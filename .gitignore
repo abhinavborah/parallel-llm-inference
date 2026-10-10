@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# model weights and run outputs never go in git
+models/
+*.safetensors
+*.bin
+runs/
