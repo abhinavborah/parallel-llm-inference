@@ -14,3 +14,12 @@ Status: early development.
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
 - macOS or Windows (Linux should work)
+
+## Development
+
+```
+uv sync
+uv run pytest
+uv run ruff check
+uv run ruff format
+```
