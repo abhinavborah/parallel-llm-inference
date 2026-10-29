@@ -1,0 +1,19 @@
+# Address and port of every process. Every process reads this file; none hard-codes an address.
+# The defaults run all processes on one laptop. For a LAN run, copy this file to
+# config/hosts.local.toml (ignored by git), set each host to that laptop's IP, and point
+# PLLM_CONFIG at the copy.
+
+# Name of the network in use, written to every run record.
+network = "single-host"
+
+[gateway]
+host = "127.0.0.1"
+port = 50050
+
+[stage0]
+host = "127.0.0.1"
+port = 50051
+
+[stage1]
+host = "127.0.0.1"
+port = 50052

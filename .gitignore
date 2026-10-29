@@ -8,3 +8,5 @@ models/
 *.safetensors
 *.bin
 runs/
+# per-laptop host addresses
+config/*.local.toml
