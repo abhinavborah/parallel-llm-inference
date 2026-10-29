@@ -15,6 +15,35 @@ Status: early development.
 - [uv](https://docs.astral.sh/uv/)
 - macOS or Windows (Linux should work)
 
+## Model weights
+
+Each model is pinned to a Hugging Face commit, and every file is checked against its sha256.
+Files go to `models/<name>/`, which git ignores.
+
+```
+uv run python -m pllm.models smollm2-135m
+uv run python -m pllm.models qwen3-0.6b
+```
+
+## Hosts and ports
+
+Every process reads its addresses from `config/hosts.toml`. The committed file runs all
+processes on one laptop. For a LAN run, copy it to `config/hosts.local.toml` (ignored by git),
+set each host to that laptop's IP, and set `PLLM_CONFIG` to the copy:
+
+```
+# macOS
+export PLLM_CONFIG=config/hosts.local.toml
+# Windows PowerShell
+$env:PLLM_CONFIG = "config/hosts.local.toml"
+```
+
+## Run records
+
+Every script writes a JSON record to `runs/` (ignored by git) with the commit, model and
+revision, split point, thread count, host, OS, network, round-trip time, available memory,
+power state and dates.
+
 ## Development
 
 ```
