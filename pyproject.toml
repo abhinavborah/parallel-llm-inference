@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Pipeline-parallel inference for a small language model, split across two machines."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "psutil>=7.2.2",
+]
 
 [dependency-groups]
 dev = [
