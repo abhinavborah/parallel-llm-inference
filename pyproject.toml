@@ -5,6 +5,7 @@ description = "Pipeline-parallel inference for a small language model, split acr
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "huggingface-hub>=2.3.0",
     "psutil>=7.2.2",
 ]
 
