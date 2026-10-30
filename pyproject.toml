@@ -7,13 +7,28 @@ requires-python = ">=3.12"
 dependencies = [
     "huggingface-hub>=2.3.0",
     "psutil>=7.2.2",
+    "safetensors>=0.8.0",
+    "tokenizers>=0.23.3",
+    "torch==2.14.1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest",
     "ruff",
+    # reference oracle for tests only; production code never imports it
+    "transformers==5.20.2",
 ]
+
+# Linux has no CPU-only torch wheel on PyPI, so CI on Linux takes it from the
+# PyTorch CPU index. macOS and Windows wheels on PyPI are already CPU builds.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.11.7,<0.14"]
