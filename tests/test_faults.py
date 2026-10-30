@@ -112,6 +112,56 @@ def test_suspend_and_resume_skip_a_process_that_already_exited(tmp_path, monkeyp
                 proc.wait()
 
 
+class RefusingProcess:
+    """Refuses suspend and resume with access denied, as Windows does for a process
+    that has terminated while a handle to it is still open."""
+
+    def __init__(self, exited):
+        self.exited = exited
+        self.calls = []
+
+    def suspend(self):
+        self.calls.append("suspend")
+        raise psutil.AccessDenied(pid=1)
+
+    def resume(self):
+        self.calls.append("resume")
+        raise psutil.AccessDenied(pid=1)
+
+    def wait(self, timeout=None):
+        if not self.exited:
+            raise psutil.TimeoutExpired(timeout, pid=1)
+        return 1
+
+
+class RecordingProcess:
+    def __init__(self):
+        self.calls = []
+
+    def suspend(self):
+        self.calls.append("suspend")
+
+    def resume(self):
+        self.calls.append("resume")
+
+
+@pytest.mark.parametrize("action", ["suspend", "resume"])
+def test_access_denied_from_an_exited_process_is_skipped(monkeypatch, action):
+    refusing, live = RefusingProcess(exited=True), RecordingProcess()
+    monkeypatch.setattr(faults, "_tree", lambda pid: [refusing, live])
+    getattr(faults, action)(1)
+    assert live.calls == [action]
+
+
+@pytest.mark.parametrize("action", ["suspend", "resume"])
+def test_access_denied_from_a_running_process_is_raised_after_the_rest(monkeypatch, action):
+    live = RecordingProcess()
+    monkeypatch.setattr(faults, "_tree", lambda pid: [RefusingProcess(exited=False), live])
+    with pytest.raises(psutil.AccessDenied):
+        getattr(faults, action)(1)
+    assert live.calls == [action]
+
+
 def test_step_delay_sleeps_for_the_configured_time():
     # perf_counter, not monotonic: on Windows with Python 3.12, monotonic ticks in 15.6 ms steps.
     delay = faults.StepDelay(0.05)
