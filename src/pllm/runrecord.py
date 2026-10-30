@@ -15,6 +15,7 @@ from pathlib import Path
 
 import psutil
 
+from pllm import config
 from pllm.config import REPO_ROOT
 
 RUNS_DIR = REPO_ROOT / "runs"
@@ -52,8 +53,12 @@ def record(
 ) -> Iterator[dict]:
     """Write a run record when the block ends, with status ok or error.
 
-    The yielded dict can be extended with results before the block ends.
+    The network defaults to the one named in the hosts file; a missing or invalid
+    hosts file stops the script before it runs. The yielded dict can be extended
+    with results before the block ends.
     """
+    if network is None:
+        network = config.load().network
     started = datetime.now(UTC)
     rec = {
         "script": script,
