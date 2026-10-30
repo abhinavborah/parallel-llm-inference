@@ -24,23 +24,27 @@ def kill(pid: int) -> None:
 
     psutil sends SIGKILL on macOS and Linux and calls TerminateProcess on Windows.
     """
-    for proc in _tree(pid):
-        try:
-            proc.kill()
-        except psutil.NoSuchProcess:
-            pass  # exited on its own, or went down with its parent
+    _each(pid, psutil.Process.kill)
 
 
 def suspend(pid: int) -> None:
     """Stop a process tree in place; it keeps its memory and sockets but runs no code."""
-    for proc in _tree(pid):
-        proc.suspend()
+    _each(pid, psutil.Process.suspend)
 
 
 def resume(pid: int) -> None:
     """Continue a process tree stopped by suspend."""
+    _each(pid, psutil.Process.resume)
+
+
+def _each(pid: int, action) -> None:
+    # A descendant can exit after the tree snapshot. Skip it and carry on, so one
+    # missing process never leaves the rest of the tree half suspended or half resumed.
     for proc in _tree(pid):
-        proc.resume()
+        try:
+            action(proc)
+        except psutil.NoSuchProcess:
+            pass
 
 
 @dataclass(frozen=True)

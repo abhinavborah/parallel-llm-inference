@@ -83,6 +83,35 @@ def test_suspend_stops_progress_and_resume_continues(ticker):
     assert os.path.getsize(path) > frozen
 
 
+def test_suspend_and_resume_skip_a_process_that_already_exited(tmp_path, monkeypatch):
+    path = tmp_path / "ticks"
+    live = subprocess.Popen([sys.executable, "-c", TICKER, str(path)])
+    gone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        _wait_for_growth(path)
+        gone_proc = psutil.Process(gone.pid)
+        gone.kill()
+        gone.wait(timeout=5)
+        # The exited process comes first, as if it left after the tree snapshot.
+        live_tree = faults._tree(live.pid)
+        monkeypatch.setattr(faults, "_tree", lambda pid: [gone_proc, *live_tree])
+
+        faults.suspend(live.pid)
+        time.sleep(0.1)
+        frozen = os.path.getsize(path)
+        time.sleep(0.3)
+        assert os.path.getsize(path) == frozen
+
+        faults.resume(live.pid)
+        time.sleep(0.3)
+        assert os.path.getsize(path) > frozen
+    finally:
+        for proc in (live, gone):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
 def test_step_delay_sleeps_for_the_configured_time():
     # perf_counter, not monotonic: on Windows with Python 3.12, monotonic ticks in 15.6 ms steps.
     delay = faults.StepDelay(0.05)
