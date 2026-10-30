@@ -24,27 +24,50 @@ def kill(pid: int) -> None:
 
     psutil sends SIGKILL on macOS and Linux and calls TerminateProcess on Windows.
     """
-    _each(pid, psutil.Process.kill)
+    _each(pid, "kill")
 
 
 def suspend(pid: int) -> None:
     """Stop a process tree in place; it keeps its memory and sockets but runs no code."""
-    _each(pid, psutil.Process.suspend)
+    _each(pid, "suspend")
 
 
 def resume(pid: int) -> None:
     """Continue a process tree stopped by suspend."""
-    _each(pid, psutil.Process.resume)
+    _each(pid, "resume")
 
 
-def _each(pid: int, action) -> None:
+def _each(pid: int, action: str) -> None:
     # A descendant can exit after the tree snapshot. Skip it and carry on, so one
     # missing process never leaves the rest of the tree half suspended or half resumed.
+    # A real refusal is raised only after every other process has been handled.
+    refused = []
     for proc in _tree(pid):
         try:
-            action(proc)
+            getattr(proc, action)()
         except psutil.NoSuchProcess:
             pass
+        except psutil.AccessDenied as err:
+            # Windows can refuse to suspend or resume a process that has terminated but
+            # whose handle is still open, with access denied instead of no such process.
+            # A process that is still running and refuses is a real failure.
+            if not _exited(proc):
+                refused.append(err)
+    if refused:
+        raise refused[0]
+
+
+def _exited(proc: psutil.Process) -> bool:
+    # A short wait, not zero: Windows can still list a PID for a moment after the
+    # process has ended. On macOS and Linux this path is not reached for our own
+    # workers, since signalling an exited child succeeds.
+    try:
+        proc.wait(timeout=0.1)
+    except psutil.TimeoutExpired:
+        return False
+    except psutil.NoSuchProcess:
+        pass
+    return True
 
 
 @dataclass(frozen=True)
