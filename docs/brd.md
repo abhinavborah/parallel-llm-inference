@@ -1,7 +1,7 @@
 # Business Requirements Document: Pipeline-Parallel LLM Inference with Fault Recovery
 
 **Project:** parallel LLM inference (course topic 38)
-**Version:** 1.0 (draft for review by both members)
+**Version:** 1.1 (draft for review by both members)
 **Date:** 2026-10-26
 **Authors:** project team (two members)
 **Baseline:** the scope proposal submitted to the course TA. Where this document and the scope proposal differ, the scope proposal governs until both members agree a change.
@@ -186,16 +186,16 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R1.2 | One uv lockfile that resolves on macOS ARM64 and Windows x86-64 with Python 3.12 and the same CPU PyTorch version; `uv sync` succeeds on both laptops. Status: Done (merged 2026-10-26: uv project, lockfile, pytest and ruff). | Must | W1 | B (unconfirmed) | G6; Proposal tools section |
 | R1.3 | Continuous integration that runs lint and the unit lane on every pull request, green on macOS, Windows and Linux runners. Status: Done (merged 2026-10-26). | Must | W1 | A (unconfirmed) | Section 7.2 |
 | R1.4 | Protocol schema frozen: services Control (Register, Heartbeat), Stage (Steps), Results (Push), Frontend (Generate) and the messages in the agreed schema; generated code builds on both OSes; later changes need both members. | Must | W1 | A and B (unconfirmed) | Spec R4; Proposal PG1; D4 |
-| R1.5 | Decision D4: transport is gRPC with raw tensor bytes (default) or ZeroMQ. Blocks R1.4. | Must | W1 | A and B (unconfirmed) | D4 |
+| R1.5 | Decision D4: transport is gRPC with raw tensor bytes (default) or ZeroMQ. Blocks R1.4. Status: decided 2026-11-01 (#4): gRPC with raw tensor bytes. | Must | W1 | A and B (unconfirmed) | D4 |
 | R1.6 | A configuration file holding both host addresses and ports, read by every process; no address is hard-coded. Stays supported when discovery exists. | Must | W1 | A (unconfirmed) | Proposal network section |
 | R1.7 | Measure Host B available memory with other programs closed (Task Manager, method and date recorded) and state the worker budget. About 2.5 GB is assumed until measured. Feeds R5.3 and R8.6. | Must | W1 | B (unconfirmed) | D8; Proposal special requirements |
 | R1.8 | Network check between the laptops: TCP in both directions on the worker port, round-trip time, Windows firewall rule on the Private profile, multicast test; result recorded. Fallbacks in order: direct cable, phone hotspot, Tailscale. | Must | W2 | A and B (unconfirmed) | Proposal special requirements |
 | R1.9 | Script that downloads the pinned model files (SmolLM2-135M-Instruct, Qwen3-0.6B) with checksum verification, into a folder that is not tracked by git. | Must | W1 | B (unconfirmed) | Proposal PG5; G6 |
 | R1.10 | Run-record writer used by every script (fields in section 7.3); `.gitignore` excludes weights and run outputs. | Must | W1 | A (unconfirmed) | Section 7.3 |
-| R1.11 | Decision TA1: is the model ours to choose or supplied? Reported answered "ours" by Member A, unconfirmed by Member B. Blocks the final model choice in R1.12. | Must | W1 | A and B (unconfirmed) | TA1; Spec R1 |
+| R1.11 | Decision TA1: is the model ours to choose or supplied? Blocks the final model choice in R1.12. Status: decided 2026-11-01 (#8): the model is ours to choose. | Must | W1 | A and B (unconfirmed) | TA1; Spec R1 |
 | R1.12 | Decision D1: confirm SmolLM2-135M for development and Qwen3-0.6B as the headline model, and use one wording for it across all project documents. Fallbacks: SmolLM2-360M, GPT-2, Qwen3-1.7B with role swap. | Must | W1 | A and B (unconfirmed) | D1; Proposal goals |
-| R1.13 | Decision TA2: is a gateway as a third process acceptable alongside the two workers? If not, the gateway role moves into a worker. | Should | W1 | A and B (unconfirmed) | TA2; Spec R1 |
-| R1.14 | Decision TA3: is bit-exact equality per host, with cross-host equality reported as agreement, acceptable? | Should | W1 | A and B (unconfirmed) | TA3; Spec R13; G3 |
+| R1.13 | Decision TA2: is a gateway as a third process acceptable alongside the two workers? If not, the gateway role moves into a worker. Status: decided 2026-11-01 (#10): the gateway is a separate process; the specification limits only the workers. | Should | W1 | A and B (unconfirmed) | TA2; Spec R1 |
+| R1.14 | Decision TA3: is bit-exact equality per host, with cross-host equality reported as agreement, acceptable? Status: decided 2026-11-01 (#11): bit-exact per host at batch 1, agreement across hosts. | Should | W1 | A and B (unconfirmed) | TA3; Spec R13; G3 |
 
 ### Epic E2. Reference model and equality oracle
 
@@ -211,7 +211,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R2.8 | Test: is the KV state after prefill of P+m tokens bitwise equal to prefill of P followed by m single-token decodes? The result decides whether single-message replay is allowed (R6.6). | Must | W1 | B (unconfirmed) | Roadmap exit W1; Proposal PG4 |
 | R2.9 | X1a harness: 50 prompts x splits {1, n/4, n/2, 3n/4, n-1}, run on each laptop alone, reporting exact token match and maximum logit difference as JSON lines. Pass: 100 percent match on each host. | Must | W2 | B (unconfirmed) | X1a; Spec R3; Spec R13 |
 | R2.10 | A device flag with CPU as the default and the only device used in equality runs. | Should | W1 | B (unconfirmed) | Spec R2; D3 |
-| R2.11 | Decision N1: if the own Llama-family forward does not match the reference by the end of W1, ship on GPT-2 small. Every distributed-systems requirement is model independent. Blocks the W2 schedule. | Should | W1 | A and B (unconfirmed) | D1; model fallback |
+| R2.11 | Decision N1: if the own Llama-family forward does not match the reference by the end of W1, ship on GPT-2 small. Every distributed-systems requirement is model independent. Blocks the W2 schedule. Status: not needed 2026-11-01 (#13): the own forward matches the reference (#12). | Should | W1 | A and B (unconfirmed) | D1; model fallback |
 | R2.12 | Store single-process reference outputs (tokens and logit summary) per host with a checksum, so X1b compares against both hosts' references. | Should | W2 | B (unconfirmed) | X1b |
 
 ### Epic E3. Stage workers and protocol
@@ -233,7 +233,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R3.13 | Route update: Stage 0 receives the address and epoch of a restarted Stage 1 and reconnects without restarting. | Must | W4 | B (unconfirmed) | Spec R10 |
 | R3.14 | Cross-test: the KV truncate and fencing tests for the stage worker are written by Member A, not the implementer. | Must | W4 | A (unconfirmed) | Contribution rule; G2 |
 | R3.15 | Worker code is the same on both OSes; OS-specific code is limited to the supervisor and fault injector. | Must | W2 | B (unconfirmed) | Spec R2; G7 |
-| R3.16 | Decision N2: the specification wording for ordering says one bidirectional stream per hop, while the protocol uses client-streaming for steps and results and bidirectional only for heartbeat. Both members choose one wording. | Should | W2 | A and B (unconfirmed) | Spec R5; Proposal tools section |
+| R3.16 | Decision N2: the specification wording for ordering says one bidirectional stream per hop, while the protocol uses client-streaming for steps and results and bidirectional only for heartbeat. Both members choose one wording. Status: decided 2026-11-01 (#19): client-streaming for steps and results, bidirectional for heartbeat, as in the scope proposal. | Should | W2 | A and B (unconfirmed) | Spec R5; Proposal tools section |
 | R3.17 | Decision N3: gRPC's default 4 MiB receive limit rejects a 1,024-token Qwen3-0.6B prefill (4 MiB plus framing). Either raise the limit on both channels or chunk long prefills; chunking interacts with R6.6. Prompts of 16, 128 and 512 tokens fit. | Should | W2 | A and B (unconfirmed) | Protocol size analysis |
 
 ### Epic E4. Gateway and decode loop
@@ -288,7 +288,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R6.15 | Stretch, partial replay (experiment X10): Stage 0 keeps its outbound activations per request so a Stage 1 failure replays only Stage 1; compare recompute time with X5. | Could | W6 | B (unconfirmed) | X10; D6 |
 | R6.16 | Stretch, gateway durability: a durable request log lets the gateway restart. Default is out of the fault model, stated in the report. | Could | W6 | A (unconfirmed) | D5 |
 | R6.17 | Decision D6: replay scope. Default is full replay through both stages; the alternative is partial replay (R6.15). Decide by W5. | Should | W5 | A and B (unconfirmed) | D6 |
-| R6.18 | Decision TA4: is full-prompt replay the expected recovery, or should the system checkpoint the KV cache? | Should | W3 | A and B (unconfirmed) | TA4; Spec R11 |
+| R6.18 | Decision TA4: is full-prompt replay the expected recovery, or should the system checkpoint the KV cache? Status: decided 2026-11-01 (#43): full-prompt replay, as the specification states. | Should | W3 | A and B (unconfirmed) | TA4; Spec R11 |
 
 ### Epic E7. Measurement and experiments
 
@@ -390,19 +390,19 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 | Id | Decision or question | Default or status | Blocks |
 |---|---|---|---|
 | D1 | Model: SmolLM2-135M for development, Qwen3-0.6B for headline runs, with a capacity-aware split. Wording differs across project documents (headline versus headline stretch). | Default adopted; wording unconfirmed | R1.12, R8.8 |
-| D4 | Transport: gRPC with raw tensor bytes against ZeroMQ. | Open, decide in W1 | R1.4 |
+| D4 | Transport: gRPC with raw tensor bytes against ZeroMQ. | Decided 2026-11-01: gRPC with raw tensor bytes (#4) | R1.4 |
 | D5 | Gateway durability. | Default: out of the fault model; revisit in W6 | R6.16 |
 | D6 | Replay scope: full replay or partial replay (X10). | Default full; decide in W5 | R6.15, R6.17 |
 | D7 | Micro-batching depth: decode only or prefill too. | Default decode only; decide in W5 | R5.11 |
 | D11 | Dashboard, discovery and pairing: scheduled W3 to W5 or stretch. | Unconfirmed; owners unassigned | R9.1 |
 | D12 | Role of the spare Linux MacBook. | Pending since before W2 | R8.13 |
 | D2, D3, D8, D9, D10 | Deployment (gateway and Stage 1 on macOS, Stage 0 on Windows); CPU fp32; hardware confirmed; Host B runs Stage 0; even split of work. | Decided. D10 owners are still marked unconfirmed in this document. | none |
-| TA1 | Is the model ours to choose or supplied? | Member A reports the answer is "ours"; unconfirmed by Member B | R1.11 |
-| TA2 | Is a gateway process acceptable alongside the two workers? | Open | R1.13 |
-| TA3 | Is bit-exact equality per host plus cross-host agreement acceptable? | Open | R1.14 |
-| TA4 | Is full-prompt replay the expected recovery, or KV checkpointing? | Open | R6.18 |
-| N1 | Fallback to GPT-2 if the own forward slips. | Raised in this document | R2.11 |
-| N2 | Ordering stream wording: bidirectional (specification mapping) or client-streaming (protocol). | Raised in this document | R3.16 |
+| TA1 | Is the model ours to choose or supplied? | Decided 2026-11-01: ours (#8) | R1.11 |
+| TA2 | Is a gateway process acceptable alongside the two workers? | Decided 2026-11-01: separate gateway process (#10) | R1.13 |
+| TA3 | Is bit-exact equality per host plus cross-host agreement acceptable? | Decided 2026-11-01: exact per host, agreement across hosts (#11) | R1.14 |
+| TA4 | Is full-prompt replay the expected recovery, or KV checkpointing? | Decided 2026-11-01: full-prompt replay (#43) | R6.18 |
+| N1 | Fallback to GPT-2 if the own forward slips. | Not needed 2026-11-01: own forward matches (#13) | R2.11 |
+| N2 | Ordering stream wording: bidirectional (specification mapping) or client-streaming (protocol). | Decided 2026-11-01: client-streaming as in the scope proposal (#19) | R3.16 |
 | N3 | gRPC 4 MiB message limit against long prefills. | Raised in this document | R3.17 |
 | N4 | Absolute deadlines and unsynchronised clocks. | Raised in this document | R5.12 |
 | N5 | X2 comparison points, adding the batched single-process upper bound. | Raised in this document | R7.19 |
@@ -464,3 +464,4 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 | Version | Date | Change |
 |---|---|---|
 | 1.0 | 2026-10-26 | First draft from the scope proposal, the course specification and the team's design and plan. For review by both members. |
+| 1.1 | 2026-11-01 | Decisions D4, TA1 to TA4, N1 and N2 recorded as decided, with their issues. |
