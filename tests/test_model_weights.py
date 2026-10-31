@@ -10,7 +10,7 @@ from tokenizers import Tokenizer
 from transformers import LlamaForCausalLM
 
 from pllm.model import Model
-from pllm.models import MODELS_DIR
+from pllm.models import MODELS_DIR, PINNED, verify
 
 MODEL_DIR = MODELS_DIR / "smollm2-135m"
 NEW_TOKENS = 16
@@ -44,7 +44,14 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def models():
+def verified():
+    """A stale or hand-copied file must not produce an acceptance result."""
+    for filename, expected in PINNED["smollm2-135m"].files.items():
+        verify(MODEL_DIR / filename, expected)
+
+
+@pytest.fixture(scope="module")
+def models(verified):
     reference = LlamaForCausalLM.from_pretrained(
         MODEL_DIR, dtype=torch.float32, attn_implementation="eager"
     ).eval()
@@ -52,7 +59,7 @@ def models():
 
 
 @pytest.fixture(scope="module")
-def tokenizer():
+def tokenizer(verified):
     return Tokenizer.from_file(str(MODEL_DIR / "tokenizer.json"))
 
 
