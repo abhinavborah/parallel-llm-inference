@@ -52,3 +52,7 @@ uv run pytest
 uv run ruff check
 uv run ruff format
 ```
+
+`tests/test_model_weights.py` checks the forward pass against the reference library on the
+real SmolLM2-135M weights. It is skipped until the model is downloaded, as in CI, and needs
+about 1.5 GB of free memory.
