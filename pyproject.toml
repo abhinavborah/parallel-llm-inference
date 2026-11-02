@@ -5,7 +5,10 @@ description = "Pipeline-parallel inference for a small language model, split acr
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "grpcio==1.85.1",
     "huggingface-hub>=2.3.0",
+    # must be at least the protobuf version grpcio-tools generates for
+    "protobuf==7.36.2",
     "psutil>=7.2.2",
     "safetensors>=0.8.0",
     "tokenizers>=0.23.3",
@@ -14,6 +17,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "grpcio-tools==1.85.1",
     "pytest",
     "ruff",
     # reference oracle for tests only; production code never imports it
@@ -40,6 +44,7 @@ module-name = "pllm"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["src/pllm/proto/*_pb2*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
