@@ -1,0 +1,133 @@
+// Wire protocol between the gateway and the stage workers.
+// Any change here needs both members' agreement and a bump of SCHEMA_VERSION
+// in pllm/proto/__init__.py. Regenerate with: uv run python -m pllm.proto.generate
+syntax = "proto3";
+
+package pllm.v1;
+
+// Hosted by the gateway.
+service Control {
+  rpc Register(RegisterReq) returns (RegisterResp);
+  rpc Heartbeat(stream StageMsg) returns (stream ControlMsg);
+}
+
+// Hosted by each stage worker: ordered inbound stream from the previous hop.
+service Stage {
+  rpc Steps(stream StepRequest) returns (Empty);
+}
+
+// Hosted by the gateway: results from the last stage.
+service Results {
+  rpc Push(stream StepResult) returns (Empty);
+}
+
+// Hosted by the gateway: client entry point.
+service Frontend {
+  rpc Generate(GenerateReq) returns (stream Token);
+}
+
+message Empty {}
+
+message RegisterReq {
+  int32 stage = 1;
+  int32 layer_start = 2;
+  int32 layer_end = 3;
+  string model_id = 4;
+  bytes weights_sha256 = 5;
+  string addr = 6;
+}
+
+message RegisterResp {
+  uint64 epoch = 1;
+}
+
+message Beat {
+  int32 stage = 1;
+  uint64 epoch = 2;
+  int32 inbox_depth = 3;
+  int32 cached_requests = 4;
+}
+
+// Reasons: WRONG_EPOCH, STALE_ATTEMPT, GAP, BAD_SENDER.
+message Nack {
+  int32 stage = 1;
+  uint64 epoch = 2;
+  string rid = 3;
+  uint32 attempt = 4;
+  uint32 step = 5;
+  string reason = 6;
+}
+
+message StageMsg {
+  oneof msg {
+    Beat beat = 1;
+    Nack nack = 2;
+  }
+}
+
+message RouteUpdate {
+  int32 next_stage = 1;
+  string addr = 2;
+  uint64 epoch = 3;
+}
+
+message Free {
+  string rid = 1;
+  uint32 attempt = 2;
+}
+
+message ControlMsg {
+  oneof msg {
+    RouteUpdate route_update = 1;
+    Free free = 2;
+  }
+}
+
+// Raw little-endian bytes, row-major, with dtype name (for example "float32") and shape.
+message Tensor {
+  string dtype = 1;
+  repeated uint32 shape = 2;
+  bytes data = 3;
+}
+
+message TokenIds {
+  repeated uint32 ids = 1;
+}
+
+message StepRequest {
+  string rid = 1;
+  uint32 attempt = 2;
+  uint32 step = 3;
+  uint32 start_pos = 4;  // first absolute position carried by this message
+  uint32 length = 5;  // number of positions carried
+  uint64 target_epoch = 6;  // epoch of the receiving stage
+  uint64 sender_epoch = 7;  // epoch of the sending stage, 0 for the gateway
+  bool replay = 8;  // part of a chunked replay
+  int64 deadline_unix_ms = 9;
+  oneof payload {
+    TokenIds tokens = 10;
+    Tensor activations = 11;
+  }
+}
+
+message StepResult {
+  string rid = 1;
+  uint32 attempt = 2;
+  uint32 step = 3;
+  uint64 epoch = 4;
+  uint32 token = 5;
+  float top_logit = 6;
+}
+
+message GenerateReq {
+  string prompt = 1;
+  uint32 max_tokens = 2;
+  uint32 timeout_ms = 3;  // relative, so client and gateway clocks need not agree
+}
+
+message Token {
+  string rid = 1;
+  uint32 step = 2;
+  uint32 token = 3;
+  string text = 4;
+}
