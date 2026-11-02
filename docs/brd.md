@@ -1,7 +1,7 @@
 # Business Requirements Document: Pipeline-Parallel LLM Inference with Fault Recovery
 
 **Project:** parallel LLM inference (course topic 38)
-**Version:** 1.1 (draft for review by both members)
+**Version:** 1.2 (draft for review by both members)
 **Date:** 2026-10-26
 **Authors:** project team (two members)
 **Baseline:** the scope proposal submitted to the course TA. Where this document and the scope proposal differ, the scope proposal governs until both members agree a change.
@@ -234,7 +234,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R3.14 | Cross-test: the KV truncate and fencing tests for the stage worker are written by Member A, not the implementer. | Must | W4 | A (unconfirmed) | Contribution rule; G2 |
 | R3.15 | Worker code is the same on both OSes; OS-specific code is limited to the supervisor and fault injector. | Must | W2 | B (unconfirmed) | Spec R2; G7 |
 | R3.16 | Decision N2: the specification wording for ordering says one bidirectional stream per hop, while the protocol uses client-streaming for steps and results and bidirectional only for heartbeat. Both members choose one wording. Status: decided 2026-11-01 (#19): client-streaming for steps and results, bidirectional for heartbeat, as in the scope proposal. | Should | W2 | A and B (unconfirmed) | Spec R5; Proposal tools section |
-| R3.17 | Decision N3: gRPC's default 4 MiB receive limit rejects a 1,024-token Qwen3-0.6B prefill (4 MiB plus framing). Either raise the limit on both channels or chunk long prefills; chunking interacts with R6.6. Prompts of 16, 128 and 512 tokens fit. | Should | W2 | A and B (unconfirmed) | Protocol size analysis |
+| R3.17 | Decision N3: gRPC's default 4 MiB receive limit rejects a 1,024-token Qwen3-0.6B prefill (4 MiB plus framing). Either raise the limit on both channels or chunk long prefills; chunking interacts with R6.6. Prompts of 16, 128 and 512 tokens fit. Status: decided 2026-11-03 (#20): no chunking; every server and channel sets the receive limit from config, sized from batch, prompt length and hidden size, and the gateway rejects prompts above it. | Should | W2 | A and B (unconfirmed) | Protocol size analysis |
 
 ### Epic E4. Gateway and decode loop
 
@@ -403,7 +403,7 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 | TA4 | Is full-prompt replay the expected recovery, or KV checkpointing? | Decided 2026-11-01: full-prompt replay (#43) | R6.18 |
 | N1 | Fallback to GPT-2 if the own forward slips. | Not needed 2026-11-01: own forward matches (#13) | R2.11 |
 | N2 | Ordering stream wording: bidirectional (specification mapping) or client-streaming (protocol). | Decided 2026-11-01: client-streaming as in the scope proposal (#19) | R3.16 |
-| N3 | gRPC 4 MiB message limit against long prefills. | Raised in this document | R3.17 |
+| N3 | gRPC 4 MiB message limit against long prefills. | Decided 2026-11-03: receive limit from config, no chunking (#20) | R3.17 |
 | N4 | Absolute deadlines and unsynchronised clocks. | Raised in this document | R5.12 |
 | N5 | X2 comparison points, adding the batched single-process upper bound. | Raised in this document | R7.19 |
 | N6 | X4 delay hops: expect about 2 x delay or 3 x delay per token. | Raised in this document | R7.20 |
@@ -465,3 +465,4 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 |---|---|---|
 | 1.0 | 2026-10-26 | First draft from the scope proposal, the course specification and the team's design and plan. For review by both members. |
 | 1.1 | 2026-11-01 | Decisions D4, TA1 to TA4, N1 and N2 recorded as decided, with their issues. |
+| 1.2 | 2026-11-03 | Decision N3 recorded as decided (#20). |
