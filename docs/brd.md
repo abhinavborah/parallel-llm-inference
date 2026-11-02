@@ -193,7 +193,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R1.9 | Script that downloads the pinned model files (SmolLM2-135M-Instruct, Qwen3-0.6B) with checksum verification, into a folder that is not tracked by git. | Must | W1 | B (unconfirmed) | Proposal PG5; G6 |
 | R1.10 | Run-record writer used by every script (fields in section 7.3); `.gitignore` excludes weights and run outputs. | Must | W1 | A (unconfirmed) | Section 7.3 |
 | R1.11 | Decision TA1: is the model ours to choose or supplied? Blocks the final model choice in R1.12. Status: decided 2026-11-01 (#8): the model is ours to choose. | Must | W1 | A and B (unconfirmed) | TA1; Spec R1 |
-| R1.12 | Decision D1: confirm SmolLM2-135M for development and Qwen3-0.6B as the headline model, and use one wording for it across all project documents. Fallbacks: SmolLM2-360M, GPT-2, Qwen3-1.7B with role swap. | Must | W1 | A and B (unconfirmed) | D1; Proposal goals |
+| R1.12 | Decision D1: confirm SmolLM2-135M for development and Qwen3-0.6B as the headline model, and use one wording for it across all project documents. Fallbacks: SmolLM2-360M, GPT-2, Qwen3-1.7B with role swap. Status: decided 2026-11-03 (#9): SmolLM2-135M-Instruct for development and tests, Qwen3-0.6B for headline runs; fallback SmolLM2-360M, Qwen3-1.7B stays stretch, GPT-2 dropped. | Must | W1 | A and B (unconfirmed) | D1; Proposal goals |
 | R1.13 | Decision TA2: is a gateway as a third process acceptable alongside the two workers? If not, the gateway role moves into a worker. Status: decided 2026-11-01 (#10): the gateway is a separate process; the specification limits only the workers. | Should | W1 | A and B (unconfirmed) | TA2; Spec R1 |
 | R1.14 | Decision TA3: is bit-exact equality per host, with cross-host equality reported as agreement, acceptable? Status: decided 2026-11-01 (#11): bit-exact per host at batch 1, agreement across hosts. | Should | W1 | A and B (unconfirmed) | TA3; Spec R13; G3 |
 
@@ -389,7 +389,7 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 
 | Id | Decision or question | Default or status | Blocks |
 |---|---|---|---|
-| D1 | Model: SmolLM2-135M for development, Qwen3-0.6B for headline runs, with a capacity-aware split. Wording differs across project documents (headline versus headline stretch). | Default adopted; wording unconfirmed | R1.12, R8.8 |
+| D1 | Model: SmolLM2-135M for development, Qwen3-0.6B for headline runs, with a capacity-aware split. Wording differs across project documents (headline versus headline stretch). | Decided 2026-11-03: as stated, one wording (#9) | R1.12, R8.8 |
 | D4 | Transport: gRPC with raw tensor bytes against ZeroMQ. | Decided 2026-11-01: gRPC with raw tensor bytes (#4) | R1.4 |
 | D5 | Gateway durability. | Default: out of the fault model; revisit in W6 | R6.16 |
 | D6 | Replay scope: full replay or partial replay (X10). | Default full; decide in W5 | R6.15, R6.17 |
@@ -465,4 +465,4 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 |---|---|---|
 | 1.0 | 2026-10-26 | First draft from the scope proposal, the course specification and the team's design and plan. For review by both members. |
 | 1.1 | 2026-11-01 | Decisions D4, TA1 to TA4, N1 and N2 recorded as decided, with their issues. |
-| 1.2 | 2026-11-03 | Decision N3 recorded as decided (#20). |
+| 1.2 | 2026-11-03 | Decisions N3 (#20) and D1 (#9) recorded as decided. |
