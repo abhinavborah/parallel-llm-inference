@@ -44,6 +44,43 @@ Every script writes a JSON record to `runs/` (ignored by git) with the commit, m
 revision, split point, thread count, host, OS, network, round-trip time, available memory,
 power state and dates.
 
+## Host checks
+
+Host B memory, with every other program closed and the charger in. Also note Task Manager's
+"Available" figure (Performance, Memory) at the same time:
+
+```
+uv run python -m pllm.hostmem
+```
+
+It samples available memory for a minute and proposes the worker budget: the lowest reading
+less 0.5 GiB of headroom, rounded down to 0.1 GiB.
+
+Network between the laptops, using the addresses in the hosts file. Stage 0 runs on Windows,
+Stage 1 and the gateway on macOS:
+
+```
+# Windows, then macOS
+uv run python -m pllm.netcheck serve --roles stage0
+uv run python -m pllm.netcheck probe --roles stage0
+# macOS, then Windows
+uv run python -m pllm.netcheck serve --roles stage1 gateway
+uv run python -m pllm.netcheck probe --roles stage1 gateway
+# multicast: listen on one laptop, send from the other, then swap
+uv run python -m pllm.netcheck multicast-listen
+uv run python -m pllm.netcheck multicast-send
+# Windows, administrator PowerShell: network profiles and inbound rules for the
+# Stage 0 port and the multicast port
+uv run python -m pllm.netcheck firewall --roles stage0
+```
+
+The Windows adapter on the laptops' network must be on the Private profile, with inbound
+rules for the Stage 0 port and the multicast port. Reading firewall rules needs an
+administrator shell; without one the check reports that and gives no verdict. With several
+network adapters, pass `--interface <this laptop's IP>` to the multicast commands.
+If the direct network fails, try in order a direct cable, a phone hotspot, then Tailscale, and
+change only the hosts file. Every probe, listen and firewall run writes a run record.
+
 ## Development
 
 ```
