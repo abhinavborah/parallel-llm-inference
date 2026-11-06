@@ -1,7 +1,7 @@
 # Business Requirements Document: Pipeline-Parallel LLM Inference with Fault Recovery
 
 **Project:** parallel LLM inference (course topic 38)
-**Version:** 1.1 (draft for review by both members)
+**Version:** 1.2 (draft for review by both members)
 **Date:** 2026-10-26
 **Authors:** project team (two members)
 **Baseline:** the scope proposal submitted to the course TA. Where this document and the scope proposal differ, the scope proposal governs until both members agree a change.
@@ -193,7 +193,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R1.9 | Script that downloads the pinned model files (SmolLM2-135M-Instruct, Qwen3-0.6B) with checksum verification, into a folder that is not tracked by git. | Must | W1 | B (unconfirmed) | Proposal PG5; G6 |
 | R1.10 | Run-record writer used by every script (fields in section 7.3); `.gitignore` excludes weights and run outputs. | Must | W1 | A (unconfirmed) | Section 7.3 |
 | R1.11 | Decision TA1: is the model ours to choose or supplied? Blocks the final model choice in R1.12. Status: decided 2026-11-01 (#8): the model is ours to choose. | Must | W1 | A and B (unconfirmed) | TA1; Spec R1 |
-| R1.12 | Decision D1: confirm SmolLM2-135M for development and Qwen3-0.6B as the headline model, and use one wording for it across all project documents. Fallbacks: SmolLM2-360M, GPT-2, Qwen3-1.7B with role swap. | Must | W1 | A and B (unconfirmed) | D1; Proposal goals |
+| R1.12 | Decision D1: confirm SmolLM2-135M for development and Qwen3-0.6B as the headline model, and use one wording for it across all project documents. Fallbacks: SmolLM2-360M, GPT-2, Qwen3-1.7B with role swap. Status: decided 2026-11-03 (#9): SmolLM2-135M-Instruct for development and tests, Qwen3-0.6B for headline runs; fallback SmolLM2-360M if a Qwen3-0.6B Stage 0 does not fit Host B after #7, Qwen3-1.7B stays stretch, GPT-2 dropped. | Must | W1 | A and B (unconfirmed) | D1; Proposal goals |
 | R1.13 | Decision TA2: is a gateway as a third process acceptable alongside the two workers? If not, the gateway role moves into a worker. Status: decided 2026-11-01 (#10): the gateway is a separate process; the specification limits only the workers. | Should | W1 | A and B (unconfirmed) | TA2; Spec R1 |
 | R1.14 | Decision TA3: is bit-exact equality per host, with cross-host equality reported as agreement, acceptable? Status: decided 2026-11-01 (#11): bit-exact per host at batch 1, agreement across hosts. | Should | W1 | A and B (unconfirmed) | TA3; Spec R13; G3 |
 
@@ -234,7 +234,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R3.14 | Cross-test: the KV truncate and fencing tests for the stage worker are written by Member A, not the implementer. | Must | W4 | A (unconfirmed) | Contribution rule; G2 |
 | R3.15 | Worker code is the same on both OSes; OS-specific code is limited to the supervisor and fault injector. | Must | W2 | B (unconfirmed) | Spec R2; G7 |
 | R3.16 | Decision N2: the specification wording for ordering says one bidirectional stream per hop, while the protocol uses client-streaming for steps and results and bidirectional only for heartbeat. Both members choose one wording. Status: decided 2026-11-01 (#19): client-streaming for steps and results, bidirectional for heartbeat, as in the scope proposal. | Should | W2 | A and B (unconfirmed) | Spec R5; Proposal tools section |
-| R3.17 | Decision N3: gRPC's default 4 MiB receive limit rejects a 1,024-token Qwen3-0.6B prefill (4 MiB plus framing). Either raise the limit on both channels or chunk long prefills; chunking interacts with R6.6. Prompts of 16, 128 and 512 tokens fit. | Should | W2 | A and B (unconfirmed) | Protocol size analysis |
+| R3.17 | Decision N3: gRPC's default 4 MiB receive limit rejects a 1,024-token Qwen3-0.6B prefill (4 MiB plus framing). Either raise the limit on both channels or chunk long prefills; chunking interacts with R6.6. Prompts of 16, 128 and 512 tokens fit. Status: decided 2026-11-03 (#20): no chunking; every server and channel sets the receive limit from config, sized from batch, prompt length and hidden size, and the gateway rejects prompts above it. | Should | W2 | A and B (unconfirmed) | Protocol size analysis |
 
 ### Epic E4. Gateway and decode loop
 
@@ -389,7 +389,7 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 
 | Id | Decision or question | Default or status | Blocks |
 |---|---|---|---|
-| D1 | Model: SmolLM2-135M for development, Qwen3-0.6B for headline runs, with a capacity-aware split. Wording differs across project documents (headline versus headline stretch). | Default adopted; wording unconfirmed | R1.12, R8.8 |
+| D1 | Model: SmolLM2-135M for development, Qwen3-0.6B for headline runs, with a capacity-aware split. Wording differs across project documents (headline versus headline stretch). | Decided 2026-11-03: as stated, one wording (#9) | R1.12, R8.8 |
 | D4 | Transport: gRPC with raw tensor bytes against ZeroMQ. | Decided 2026-11-01: gRPC with raw tensor bytes (#4) | R1.4 |
 | D5 | Gateway durability. | Default: out of the fault model; revisit in W6 | R6.16 |
 | D6 | Replay scope: full replay or partial replay (X10). | Default full; decide in W5 | R6.15, R6.17 |
@@ -403,7 +403,7 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 | TA4 | Is full-prompt replay the expected recovery, or KV checkpointing? | Decided 2026-11-01: full-prompt replay (#43) | R6.18 |
 | N1 | Fallback to GPT-2 if the own forward slips. | Not needed 2026-11-01: own forward matches (#13) | R2.11 |
 | N2 | Ordering stream wording: bidirectional (specification mapping) or client-streaming (protocol). | Decided 2026-11-01: client-streaming as in the scope proposal (#19) | R3.16 |
-| N3 | gRPC 4 MiB message limit against long prefills. | Raised in this document | R3.17 |
+| N3 | gRPC 4 MiB message limit against long prefills. | Decided 2026-11-03: receive limit from config, no chunking (#20) | R3.17 |
 | N4 | Absolute deadlines and unsynchronised clocks. | Raised in this document | R5.12 |
 | N5 | X2 comparison points, adding the batched single-process upper bound. | Raised in this document | R7.19 |
 | N6 | X4 delay hops: expect about 2 x delay or 3 x delay per token. | Raised in this document | R7.20 |
@@ -465,3 +465,4 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 |---|---|---|
 | 1.0 | 2026-10-26 | First draft from the scope proposal, the course specification and the team's design and plan. For review by both members. |
 | 1.1 | 2026-11-01 | Decisions D4, TA1 to TA4, N1 and N2 recorded as decided, with their issues. |
+| 1.2 | 2026-11-03 | Decisions N3 (#20) and D1 (#9) recorded as decided. |
