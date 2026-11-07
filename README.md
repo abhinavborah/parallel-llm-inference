@@ -55,6 +55,23 @@ runs on it unchanged, and its logits are bitwise equal to the single-process one
 matrix, so stage 1 loads its own copy. Stage 0 reads the whole embedding into memory; the
 memory-mapped lookup for Host B (R3.2) comes with the stage worker.
 
+## Stage worker
+
+`pllm.worker.StageWorker` is one process's share of the model: it loads only its layer
+range, logs the weight load time and the process RSS, and calls the step delay once
+before each step (zero by default). The first stage reads embedding rows through the
+checkpoint's memory map, so only the rows of the tokens it is given enter memory. The
+rows are widened to fp32 exactly as a full load would, so the results stay bitwise equal
+to the single process on one host. The network service that hosts a worker is a separate
+piece of work.
+
+```
+uv run python -m pllm.worker smollm2-135m --layers 0:15
+uv run python -m pllm.worker smollm2-135m --layers 15:30
+```
+
+Each command loads the stage, prints the load time and RSS, and exits.
+
 ## Hosts and ports
 
 Every process reads its addresses from `config/hosts.toml`. The committed file runs all

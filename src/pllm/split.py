@@ -10,8 +10,10 @@ Equality needs the same thread count as the run it is compared with (R8.9).
 With tied embeddings the LM head is the embedding matrix. Loaded from a file, stage 1
 reads its own copy of that matrix, as a stage running in another process must.
 
-Stage 0 reads the whole embedding into memory here. The memory-mapped lookup that keeps
-Host B within its budget (R3.2) belongs to the stage worker.
+Stage 0 reads the whole embedding into memory by default. With mapped_embedding it keeps
+only a MappedEmbedding, which reads the rows of the tokens it is given from the file, so
+Host B stays within its budget (R3.2). Rows are widened to fp32 exactly as the full
+upcast would, so the two paths give the same bits.
 
     stages = InProcessSplit.load(model_dir, k)
 
@@ -32,6 +34,30 @@ NORM = "model.norm.weight"
 LM_HEAD = "lm_head.weight"
 
 
+class MappedEmbedding:
+    """Embedding rows read from the checkpoint on demand through its memory map.
+
+    The file is opened for each lookup and closed again, so no handle stays open and
+    only the pages of the requested rows are read into memory.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+
+    def __getitem__(self, ids: torch.Tensor) -> torch.Tensor:
+        unique, inverse = torch.unique(ids, return_inverse=True)
+        with safe_open(self.path, framework="pt") as f:
+            rows = f.get_slice(EMBED)
+            vocab, width = rows.get_shape()
+            if len(unique) and not 0 <= unique[0] <= unique[-1] < vocab:
+                bad = unique[0] if unique[0] < 0 else unique[-1]
+                raise IndexError(f"token id {bad.item()} outside the embedding of {vocab} rows")
+            if not len(unique):
+                return torch.empty(*ids.shape, width)
+            table = torch.cat([rows[i : i + 1] for i in unique.tolist()]).to(torch.float32)
+        return table[inverse]
+
+
 def check_layer_range(config: ModelConfig, layer_start: int, layer_end: int) -> None:
     if not 0 <= layer_start < layer_end <= config.num_layers:
         raise ValueError(f"layers {layer_start} to {layer_end} outside 0 to {config.num_layers}")
@@ -47,6 +73,7 @@ class Stage(LayerStack):
         weights: dict[str, torch.Tensor],
         layer_start: int,
         layer_end: int,
+        embed: "torch.Tensor | MappedEmbedding | None" = None,
     ):
         check_layer_range(config, layer_start, layer_end)
         super().__init__(
@@ -57,20 +84,30 @@ class Stage(LayerStack):
         self.layer_end = layer_end
         self.first = layer_start == 0
         self.last = layer_end == config.num_layers
-        self.embed = weights[EMBED] if self.first else None
+        self.embed = embed if embed is not None else (weights[EMBED] if self.first else None)
         self.norm = weights[NORM] if self.last else None
         self.lm_head = None
         if self.last:
             self.lm_head = weights[EMBED if config.tie_word_embeddings else LM_HEAD]
 
     @classmethod
-    def load(cls, model_dir: str | Path, layer_start: int, layer_end: int) -> "Stage":
-        """Read only this stage's tensors from model.safetensors, upcast to fp32."""
+    def load(
+        cls,
+        model_dir: str | Path,
+        layer_start: int,
+        layer_end: int,
+        mapped_embedding: bool = False,
+    ) -> "Stage":
+        """Read only this stage's tensors from model.safetensors, upcast to fp32.
+
+        With mapped_embedding the first stage reads embedding rows on demand instead of
+        holding the matrix. A stage that is also last still reads it, as the tied head.
+        """
         model_dir = Path(model_dir)
         config = ModelConfig.from_file(model_dir / "config.json")
         check_layer_range(config, layer_start, layer_end)
         first, last = layer_start == 0, layer_end == config.num_layers
-        wanted = {EMBED} if first else set()
+        wanted = {EMBED} if first and not mapped_embedding else set()
         if last:
             wanted |= {NORM, EMBED if config.tie_word_embeddings else LM_HEAD}
         weights = {}
@@ -82,7 +119,10 @@ class Stage(LayerStack):
                 )
                 if name in wanted or in_range:
                     weights[name] = f.get_tensor(name).to(torch.float32)
-        return cls(config, weights, layer_start, layer_end)
+        embed = (
+            MappedEmbedding(model_dir / "model.safetensors") if first and mapped_embedding else None
+        )
+        return cls(config, weights, layer_start, layer_end, embed)
 
     @torch.inference_mode()
     def forward(self, inputs: torch.Tensor, start_pos: int, cache: KVCache) -> torch.Tensor:
