@@ -74,6 +74,16 @@ Each command loads the stage, prints the load time and RSS, and exits. The layer
 comes from the split point under `[split]` in the committed `config/hosts.toml` (never a
 local copy, so both laptops agree): stage 0 runs layers 0 to k - 1 and stage 1 the rest. `--layers START:END` overrides it for tests and split sweeps.
 
+## Stage registration
+
+`pllm.control` holds the gateway side of `Control.Register`; the gateway serves one model per
+run (`expected_model`, with an optional split point for sweeps). A stage sends its index,
+layer range, model id, the sha256 of the weights it loaded and its address. The gateway
+rejects a model it does not serve, a hash that differs from the pinned one, or a layer
+range that does not match the split point, and otherwise returns a new epoch.
+Epochs come from one counter in the gateway, so a stage that registers again always gets
+a higher epoch. `pllm.control.register` is the stage side.
+
 ## Hosts and ports
 
 Every process reads its addresses from `config/hosts.toml`. The committed file runs all
