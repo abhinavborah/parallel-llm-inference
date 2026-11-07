@@ -12,7 +12,7 @@ Status: early development.
 ## Requirements
 
 - Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
+- [uv](https://docs.astral.sh/uv/) 0.13.0 or newer
 - macOS or Windows (Linux should work)
 
 ## Model weights
