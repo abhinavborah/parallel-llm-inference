@@ -123,6 +123,15 @@ def test_split_points_outside_the_model_are_rejected(tmp_path):
             Stage.load(tmp_path, start, end)
 
 
+def test_a_bad_layer_range_is_rejected_before_any_tensor_is_read(tmp_path, reads):
+    tiny_reference(tmp_path, layers=LAYERS)
+    reads.clear()
+    for start, end in ((0, LAYERS + 1), (2, 2), (-1, 2)):
+        with pytest.raises(ValueError, match="outside"):
+            Stage.load(tmp_path, start, end)
+    assert reads == []
+
+
 def test_stages_that_do_not_meet_are_rejected(tmp_path):
     tiny_reference(tmp_path, layers=LAYERS)
     with pytest.raises(ValueError, match="covering the whole model"):

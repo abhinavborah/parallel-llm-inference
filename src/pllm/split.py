@@ -32,6 +32,11 @@ NORM = "model.norm.weight"
 LM_HEAD = "lm_head.weight"
 
 
+def check_layer_range(config: ModelConfig, layer_start: int, layer_end: int) -> None:
+    if not 0 <= layer_start < layer_end <= config.num_layers:
+        raise ValueError(f"layers {layer_start} to {layer_end} outside 0 to {config.num_layers}")
+
+
 class Stage(LayerStack):
     """Layers layer_start to layer_end - 1, with the embedding if first and the norm and
     LM head if last."""
@@ -43,10 +48,7 @@ class Stage(LayerStack):
         layer_start: int,
         layer_end: int,
     ):
-        if not 0 <= layer_start < layer_end <= config.num_layers:
-            raise ValueError(
-                f"layers {layer_start} to {layer_end} outside 0 to {config.num_layers}"
-            )
+        check_layer_range(config, layer_start, layer_end)
         super().__init__(
             config,
             [layer_from_weights(weights, i, config.qk_norm) for i in range(layer_start, layer_end)],
@@ -66,6 +68,7 @@ class Stage(LayerStack):
         """Read only this stage's tensors from model.safetensors, upcast to fp32."""
         model_dir = Path(model_dir)
         config = ModelConfig.from_file(model_dir / "config.json")
+        check_layer_range(config, layer_start, layer_end)
         first, last = layer_start == 0, layer_end == config.num_layers
         wanted = {EMBED} if first else set()
         if last:
