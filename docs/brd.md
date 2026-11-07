@@ -40,7 +40,7 @@ The central claims to demonstrate are: tokens equal single-process output (bit-e
 **In scope**
 - A two-stage pipeline: gateway, two workers, a supervisor on each laptop, with gRPC protocol definitions, bounded queues, timeouts, and per-request KV state.
 - A minimal Llama-family forward pass written in PyTorch (CPU, fp32) with explicit position-indexed KV tensors, loading safetensors weights. Hugging Face transformers is a pinned test oracle only.
-- Models: SmolLM2-135M-Instruct for development and tests; Qwen3-0.6B for headline runs (needs QK-norm).
+- Models: SmolLM2-135M-Instruct for development, tests and, for now, the presented runs (#61); Qwen3-0.6B stays pinned and tested for headline runs if time and the Host B budget allow (needs QK-norm).
 - Epoch-fenced crash recovery with prompt replay, fault injection (kill, suspend, delay) and a stale-output filter.
 - Optional micro-batching (decode only).
 - Capacity-aware layer split chosen from each host's free memory and speed.
@@ -83,7 +83,7 @@ Division of work is balanced by estimated effort (A about 14 days, B about 15 da
 | O5 | Failure recovery with fencing. | After a kill or suspend of each stage mid-generation with several requests in flight, every request completes with output equal to a fault-free run (batch 1); zero duplicate tokens at the client; every stale output rejected; each recovery increments the attempt counter; an unrecoverable request fails at its deadline (X5, X6). |
 | O6 | Communication cost is understood. | Measured bytes per token per hop equal hidden size x 4 B x tokens within framing overhead (X3); effect of 0, 1, 5, 20 and 50 ms injected delay reported (X4). |
 | O7 | Performance is reported honestly. | TTFT and TPOT at p50 and p95, throughput in tokens per second against concurrency 1 to 16, with at least 5 repeats per LAN run. Single-request latency is expected to be higher than single-process; throughput gain with concurrency is expected up to about 2x over the pipeline at concurrency 1, and is not promised. |
-| O8 | Memory-aware split. | Balanced split of Qwen3-0.6B compared with an even split on throughput and Host B peak memory; Host B does not page to disk (X9). |
+| O8 | Memory-aware split. | Balanced split of the presented model (SmolLM2-135M for now, #61) compared with an even split on throughput and Host B peak memory; Host B does not page to disk (X9). |
 | O9 | Deliver on time with evidence. | Report, plots and rehearsed demo by the final week; every row Spec R1 to Spec R16 has cited evidence; every reported number comes from a script. |
 | O10 | (Stretch) Make behaviour visible to evaluators. | Dashboard shows epochs, replay and rejections live; pairing and discovery demonstrated; manual IP entry always works. |
 
@@ -97,7 +97,7 @@ The plan assumes a start on 2026-10-12 and 45 days, ending about 2026-11-25. The
 | W2 | Oct 19 to 25 | gRPC stages in chain topology; gateway with one request at a time; byte counters; JSON-lines metrics; LAN bring-up with Stage 0 on Windows and Stage 1 plus gateway on macOS | X1a passes on each laptop; one request generates end to end across both laptops; X1b and X3 numbers produced | Not met. |
 | W3 | Oct 26 to Nov 1 | Many requests in flight; per-request KV store; ordering asserts; bounded admission queue; credit limits; deadlines on every hop; dashboard v1 (stretch) | X2 and X7 run end to end; zero ordering violations | Starts today. |
 | W4 | Nov 2 to 8 | Heartbeats, supervisor respawn, epochs, attempts, replay with truncate, stale-output filter | X5 and X6 pass: output equals reference after crash; zero duplicate tokens after pause | Planned. |
-| W5 | Nov 9 to 15 | Micro-batching; delay injection; capacity-aware split sweep; switch presented runs to Qwen3-0.6B; discovery and pairing (stretch) | X4, X8, X9 produce data; Host B never pages | Planned. |
+| W5 | Nov 9 to 15 | Micro-batching; delay injection; capacity-aware split sweep; switch presented runs to Qwen3-0.6B (deferred by #61); discovery and pairing (stretch) | X4, X8, X9 produce data; Host B never pages | Planned. |
 | W6 | Nov 16 to 22 | Full experiment runs with repeats; plots; report draft; demo rehearsed twice | Every row Spec R1 to Spec R16 has evidence | Planned. |
 | Buffer | Nov 23 to 25 | Fixes; stretch only if all exit criteria pass | Submission | Planned. |
 
@@ -114,7 +114,7 @@ The week column in section 8 shows the roadmap week in which a requirement was p
 | Oct 26 to 28 | W1 exit: oracle, in-process split, protocol frozen, lockfile on both OSes, fault injector skeleton | A and B work in parallel: B on forward, weights and oracle; A on protocol and gateway skeleton. |
 | Oct 29 to Nov 1 | W2 exit: gRPC chain, LAN bring-up, X1a, one end-to-end request, byte counters, X3 | Run the network check (R1.8) and the Host B memory measurement (R1.7) on the first day. |
 | Nov 2 to 8 | W3 and W4 core: concurrency, bounded queues, ordering asserts, heartbeats, epochs, replay, fencing; X7, X5, X6 | Fault tests written with each feature, not afterwards. |
-| Nov 9 to 15 | W5 reduced: delay injection, capacity-aware split, Qwen3-0.6B switch; X4, X9; micro-batching if time remains | |
+| Nov 9 to 15 | W5 reduced: delay injection, capacity-aware split, Qwen3-0.6B switch (deferred by #61); X4, X9; micro-batching if time remains | |
 | Nov 16 to 22 | W6 as planned: repeats, plots, report, demo rehearsed twice | |
 | Nov 23 to 25 | Buffer | Submission. |
 
@@ -193,7 +193,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R1.9 | Script that downloads the pinned model files (SmolLM2-135M-Instruct, Qwen3-0.6B) with checksum verification, into a folder that is not tracked by git. | Must | W1 | B (unconfirmed) | Proposal PG5; G6 |
 | R1.10 | Run-record writer used by every script (fields in section 7.3); `.gitignore` excludes weights and run outputs. | Must | W1 | A (unconfirmed) | Section 7.3 |
 | R1.11 | Decision TA1: is the model ours to choose or supplied? Blocks the final model choice in R1.12. Status: decided 2026-11-01 (#8): the model is ours to choose. | Must | W1 | A and B (unconfirmed) | TA1; Spec R1 |
-| R1.12 | Decision D1: confirm SmolLM2-135M for development and Qwen3-0.6B as the headline model, and use one wording for it across all project documents. Fallbacks: SmolLM2-360M, GPT-2, Qwen3-1.7B with role swap. Status: decided 2026-11-03 (#9): SmolLM2-135M-Instruct for development and tests, Qwen3-0.6B for headline runs; fallback SmolLM2-360M if a Qwen3-0.6B Stage 0 does not fit Host B after #7, Qwen3-1.7B stays stretch, GPT-2 dropped. | Must | W1 | A and B (unconfirmed) | D1; Proposal goals |
+| R1.12 | Decision D1: confirm SmolLM2-135M for development and Qwen3-0.6B as the headline model, and use one wording for it across all project documents. Fallbacks: SmolLM2-360M, GPT-2, Qwen3-1.7B with role swap. Status: decided 2026-11-03 (#9): SmolLM2-135M-Instruct for development and tests, Qwen3-0.6B for headline runs; fallback SmolLM2-360M if a Qwen3-0.6B Stage 0 does not fit Host B after #7, Qwen3-1.7B stays stretch, GPT-2 dropped. Update 2026-11-07 (#61): presented runs use SmolLM2-135M until the pipeline, recovery and the main experiments work end to end; Qwen3-0.6B stays pinned and tested and the presented runs switch back to it if time and the Host B budget allow. | Must | W1 | A and B (unconfirmed) | D1; Proposal goals |
 | R1.13 | Decision TA2: is a gateway as a third process acceptable alongside the two workers? If not, the gateway role moves into a worker. Status: decided 2026-11-01 (#10): the gateway is a separate process; the specification limits only the workers. | Should | W1 | A and B (unconfirmed) | TA2; Spec R1 |
 | R1.14 | Decision TA3: is bit-exact equality per host, with cross-host equality reported as agreement, acceptable? Status: decided 2026-11-01 (#11): bit-exact per host at batch 1, agreement across hosts. | Should | W1 | A and B (unconfirmed) | TA3; Spec R13; G3 |
 
@@ -260,11 +260,11 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R5.4 | Per-request deadline propagated on every hop. | Must | W3 | A (unconfirmed) | Spec R8; Proposal PG3 |
 | R5.5 | Per-step timeout at the gateway. An expired step starts the failure path (Epic E6) or fails the request at its deadline. | Must | W3 | A (unconfirmed) | Spec R8 |
 | R5.6 | No request hangs: every request ends completed, rejected, or failed with a deadline error within its deadline plus a stated tolerance. Test with a suspended worker. | Must | W3 | A (unconfirmed) | Spec R8; X6 |
-| R5.7 | Micro-batching in the stage scheduler: collect up to B decode steps within a window of W ms, pad the KV with an attention mask. Decode only. | Should | W5 | B (unconfirmed) | Spec R9; D7 |
+| R5.7 | Micro-batching in the stage scheduler: collect up to B decode steps within a window of W ms, pad the KV with an attention mask. Decode only: a message with length above 1 (a prompt or a replay prefill) runs alone at batch 1; replay steps run unbatched and fault runs stay at batch 1 (R6.7). | Should | W5 | B (unconfirmed) | Spec R9; D7 |
 | R5.8 | Batch size B in {1, 2, 4, 8} and window W in {0, 2, 5} ms are configurable; B = 1 with W = 0 behaves as the non-batched path. | Should | W5 | B (unconfirmed) | Spec R9; X8 |
 | R5.9 | Micro-batched output is compared with batch-1 tokens and the agreement rate is reported. Batched runs are never used for exact-equality claims. | Should | W5 | B (unconfirmed) | Spec R9; G3 |
 | R5.10 | Tune the KV admission budget from measured KV use. | Could | W6 | A (unconfirmed) | Proposal PG3 |
-| R5.11 | Decision D7: batch prefill as well as decode? Default is decode only. | Could | W5 | A and B (unconfirmed) | D7 |
+| R5.11 | Decision D7: batch prefill as well as decode? Default is decode only. Status: decided 2026-11-07 (#41): decode only; the cost is that a prefill stalls batched decodes, which X8 reports. | Could | W5 | A and B (unconfirmed) | D7 |
 | R5.12 | Decision N4: the step message carries an absolute deadline in unix milliseconds, but the two laptops' wall clocks may differ. Choose either a clock-offset check at start or gateway-only deadline enforcement. Blocks R5.4. | Should | W3 | A and B (unconfirmed) | G4; protocol |
 
 ### Epic E6. Failure recovery and fencing
@@ -287,7 +287,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R6.14 | Both stages failing at once recovers, with longer recovery time (test). | Could | W5 | A (unconfirmed) | Fault model |
 | R6.15 | Stretch, partial replay (experiment X10): Stage 0 keeps its outbound activations per request so a Stage 1 failure replays only Stage 1; compare recompute time with X5. | Could | W6 | B (unconfirmed) | X10; D6 |
 | R6.16 | Stretch, gateway durability: a durable request log lets the gateway restart. Default is out of the fault model, stated in the report. | Could | W6 | A (unconfirmed) | D5 |
-| R6.17 | Decision D6: replay scope. Default is full replay through both stages; the alternative is partial replay (R6.15). Decide by W5. | Should | W5 | A and B (unconfirmed) | D6 |
+| R6.17 | Decision D6: replay scope. Default is full replay through both stages; the alternative is partial replay (R6.15). Decide by W5. Status: decided 2026-11-07 (#51): full replay only; R6.15 stays a stretch, revisited only if Stage 0 busy time during replay in the X5 Stage 1 kill runs exceeds a quarter of recovery time and every Must exit criterion passes. | Should | W5 | A and B (unconfirmed) | D6 |
 | R6.18 | Decision TA4: is full-prompt replay the expected recovery, or should the system checkpoint the KV cache? Status: decided 2026-11-01 (#43): full-prompt replay, as the specification states. | Should | W3 | A and B (unconfirmed) | TA4; Spec R11 |
 
 ### Epic E7. Measurement and experiments
@@ -300,21 +300,21 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R7.4 | Report TTFT, TPOT and end-to-end time per request at p50, p95 and p99. | Must | W3 | A (unconfirmed) | Spec R14 |
 | R7.5 | Report system-wide throughput in output tokens per second. | Must | W3 | A (unconfirmed) | Spec R15 |
 | R7.6 | Report stage utilisation (busy time per stage). | Should | W3 | A (unconfirmed) | X2 |
-| R7.7 | Transport delay-injection wrapper with 0, 1, 5, 20 and 50 ms per hop; toxiproxy as an optional cross-check. | Must | W5 | A (unconfirmed) | X4; Proposal PG6 |
+| R7.7 | Transport delay-injection wrapper with 0, 1, 5, 20 and 50 ms per message on the two LAN hops (gateway to Stage 0 and Stage 0 to Stage 1), injected on Host A and pipelined, not blocking; toxiproxy as an optional cross-check. | Must | W5 | A (unconfirmed) | X4; Proposal PG6 |
 | R7.8 | X1a (single host, exact) and X1b (two laptops, agreement rate, first divergence position, maximum logit difference against each host's single-process reference). | Must | W2 | B (unconfirmed) | X1a; X1b; Spec R13 |
-| R7.9 | X2: concurrency 1, 2, 4, 8, 16 against single-process round-robin serving without batching on each laptop; reports throughput, TTFT, TPOT and stage utilisation. | Must | W3 | A (unconfirmed) | X2; Spec R15 |
+| R7.9 | X2: concurrency 1, 2, 4, 8, 16 against single-process round-robin serving without batching, the primary on Host A only, the reference across the two laptops at concurrency 1, and one Host B single-process run at concurrency 1 that records peak RSS; reports throughput, TTFT, TPOT and stage utilisation. | Must | W3 | A (unconfirmed) | X2; Spec R15 |
 | R7.10 | X3: prompt lengths 16, 128 and 512, 128 decoded tokens; measured bytes per token per hop equal hidden size x 4 B x tokens within framing overhead. | Must | W2 | B (unconfirmed) | X3; Spec R16 |
-| R7.11 | X4: per-token latency and throughput against injected delay of 0, 1, 5, 20 and 50 ms per hop. | Must | W5 | A (unconfirmed) | X4; Spec R14 |
+| R7.11 | X4: per-token latency and throughput against injected delay of 0, 1, 5, 20 and 50 ms per message on the two LAN hops, at concurrency 1 and at a higher concurrency. | Must | W5 | A (unconfirmed) | X4; Spec R14 |
 | R7.12 | X5: kill Stage 1 and separately Stage 0 at token 20 of 64 with 4 requests in flight; detection, respawn, load and replay times; output equals reference. | Must | W4 | A (unconfirmed) | X5; Spec R10; Spec R11 |
 | R7.13 | X6: suspend Stage 1 past the heartbeat timeout and resume after replacement; repeat for Stage 0; stale outputs by reason; duplicate tokens at the client. | Must | W4 | A (unconfirmed) | X6; Spec R12 |
 | R7.14 | X7: offered load above capacity with admission bound on and off, and the credit limit varied; queue depth over time, rejects, p99 latency. With bounds, depth is capped and p99 is bounded. | Must | W3 | A (unconfirmed) | X7; Spec R7 |
-| R7.15 | X8: 16 concurrent requests, B in {1, 2, 4, 8}, W in {0, 2, 5} ms; throughput, latency and token agreement against batch 1. | Should | W5 | B (unconfirmed) | X8; Spec R9 |
+| R7.15 | X8: 16 concurrent requests, B in {1, 2, 4, 8}, W in {0, 2, 5} ms; throughput, latency (TPOT p95 and p99 included, to show the stall a prefill causes) and token agreement against batch 1. | Should | W5 | B (unconfirmed) | X8; Spec R9 |
 | R7.16 | X9: layer split from even down to memory- and speed-balanced; stage busy time, tokens per second, Host B peak RSS and page faults. | Must | W5 | B (unconfirmed) | X9; Proposal PG3 |
 | R7.17 | Every LAN experiment has at least 5 repeats and reports the spread; each run records the network and round-trip time. | Must | W6 | A and B (unconfirmed) | Proposal evaluation setup |
 | R7.18 | Reported numbers come only from the scripts in R7.3; run outputs are not committed. | Must | W6 | A and B (unconfirmed) | G4; section 7.3 |
-| R7.19 | Decision N5: X2 comparison points. Primary is single-process round-robin without batching. Reference is the pipeline at concurrency 1 (gain at most about 2x). Upper bound is a batched single process on Host A, which may beat the pipeline; it is not yet in the X2 plan. Decide whether to add it. | Should | W3 | A and B (unconfirmed) | Proposal expected results; X2 |
-| R7.20 | Decision N6: with the gateway and Stage 1 on Host A, only two hops cross the LAN, so a per-hop delay gives about 2 x delay per token, not 3 x. Confirm which hops get injected delay before fixing the X4 expectation. | Should | W5 | A and B (unconfirmed) | Proposal expected results; X4 |
-| R7.21 | Decision N7: an even split of Qwen3-0.6B may also fit in Host B's budget, so X9 may not separate the splits on memory. Keep Qwen3-0.6B and report speed as well as memory, or add Qwen3-1.7B where memory binds. | Should | W5 | A and B (unconfirmed) | X9; Proposal expected results |
+| R7.19 | Decision N5: X2 comparison points. Primary is single-process round-robin without batching. Reference is the pipeline at concurrency 1 (gain at most about 2x). Upper bound is a batched single process on Host A, which may beat the pipeline; it is not yet in the X2 plan. Decide whether to add it. Status: decided 2026-11-07 (#57), option 3: primary and reference now, the upper bound after R5.7 (#40), the primary on Host A only plus one Host B single-process run at concurrency 1; if micro-batching is cut, the upper bound is cut and the report says so. | Should | W3 | A and B (unconfirmed) | Proposal expected results; X2 |
+| R7.20 | Decision N6: with the gateway and Stage 1 on Host A, only two hops cross the LAN, so a per-hop delay gives about 2 x delay per token, not 3 x. Confirm which hops get injected delay before fixing the X4 expectation. Status: decided 2026-11-07 (#48): the two LAN hops get the delay, and the X4 expectation is about 2 x delay per token. | Should | W5 | A and B (unconfirmed) | Proposal expected results; X4 |
+| R7.21 | Decision N7: an even split of Qwen3-0.6B may also fit in Host B's budget, so X9 may not separate the splits on memory. Keep Qwen3-0.6B and report speed as well as memory, or add Qwen3-1.7B where memory binds. Status: decided 2026-11-07 (#61): SmolLM2-135M for all runs for now, so X9 runs on SmolLM2-135M, where an even split fits Host B and the splits separate on speed and busy time, not on memory; Qwen3-0.6B stays pinned and tested, and Qwen3-1.7B stays a stretch (R8.12). | Should | W5 | A and B (unconfirmed) | X9; Proposal expected results |
 
 ### Epic E8. LAN deployment on both laptops
 
@@ -327,7 +327,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R8.5 | Network fallbacks (direct cable, phone hotspot, Tailscale) work by changing the configuration file only. | Should | W2 | A (unconfirmed) | Proposal special requirements |
 | R8.6 | Capacity-aware layer split: a function chooses k from each host's measured free memory and speed; Host B receives fewer layers than an even split. | Must | W5 | A (unconfirmed) | Spec R3; Proposal PG3 |
 | R8.7 | Host B peak RSS for the chosen split stays within the stated budget and shows no paging to disk (page-fault counter reported). | Must | W5 | B (unconfirmed) | X9; G5 |
-| R8.8 | Presented runs use Qwen3-0.6B fp32 with the balanced split; SmolLM2-135M is kept for development and tests. | Must | W5 | A and B (unconfirmed) | D1; Proposal goals |
+| R8.8 | Presented runs use SmolLM2-135M fp32 with the balanced split until the pipeline, recovery and the main experiments work end to end (decided 2026-11-07, #61); they switch to Qwen3-0.6B if time and the Host B budget allow. SmolLM2-135M is also used for development and tests. | Must | W5 | A and B (unconfirmed) | D1; Proposal goals |
 | R8.9 | Fixed thread count per process, identical in reference and workers for X1a; on a single host each stage gets half the cores. | Must | W2 | B (unconfirmed) | X1a; G3 |
 | R8.10 | Single-host mode: all processes start on one laptop with the same entry points, for tests and X1a. | Must | W2 | A (unconfirmed) | Proposal special requirements |
 | R8.11 | Run discipline: other programs closed, same power state for every run, available memory logged at the start of each run. | Should | W2 | A and B (unconfirmed) | Proposal evaluation setup |
@@ -389,11 +389,11 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 
 | Id | Decision or question | Default or status | Blocks |
 |---|---|---|---|
-| D1 | Model: SmolLM2-135M for development, Qwen3-0.6B for headline runs, with a capacity-aware split. Wording differs across project documents (headline versus headline stretch). | Decided 2026-11-03: as stated, one wording (#9) | R1.12, R8.8 |
+| D1 | Model: SmolLM2-135M for development, Qwen3-0.6B for headline runs, with a capacity-aware split. Wording differs across project documents (headline versus headline stretch). | Decided 2026-11-03: as stated, one wording (#9). Updated 2026-11-07 (#61): SmolLM2-135M for all runs for now | R1.12, R8.8 |
 | D4 | Transport: gRPC with raw tensor bytes against ZeroMQ. | Decided 2026-11-01: gRPC with raw tensor bytes (#4) | R1.4 |
 | D5 | Gateway durability. | Default: out of the fault model; revisit in W6 | R6.16 |
-| D6 | Replay scope: full replay or partial replay (X10). | Default full; decide in W5 | R6.15, R6.17 |
-| D7 | Micro-batching depth: decode only or prefill too. | Default decode only; decide in W5 | R5.11 |
+| D6 | Replay scope: full replay or partial replay (X10). | Default full. Decided 2026-11-07 (#51): full replay | R6.15, R6.17 |
+| D7 | Micro-batching depth: decode only or prefill too. | Default decode only. Decided 2026-11-07 (#41): decode only | R5.11 |
 | D11 | Dashboard, discovery and pairing: scheduled W3 to W5 or stretch. | Unconfirmed; owners unassigned | R9.1 |
 | D12 | Role of the spare Linux MacBook. | Pending since before W2 | R8.13 |
 | D2, D3, D8, D9, D10 | Deployment (gateway and Stage 1 on macOS, Stage 0 on Windows); CPU fp32; hardware confirmed; Host B runs Stage 0; even split of work. | Decided. D10 owners are still marked unconfirmed in this document. | none |
@@ -405,9 +405,9 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 | N2 | Ordering stream wording: bidirectional (specification mapping) or client-streaming (protocol). | Decided 2026-11-01: client-streaming as in the scope proposal (#19) | R3.16 |
 | N3 | gRPC 4 MiB message limit against long prefills. | Decided 2026-11-03: receive limit from config, no chunking (#20) | R3.17 |
 | N4 | Absolute deadlines and unsynchronised clocks. | Raised in this document | R5.12 |
-| N5 | X2 comparison points, adding the batched single-process upper bound. | Raised in this document | R7.19 |
-| N6 | X4 delay hops: expect about 2 x delay or 3 x delay per token. | Raised in this document | R7.20 |
-| N7 | X9 framing if an even split also fits Host B. | Raised in this document | R7.21 |
+| N5 | X2 comparison points, adding the batched single-process upper bound. | Raised in this document. Decided 2026-11-07 (#57): option 3 | R7.19 |
+| N6 | X4 delay hops: expect about 2 x delay or 3 x delay per token. | Raised in this document. Decided 2026-11-07 (#48): the two LAN hops | R7.20 |
+| N7 | X9 framing if an even split also fits Host B. | Raised in this document. Decided 2026-11-07 (#61): SmolLM2-135M for all runs for now | R7.21 |
 | N8 | Real submission and demo dates. | Raised in this document | R10.1 |
 
 ## 10. Traceability
