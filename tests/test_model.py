@@ -8,7 +8,7 @@ from pllm.config import REPO_ROOT
 from pllm.model import Model, ModelConfig
 
 
-def tiny_reference(tmp_path, tie=True, qwen3=False):
+def tiny_reference(tmp_path, tie=True, qwen3=False, layers=2):
     """A small random Llama or Qwen3 saved the way Hugging Face saves it, plus its reference."""
     torch.manual_seed(0)
     # head_dim 32, not hidden_size // heads = 16, so a head_dim read wrongly shows up.
@@ -21,7 +21,7 @@ def tiny_reference(tmp_path, tie=True, qwen3=False):
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
-        num_hidden_layers=2,
+        num_hidden_layers=layers,
         num_attention_heads=4,
         num_key_value_heads=2,
         rms_norm_eps=1e-5,

@@ -90,62 +90,52 @@ class Layer:
 class KVCache:
     """Keys and values per layer, each shaped (kv_heads, positions, head_dim)."""
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, num_layers: int | None = None):
+        """A cache for num_layers layers; all of the model's when left out."""
         empty = torch.empty(config.num_kv_heads, 0, config.head_dim)
-        self.keys = [empty] * config.num_layers
-        self.values = [empty] * config.num_layers
+        count = config.num_layers if num_layers is None else num_layers
+        self.keys = [empty] * count
+        self.values = [empty] * count
 
     def __len__(self) -> int:
         return self.keys[0].shape[1]
 
 
-class Model:
-    def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor]):
+class LayerStack:
+    """A run of decoder layers over hidden states. The whole model and each stage of a
+    split run the same code here, so the split cannot drift from the single process."""
+
+    def __init__(self, config: ModelConfig, layers: list[Layer]):
         self.config = config
-        self.embed = weights["model.embed_tokens.weight"]
-        self.layers = [_layer(weights, i, config.qk_norm) for i in range(config.num_layers)]
-        self.norm = weights["model.norm.weight"]
-        self.lm_head = self.embed if config.tie_word_embeddings else weights["lm_head.weight"]
+        self.layers = layers
         half = config.head_dim // 2
         exponents = torch.arange(0, half, dtype=torch.float32) * 2 / config.head_dim
         self.inv_freq = 1.0 / (config.rope_theta**exponents)
 
-    @classmethod
-    def load(cls, model_dir: str | Path) -> "Model":
-        """Load config.json and model.safetensors from a folder, upcasting to fp32."""
-        model_dir = Path(model_dir)
-        config = ModelConfig.from_file(model_dir / "config.json")
-        weights = {}
-        with safe_open(model_dir / "model.safetensors", framework="pt") as f:
-            for name in f.keys():
-                weights[name] = f.get_tensor(name).to(torch.float32)
-        return cls(config, weights)
-
-    def new_cache(self) -> KVCache:
-        return KVCache(self.config)
-
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int, cache: KVCache) -> torch.Tensor:
-        """Run tokens at positions start_pos onward; return logits shaped (tokens, vocab).
+    def run_layers(self, x: torch.Tensor, start_pos: int, cache: KVCache) -> torch.Tensor:
+        """Run hidden states shaped (tokens, hidden) through these layers.
 
-        The cache is truncated to start_pos before the new keys and values are added,
-        so start_pos may not be past the end of the cache.
+        Layer j of this stack uses cache slot j. The cache is truncated to start_pos
+        before the new keys and values are added, so start_pos may not be past its end.
         """
         if not 0 <= start_pos <= len(cache):
             raise ValueError(f"start_pos {start_pos} outside cache of length {len(cache)}")
-        positions = torch.arange(start_pos, start_pos + len(tokens))
+        positions = torch.arange(start_pos, start_pos + len(x))
         cos, sin = self._rope(positions)
 
-        x = self.embed[tokens]
         for i, layer in enumerate(self.layers):
             x = x + self._attention(
-                i, layer, _rms_norm(x, layer.attn_norm, self.config), cos, sin, start_pos, cache
+                i, layer, rms_norm(x, layer.attn_norm, self.config), cos, sin, start_pos, cache
             )
-            h = _rms_norm(x, layer.mlp_norm, self.config)
+            h = rms_norm(x, layer.mlp_norm, self.config)
             x = x + F.linear(
                 F.silu(F.linear(h, layer.w_gate)) * F.linear(h, layer.w_up), layer.w_down
             )
-        return F.linear(_rms_norm(x, self.norm, self.config), self.lm_head)
+        return x
+
+    def new_cache(self) -> KVCache:
+        return KVCache(self.config, len(self.layers))
 
     def _rope(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         freqs = positions[:, None].to(torch.float32) * self.inv_freq
@@ -159,8 +149,8 @@ class Model:
         k = F.linear(x, layer.wk).view(n, cfg.num_kv_heads, cfg.head_dim).transpose(0, 1)
         v = F.linear(x, layer.wv).view(n, cfg.num_kv_heads, cfg.head_dim).transpose(0, 1)
         if cfg.qk_norm:
-            q = _rms_norm(q, layer.q_norm, cfg)
-            k = _rms_norm(k, layer.k_norm, cfg)
+            q = rms_norm(q, layer.q_norm, cfg)
+            k = rms_norm(k, layer.k_norm, cfg)
         q = q * cos + _rotate_half(q) * sin
         k = k * cos + _rotate_half(k) * sin
 
@@ -179,7 +169,39 @@ class Model:
         return F.linear(out.transpose(0, 1).reshape(n, cfg.num_heads * cfg.head_dim), layer.wo)
 
 
-def _layer(weights: dict[str, torch.Tensor], i: int, qk_norm: bool) -> Layer:
+class Model(LayerStack):
+    def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor]):
+        super().__init__(
+            config,
+            [layer_from_weights(weights, i, config.qk_norm) for i in range(config.num_layers)],
+        )
+        self.embed = weights["model.embed_tokens.weight"]
+        self.norm = weights["model.norm.weight"]
+        self.lm_head = self.embed if config.tie_word_embeddings else weights["lm_head.weight"]
+
+    @classmethod
+    def load(cls, model_dir: str | Path) -> "Model":
+        """Load config.json and model.safetensors from a folder, upcasting to fp32."""
+        model_dir = Path(model_dir)
+        config = ModelConfig.from_file(model_dir / "config.json")
+        weights = {}
+        with safe_open(model_dir / "model.safetensors", framework="pt") as f:
+            for name in f.keys():
+                weights[name] = f.get_tensor(name).to(torch.float32)
+        return cls(config, weights)
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int, cache: KVCache) -> torch.Tensor:
+        """Run tokens at positions start_pos onward; return logits shaped (tokens, vocab).
+
+        The cache is truncated to start_pos before the new keys and values are added,
+        so start_pos may not be past the end of the cache.
+        """
+        x = self.run_layers(self.embed[tokens], start_pos, cache)
+        return F.linear(rms_norm(x, self.norm, self.config), self.lm_head)
+
+
+def layer_from_weights(weights: dict[str, torch.Tensor], i: int, qk_norm: bool) -> Layer:
     p = f"model.layers.{i}."
     return Layer(
         attn_norm=weights[p + "input_layernorm.weight"],
@@ -196,7 +218,7 @@ def _layer(weights: dict[str, torch.Tensor], i: int, qk_norm: bool) -> Layer:
     )
 
 
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, config: ModelConfig) -> torch.Tensor:
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, config: ModelConfig) -> torch.Tensor:
     variance = x.pow(2).mean(-1, keepdim=True)
     return weight * (x * torch.rsqrt(variance + config.rms_norm_eps))
 
