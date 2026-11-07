@@ -73,5 +73,5 @@ uv run ruff format
 ```
 
 `tests/test_model_weights.py` checks the forward pass against the reference library on the
-real SmolLM2-135M weights. It is skipped until the model is downloaded, as in CI, and needs
-about 1.5 GB of free memory.
+real weights of each model. Each model is skipped until it is downloaded, as in CI. Free
+memory needed: about 1.5 GB for SmolLM2-135M and about 5 GB for Qwen3-0.6B.

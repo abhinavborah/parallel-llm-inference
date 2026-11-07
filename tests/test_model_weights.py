@@ -1,18 +1,19 @@
-"""Our forward pass against the reference library on the real SmolLM2-135M weights.
+"""Our forward pass against the reference library on the real model weights.
 
-Needs the downloaded model (uv run python -m pllm.models smollm2-135m) and about
-1.5 GB of free memory, so it is skipped when the weights are absent, as in CI.
+Each model needs its download (uv run python -m pllm.models smollm2-135m qwen3-0.6b)
+and is skipped when its weights are absent, as in CI. Free memory needed: about
+1.5 GB for SmolLM2-135M and about 5 GB for Qwen3-0.6B (ours and the reference in fp32).
 """
 
 import pytest
 import torch
 from tokenizers import Tokenizer
-from transformers import LlamaForCausalLM
+from transformers import LlamaForCausalLM, Qwen3ForCausalLM
 
 from pllm.model import Model
 from pllm.models import MODELS_DIR, PINNED, verify
 
-MODEL_DIR = MODELS_DIR / "smollm2-135m"
+REFERENCE_CLASSES = {"smollm2-135m": LlamaForCausalLM, "qwen3-0.6b": Qwen3ForCausalLM}
 NEW_TOKENS = 16
 
 PROMPTS = [
@@ -38,33 +39,26 @@ PROMPTS = [
     "1, 1, 2, 3, 5, 8,",
 ]
 
-pytestmark = pytest.mark.skipif(
-    not (MODEL_DIR / "model.safetensors").exists(), reason="model weights not downloaded"
-)
+
+@pytest.fixture(scope="module", params=sorted(REFERENCE_CLASSES))
+def model_dir(request):
+    """The verified model folder; a stale or hand-copied file must not produce a result."""
+    model_dir = MODELS_DIR / request.param
+    if not (model_dir / "model.safetensors").exists():
+        pytest.skip(f"{request.param} weights not downloaded")
+    for filename, expected in PINNED[request.param].files.items():
+        verify(model_dir / filename, expected)
+    return model_dir
 
 
-@pytest.fixture(scope="module")
-def verified():
-    """A stale or hand-copied file must not produce an acceptance result."""
-    for filename, expected in PINNED["smollm2-135m"].files.items():
-        verify(MODEL_DIR / filename, expected)
-
-
-@pytest.fixture(scope="module")
-def models(verified):
-    reference = LlamaForCausalLM.from_pretrained(
-        MODEL_DIR, dtype=torch.float32, attn_implementation="eager"
-    ).eval()
-    return reference, Model.load(MODEL_DIR)
-
-
-@pytest.fixture(scope="module")
-def tokenizer(verified):
-    return Tokenizer.from_file(str(MODEL_DIR / "tokenizer.json"))
-
-
-def test_twenty_prompts(models, tokenizer):
-    reference, model = models
+def test_twenty_prompts(model_dir):
+    reference = (
+        REFERENCE_CLASSES[model_dir.name]
+        .from_pretrained(model_dir, dtype=torch.float32, attn_implementation="eager")
+        .eval()
+    )
+    model = Model.load(model_dir)
+    tokenizer = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
     assert len(PROMPTS) == 20
     worst = 0.0
     for prompt in PROMPTS:
@@ -92,5 +86,5 @@ def test_twenty_prompts(models, tokenizer):
                 expected_tokens = torch.cat((expected_tokens, step[None]))
         assert generated == expected_tokens[len(tokens) :].tolist(), prompt
 
-    print(f"max abs logit difference over {len(PROMPTS)} prompts: {worst:.2e}")
+    print(f"{model_dir.name}: max abs logit difference over {len(PROMPTS)} prompts: {worst:.2e}")
     assert worst < 1e-4

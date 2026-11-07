@@ -1,5 +1,8 @@
 """Llama-family forward pass on CPU in fp32, with an explicit KV cache.
 
+Qwen3 is the same architecture plus QK-norm: an RMSNorm over each head of the
+queries and keys, applied before RoPE.
+
 Weights are read from a Hugging Face safetensors file and upcast to fp32. The
 cache holds keys and values for every layer indexed by position: a call with
 start_pos first truncates the cache to start_pos and then appends the new
@@ -27,6 +30,7 @@ class ModelConfig:
     rms_norm_eps: float
     rope_theta: float
     tie_word_embeddings: bool
+    qk_norm: bool = False
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "ModelConfig":
@@ -36,13 +40,15 @@ class ModelConfig:
         rope_theta = rope.get("rope_theta") or cfg.get("rope_theta") or 10000.0
         # Fail loudly on variants this forward pass does not implement.
         unsupported = {
-            "model_type": cfg.get("model_type", "llama") != "llama",
+            "model_type": cfg.get("model_type", "llama") not in ("llama", "qwen3"),
             "rope_scaling": cfg.get("rope_scaling") is not None,
             "rope_type": rope.get("rope_type", "default") != "default",
             "rope_interleaved": cfg.get("rope_interleaved", False),
             "attention_bias": cfg.get("attention_bias", False),
             "mlp_bias": cfg.get("mlp_bias", False),
             "hidden_act": cfg.get("hidden_act", "silu") != "silu",
+            "use_sliding_window": cfg.get("use_sliding_window", False),
+            "layer_types": any(t != "full_attention" for t in cfg.get("layer_types") or []),
         }
         bad = [key for key, is_bad in unsupported.items() if is_bad]
         if bad:
@@ -58,6 +64,7 @@ class ModelConfig:
             rms_norm_eps=cfg["rms_norm_eps"],
             rope_theta=rope_theta,
             tie_word_embeddings=cfg.get("tie_word_embeddings", False),
+            qk_norm=cfg.get("model_type") == "qwen3",
         )
 
     @classmethod
@@ -76,6 +83,8 @@ class Layer:
     w_gate: torch.Tensor
     w_up: torch.Tensor
     w_down: torch.Tensor
+    q_norm: torch.Tensor | None = None
+    k_norm: torch.Tensor | None = None
 
 
 class KVCache:
@@ -94,7 +103,7 @@ class Model:
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor]):
         self.config = config
         self.embed = weights["model.embed_tokens.weight"]
-        self.layers = [_layer(weights, i) for i in range(config.num_layers)]
+        self.layers = [_layer(weights, i, config.qk_norm) for i in range(config.num_layers)]
         self.norm = weights["model.norm.weight"]
         self.lm_head = self.embed if config.tie_word_embeddings else weights["lm_head.weight"]
         half = config.head_dim // 2
@@ -149,6 +158,9 @@ class Model:
         q = F.linear(x, layer.wq).view(n, cfg.num_heads, cfg.head_dim).transpose(0, 1)
         k = F.linear(x, layer.wk).view(n, cfg.num_kv_heads, cfg.head_dim).transpose(0, 1)
         v = F.linear(x, layer.wv).view(n, cfg.num_kv_heads, cfg.head_dim).transpose(0, 1)
+        if cfg.qk_norm:
+            q = _rms_norm(q, layer.q_norm, cfg)
+            k = _rms_norm(k, layer.k_norm, cfg)
         q = q * cos + _rotate_half(q) * sin
         k = k * cos + _rotate_half(k) * sin
 
@@ -167,7 +179,7 @@ class Model:
         return F.linear(out.transpose(0, 1).reshape(n, cfg.num_heads * cfg.head_dim), layer.wo)
 
 
-def _layer(weights: dict[str, torch.Tensor], i: int) -> Layer:
+def _layer(weights: dict[str, torch.Tensor], i: int, qk_norm: bool) -> Layer:
     p = f"model.layers.{i}."
     return Layer(
         attn_norm=weights[p + "input_layernorm.weight"],
@@ -179,6 +191,8 @@ def _layer(weights: dict[str, torch.Tensor], i: int) -> Layer:
         w_gate=weights[p + "mlp.gate_proj.weight"],
         w_up=weights[p + "mlp.up_proj.weight"],
         w_down=weights[p + "mlp.down_proj.weight"],
+        q_norm=weights[p + "self_attn.q_norm.weight"] if qk_norm else None,
+        k_norm=weights[p + "self_attn.k_norm.weight"] if qk_norm else None,
     )
 
 
