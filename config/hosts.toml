@@ -17,3 +17,10 @@ port = 50051
 [stage1]
 host = "127.0.0.1"
 port = 50052
+
+# Split point k per model: stage 0 runs layers 0 to k - 1, stage 1 runs k to the last layer.
+# Always read from this committed file, never from a local copy, so both laptops use the
+# same k. The values are the even splits; the capacity-aware split replaces them.
+[split]
+"smollm2-135m" = 15
+"qwen3-0.6b" = 14

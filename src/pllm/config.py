@@ -55,6 +55,21 @@ def load(path: str | Path | None = None) -> HostConfig:
     return HostConfig(network=network, **endpoints)
 
 
+def split_point(model: str, path: str | Path | None = None) -> int:
+    """The split point k for model from the [split] table: stage 0 has layers 0 to k - 1.
+
+    Read from the committed file, not from PLLM_CONFIG: each laptop points PLLM_CONFIG at
+    its own copy for addresses, and both stages must use the same k.
+    """
+    path = Path(path) if path is not None else DEFAULT_PATH
+    with open(path, "rb") as f:
+        k = tomllib.load(f).get("split", {}).get(model)
+    # bool is a subclass of int, so rule it out explicitly
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise ValueError(f"{path}: [split] needs a positive whole number for {model!r}")
+    return k
+
+
 def _endpoint(data: dict, role: str, path: Path) -> Endpoint:
     section = data.get(role)
     if not isinstance(section, dict):
