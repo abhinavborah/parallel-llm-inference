@@ -89,7 +89,7 @@ Division of work is balanced by estimated effort (A about 14 days, B about 15 da
 
 ## 6. Key dates
 
-The plan assumes a start on 2026-10-12 and 45 days, ending about 2026-11-25. The real submission and demo dates are not confirmed (N8, R10.1); shift this table once they are known. A week is not done until its exit criteria pass.
+The plan assumed a start on 2026-10-12 and 45 days, ending about 2026-11-25. The course has not released the dates; the probable submission deadline is now 2026-11-15 and the demo is probably around 2026-11-20, both reported by Member B and not confirmed by the course (N8, R10.1, #70). The table below keeps its original dates: W6 and the buffer fall after 2026-11-15 and are to be pulled forward, and no story is cut. Shift this table once the real dates are known. A week is not done until its exit criteria pass.
 
 | Week | Dates | Deliverables | Exit criteria | Status on 2026-10-26 |
 |---|---|---|---|---|
@@ -354,7 +354,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 
 | ID | Requirement | Priority | Week | Owner | Source |
 |---|---|---|---|---|---|
-| R10.1 | Decision N8: confirm the real submission and demo dates with the course. The plan assumes about 2026-11-25. Blocks re-baselining section 6. | Must | W3 | A and B (unconfirmed) | Roadmap assumption |
+| R10.1 | Decision N8: confirm the real submission and demo dates with the course. The plan assumed about 2026-11-25. Status: the course has not released the dates; the probable submission deadline is 2026-11-15 and the demo is probably around 2026-11-20 (reported by Member B on 2026-11-07, not confirmed by the course, #70). Blocks re-baselining section 6. | Must | W3 | A and B (unconfirmed) | Roadmap assumption |
 | R10.2 | Final report: description, architecture, protocol, guarantees, results with plots, limitations. Each member writes the sections for their own components and experiments; introduction and conclusion are joint. | Must | W6 | A and B (unconfirmed) | Proposal deliverables |
 | R10.3 | A contribution table in the report that matches the git history and this document's owners. | Must | W6 | A and B (unconfirmed) | Contribution rule |
 | R10.4 | Evidence table: each of Spec R1 to Spec R16 cites a test, a run or a plot. | Must | W6 | A and B (unconfirmed) | O9 |
