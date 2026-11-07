@@ -2,6 +2,7 @@
 
 import ast
 import logging
+import os
 import subprocess
 import sys
 
@@ -136,7 +137,7 @@ def test_layer_ranges_are_parsed_and_checked(tmp_path):
         make_worker(tmp_path, 3, LAYERS + 1)
 
 
-@pytest.mark.parametrize("module", ["worker.py", "split.py", "model.py"])
+@pytest.mark.parametrize("module", ["worker.py", "split.py", "model.py", "config.py", "models.py"])
 def test_worker_code_has_no_operating_system_branches(module):
     tree = ast.parse((REPO_ROOT / "src" / "pllm" / module).read_text(encoding="utf-8"))
     names = {
@@ -149,7 +150,15 @@ def test_worker_code_has_no_operating_system_branches(module):
             names |= {alias.name for alias in n.names}
         elif isinstance(n, ast.ImportFrom):
             names |= {n.module} | {f"{n.module}.{alias.name}" for alias in n.names}
-    branches = {"sys.platform", "os.name", "platform.system", "os.getuid"}
+    branches = {
+        "sys.platform",
+        "os.name",
+        "platform.system",
+        "os.getuid",
+        "os.uname",
+        "sys.getwindowsversion",
+        "ctypes.windll",
+    }
     modules = {"posix", "winreg", "msvcrt", "fcntl", "platform"}
     assert not names & (branches | modules)
 
@@ -229,14 +238,24 @@ def test_a_lookup_parses_the_header_once_and_keeps_no_file_open(tmp_path, monkey
     monkeypatch.setattr("pllm.split.json.loads", refuse)
     ids = torch.tensor([3, 1, 3])
     assert torch.equal(mapped[ids], model.embed[ids])
-    assert all(f.path != str(mapped.path) for f in psutil.Process().open_files())
+    target = os.path.normcase(os.path.realpath(mapped.path))
+
+    def is_open():
+        open_files = psutil.Process().open_files()
+        return any(os.path.normcase(os.path.realpath(f.path)) == target for f in open_files)
+
+    with open(mapped.path, "rb"):
+        assert is_open()  # the control: the check does see an open handle
+    assert not is_open()
 
 
 def test_the_layer_range_comes_from_the_split_point_in_the_hosts_file(tmp_path, monkeypatch):
     tiny_reference(tmp_path, layers=LAYERS)
     hosts = tmp_path / "hosts.toml"
     hosts.write_text("[split]\ntiny = 2\n", encoding="utf-8")
-    monkeypatch.setenv("PLLM_CONFIG", str(hosts))
+    monkeypatch.setattr(config, "DEFAULT_PATH", hosts)
+    # A local copy named by PLLM_CONFIG, without [split], must not matter.
+    monkeypatch.setenv("PLLM_CONFIG", str(tmp_path / "missing.toml"))
     assert stage_layers(tmp_path, "tiny", 0) == (0, 2)
     assert stage_layers(tmp_path, "tiny", 1) == (2, LAYERS)
     with pytest.raises(ValueError, match="needs a positive whole number"):
@@ -330,3 +349,14 @@ def test_smollm2_stage0_peak_rss_is_reported(record_property):
     record_property("stage0_peak_rss_mib", round(peak))
     print(f"smollm2-135m stage 0 peak rss {peak:.0f} MiB")
     assert peak > 0
+
+
+def test_a_mapped_embedding_rejects_a_truncated_file(tmp_path):
+    path = tmp_path / "model.safetensors"
+    save_file({EMBED: torch.ones(64, 8, dtype=torch.bfloat16)}, path)
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) - 16 * 8 * 2])  # cut off the last 16 rows
+    mapped = MappedEmbedding(path)
+    assert mapped[torch.tensor([0, 47])].shape == (2, 8)
+    with pytest.raises(ValueError, match="ends inside the embedding"):
+        mapped[torch.tensor([63])]

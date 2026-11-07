@@ -53,9 +53,14 @@ class MappedEmbedding:
         if entry["dtype"] not in self.DTYPES:
             raise ValueError(f"{self.path}: embedding dtype {entry['dtype']} is not supported")
         self.dtype = self.DTYPES[entry["dtype"]]
+        if len(entry["shape"]) != 2:
+            raise ValueError(f"{self.path}: embedding shape {entry['shape']} is not 2-D")
         self.vocab, self.width = entry["shape"]
         self.row_bytes = self.width * self.dtype.itemsize
-        self.offset = 8 + size + entry["data_offsets"][0]
+        begin, end = entry["data_offsets"]
+        if end - begin != self.vocab * self.row_bytes:
+            raise ValueError(f"{self.path}: embedding data size does not match its shape")
+        self.offset = 8 + size + begin
 
     def __getitem__(self, ids: torch.Tensor) -> torch.Tensor:
         unique, inverse = torch.unique(ids, return_inverse=True)
@@ -69,6 +74,9 @@ class MappedEmbedding:
             for i in unique.tolist():
                 f.seek(self.offset + i * self.row_bytes)
                 data += f.read(self.row_bytes)
+        if len(data) != len(unique) * self.row_bytes:
+            raise ValueError(f"{self.path}: file ends inside the embedding table")
+        # safetensors is little-endian, as are both hosts; frombuffer uses native order.
         rows = torch.frombuffer(data, dtype=self.dtype).view(len(unique), self.width)
         return rows.to(torch.float32)[inverse]
 

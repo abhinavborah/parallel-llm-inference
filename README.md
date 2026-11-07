@@ -71,8 +71,8 @@ uv run python -m pllm.worker smollm2-135m --stage 1
 ```
 
 Each command loads the stage, prints the load time and RSS, and exits. The layer range
-comes from the split point under `[split]` in the hosts file: stage 0 runs layers 0 to
-k - 1 and stage 1 the rest. `--layers START:END` overrides it for tests and split sweeps.
+comes from the split point under `[split]` in the committed `config/hosts.toml` (never a
+local copy, so both laptops agree): stage 0 runs layers 0 to k - 1 and stage 1 the rest. `--layers START:END` overrides it for tests and split sweeps.
 
 ## Hosts and ports
 
