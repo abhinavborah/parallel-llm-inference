@@ -7,7 +7,7 @@ step comes from the last prefill position.
 
 Usage:
 uv run python -m pllm.reference smollm2-135m --length 16 --index 0 --new-tokens 16 --threads 4
-uv run python -m pllm.reference smollm2-135m --text "The capital of France is"
+uv run python -m pllm.reference smollm2-135m --text "The capital of France is" --threads 4
 """
 
 import argparse
@@ -47,27 +47,31 @@ def main(argv: list[str] | None = None) -> None:
     source.add_argument("--length", type=int, choices=prompts.LENGTHS, help="prompt set length")
     parser.add_argument("--index", type=int, default=0, help="prompt set entry, 0 to 49")
     parser.add_argument("--new-tokens", type=int, default=16)
-    parser.add_argument("--threads", type=int, default=torch.get_num_threads())
+    # Required, since the default count differs between hosts and equality runs fix it.
+    parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--device", choices=DEVICES, default="cpu")
     args = parser.parse_args(argv)
+    if not 0 <= args.index < prompts.PASSAGES:
+        parser.error(f"--index must be 0 to {prompts.PASSAGES - 1}")
 
     torch.set_num_threads(args.threads)
-    model_dir = MODELS_DIR / args.model
-    for filename, expected in PINNED[args.model].files.items():
-        verify(model_dir / filename, expected)
-    tokenizer = prompts.load_tokenizer(args.model)
-    if args.text is not None:
-        ids = prompts.encode(tokenizer, args.text)
-    else:
-        ids = prompts.prompts(args.model, args.length)[args.index]
-    model = Model.load(model_dir)
-
     spec = PINNED[args.model]
     with runrecord.record(
         "reference", model=args.model, revision=spec.revision, threads=args.threads
     ) as rec:
+        rec["device"] = args.device
+        model_dir = MODELS_DIR / args.model
+        for filename, expected in spec.files.items():
+            verify(model_dir / filename, expected)
+        tokenizer = prompts.load_tokenizer(args.model)
+        if args.text is not None:
+            ids = prompts.encode(tokenizer, args.text)
+        else:
+            ids = prompts.prompts(args.model, args.length)[args.index]
+        rec["prompt"] = ids
+        model = Model.load(model_dir)
         tokens, top = generate(model, ids, args.new_tokens)
-        rec.update(device=args.device, prompt=ids, tokens=tokens, top_logits=top)
+        rec.update(tokens=tokens, top_logits=top)
     print(json.dumps({"tokens": tokens, "top_logits": top, "text": tokenizer.decode(tokens)}))
 
 

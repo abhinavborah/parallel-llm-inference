@@ -32,7 +32,7 @@ prefills and decodes greedily, and prints the tokens and the top logit of each s
 
 ```
 uv run python -m pllm.reference smollm2-135m --length 128 --index 0 --new-tokens 16 --threads 4
-uv run python -m pllm.reference smollm2-135m --text "The capital of France is"
+uv run python -m pllm.reference smollm2-135m --text "The capital of France is" --threads 4
 ```
 
 `data/prompt_set.json` is the fixed prompt set used by every experiment: 50 passages from

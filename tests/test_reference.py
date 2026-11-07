@@ -54,7 +54,8 @@ def test_generate_matches_argmax_of_a_full_pass():
     for token, logit in zip(tokens, top, strict=True):
         last = model.forward(torch.tensor(sequence), 0, model.new_cache())[-1]
         assert token == last.argmax().item()
-        assert logit == pytest.approx(last.max().item(), abs=1e-5)
+        # Relative: the two shapes sum in a different order, and logits here are around 14.
+        assert logit == pytest.approx(last.max().item(), rel=1e-5)
         sequence.append(token)
 
 
@@ -65,9 +66,62 @@ def test_generate_rejects_empty_input():
         reference.generate(tiny_model(), [1], 0)
 
 
-def test_only_cpu_is_accepted():
+def test_only_cpu_is_accepted(capsys):
     with pytest.raises(SystemExit):
-        reference.main(["smollm2-135m", "--text", "hi", "--device", "cuda"])
+        reference.main(["smollm2-135m", "--text", "hi", "--threads", "1", "--device", "cuda"])
+    assert "--device" in capsys.readouterr().err
+
+
+def test_thread_count_is_required(capsys):
+    with pytest.raises(SystemExit):
+        reference.main(["smollm2-135m", "--text", "hi"])
+    assert "--threads" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("index", ["-1", "50"])
+def test_index_outside_the_prompt_set_is_rejected(capsys, index):
+    with pytest.raises(SystemExit):
+        reference.main(["smollm2-135m", "--length", "16", "--threads", "1", f"--index={index}"])
+    assert "--index must be 0 to 49" in capsys.readouterr().err
+
+
+def only_record(runs_dir):
+    (record_file,) = runs_dir.glob("*-reference.json")
+    return json.loads(record_file.read_text(encoding="utf-8"))
+
+
+def fail(*args, **kwargs):
+    raise RuntimeError("injected")
+
+
+def test_a_failed_load_leaves_an_error_record(tmp_path, monkeypatch):
+    monkeypatch.setattr(runrecord, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(reference, "verify", fail)
+    threads = torch.get_num_threads()
+    with pytest.raises(RuntimeError, match="injected"):
+        reference.main(["smollm2-135m", "--length", "16", "--threads", str(threads)])
+
+    rec = only_record(tmp_path)
+    assert rec["status"] == "error"
+    assert rec["threads"] == threads
+    assert rec["device"] == "cpu"
+
+
+def test_a_failed_decode_records_the_device_and_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(runrecord, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(reference, "verify", lambda path, expected: None)
+    monkeypatch.setattr(reference.prompts, "load_tokenizer", lambda model: None)
+    monkeypatch.setattr(reference.Model, "load", lambda model_dir: tiny_model())
+    monkeypatch.setattr(reference, "generate", fail)
+    threads = torch.get_num_threads()
+    with pytest.raises(RuntimeError, match="injected"):
+        reference.main(["smollm2-135m", "--length", "16", "--threads", str(threads)])
+
+    rec = only_record(tmp_path)
+    assert rec["status"] == "error"
+    assert rec["device"] == "cpu"
+    assert len(rec["prompt"]) == 16
+    assert "tokens" not in rec
 
 
 @pytest.mark.skipif(
