@@ -44,6 +44,17 @@ it from the book's text file:
 uv run python -m pllm.prompts path/to/pg1661.txt
 ```
 
+## Two-stage split in one process
+
+`pllm.split.InProcessSplit.load(model_dir, k)` cuts the model after layer k - 1: stage 0 holds
+the embedding and layers 0 to k-1, stage 1 holds the remaining layers, the final norm and the
+LM head. Each stage reads only its own tensors from the checkpoint. It has the same
+`new_cache` and `forward` calls as the single-process model, so `pllm.reference.generate`
+runs on it unchanged, and its logits are bitwise equal to the single-process ones on one host
+(fp32, batch 1, the same thread count). With tied embeddings the LM head is the embedding
+matrix, so stage 1 loads its own copy. Stage 0 reads the whole embedding into memory; the
+memory-mapped lookup for Host B (R3.2) comes with the stage worker.
+
 ## Hosts and ports
 
 Every process reads its addresses from `config/hosts.toml`. The committed file runs all
