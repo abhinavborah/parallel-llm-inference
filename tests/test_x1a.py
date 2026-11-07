@@ -6,7 +6,7 @@ import pytest
 import torch
 from test_model import tiny_reference
 
-from pllm import x1a
+from pllm import runrecord, x1a
 from pllm.model import Model
 from pllm.split import InProcessSplit
 
@@ -132,6 +132,50 @@ def test_a_nan_difference_is_not_hidden(tmp_path):
     nan_row = torch.tensor([0.0, float("nan"), 0.0, 0.0])
     same, diff = x1a.compare(([0], [row]), ([0], [nan_row]))
     assert same and diff == float("inf")
+    # and it is written as strict JSON, not Infinity
+    fields = x1a.diff_fields(diff)
+    assert fields == {"max_logit_diff": None, "non_finite": True}
+    json.loads(json.dumps(fields, allow_nan=False))
+    assert x1a.diff_fields(0.0) == {"max_logit_diff": 0.0, "non_finite": False}
+
+
+def run_main(tmp_path, monkeypatch, capsys):
+    """main on a tiny model saved under a models folder, with runs/ not yet created."""
+    tiny_reference(tmp_path / "models" / "smollm2-135m", layers=LAYERS)
+    monkeypatch.setattr(x1a, "MODELS_DIR", tmp_path / "models")
+    monkeypatch.setattr(x1a, "verify", lambda path, expected: None)
+    monkeypatch.setattr(x1a.prompts, "prompts", lambda model, length: prompts_for_tests())
+    monkeypatch.setattr(runrecord, "RUNS_DIR", tmp_path / "runs")
+    argv = ["smollm2-135m", "--threads", str(THREADS), "--new-tokens", "4"]
+    code = x1a.main(argv)
+    (record_file,) = (tmp_path / "runs").glob("*-x1a.json")
+    rec = json.loads(record_file.read_text(encoding="utf-8"))
+    rec["record_file"] = record_file
+    return code, rec, capsys.readouterr().out
+
+
+def test_the_lines_are_written_next_to_the_record_on_a_fresh_checkout(
+    tmp_path, monkeypatch, capsys
+):
+    code, rec, out = run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0 and rec["status"] == "ok"
+    lines_file = tmp_path / "runs" / rec["results_file"]
+    assert lines_file == rec["record_file"].with_suffix(".jsonl")
+    text = lines_file.read_text(encoding="utf-8")
+    assert text == out
+    lines = [json.loads(line) for line in text.splitlines()]
+    assert len(lines) == 3 * len(x1a.split_points(LAYERS)) + 1
+    assert all(line["tokens_match"] for line in lines[:-1])
+    assert lines[-1]["type"] == "summary" and lines[-1]["matched"] == len(lines) - 1
+
+
+def test_a_non_finite_difference_fails_the_run(tmp_path, monkeypatch, capsys):
+    real = x1a.compare
+    monkeypatch.setattr(x1a, "compare", lambda want, got: (real(want, got)[0], float("inf")))
+    code, rec, out = run_main(tmp_path, monkeypatch, capsys)
+    assert code == 1
+    assert rec["summary"]["non_finite"] and rec["summary"]["max_logit_diff"] is None
+    assert "Infinity" not in out
 
 
 def test_stored_logit_rows_do_not_keep_the_prefill_output_alive(tmp_path):

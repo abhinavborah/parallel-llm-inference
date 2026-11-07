@@ -58,19 +58,24 @@ memory-mapped lookup for Host B (R3.2) comes with the stage worker.
 ## X1a: the split against the single process
 
 `pllm.x1a` runs the 50 prompts of one length through the single-process model and through
-the two-stage split at the split points 1, n/4, n/2, 3n/4 and n-1. It prints one JSON line
+the two-stage split at the split points 1, n/4, n/2, 3n/4 and n-1. It writes one JSON line
 per prompt and split with the exact token match and the maximum logit difference over the
-full vocabulary, then a summary line, and exits with 0 only at 100 percent token match.
+full vocabulary, then a summary line, to a `.jsonl` file next to the run record in `runs/`
+(named in the record as `results_file`) and to stdout. It exits with 0 only at 100 percent
+token match with finite differences; a non-finite difference is written as `null` with
+`non_finite` true, so every line is strict JSON.
 
 ```
-uv run python -m pllm.x1a smollm2-135m --threads 6 --length 128 > runs/x1a.jsonl
+uv run python -m pllm.x1a smollm2-135m --threads 6 --length 128
 ```
 
 `--threads` is required and is the same for the reference and the split, because equality
 holds only at one thread count. Use the same value on a later run you compare with. The
 run record in `runs/` keeps each prompt's reference tokens and top logits with a sha256
-that also covers the model, prompt set, length, token count and thread count, so the
-references of the two laptops can be compared. The summary line also gives the inter-op
+that also covers the model, prompt set, length, token count and thread count. The checksum
+detects a changed reference on the same host. It differs across hosts, because the top
+logits differ in their low bits there, so across hosts compare the stored tokens per prompt
+and report agreement. The summary line also gives the inter-op
 thread count. The stored logit summary is the top logit per step, not the full logits. `--length` is 16, 128 (the default)
 or 512; `--count` limits the run to the first prompts.
 

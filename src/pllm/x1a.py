@@ -2,20 +2,24 @@
 
 For every prompt of one length and every split point, the split decodes greedily and is
 compared with the single-process reference: the tokens must be identical and the logits
-are compared over the full vocabulary at every step. One JSON line is printed per prompt
-and split, then a summary line. The run passes at 100 percent exact token match, and the
-exit code says so.
+are compared over the full vocabulary at every step. One JSON line is written per prompt
+and split, then a summary line, to a .jsonl file next to the run record in runs/ and to
+stdout. The run passes at 100 percent exact token match with finite logit differences,
+and the exit code says so. A non-finite difference is written as null with non_finite
+true, so every line is strict JSON.
 
 Equality needs one thread count for the reference and the split (R8.9), so --threads is
 required and checked before every decode. The reference runs first for all prompts and its
 model is freed before the splits load, which keeps the peak memory near one model plus
 the logits of the reference run.
 
-The run record keeps each prompt's reference tokens and top logits with a sha256, so
-the two hosts' references can be compared later.
+The run record keeps each prompt's reference tokens and top logits with a sha256. The
+checksum detects a changed reference on the same host. It differs across hosts, because
+the top logits differ in their low bits there, so across hosts the stored tokens are
+compared per prompt and reported as agreement.
 
 Usage:
-uv run python -m pllm.x1a smollm2-135m --threads 6 --length 128 > runs/x1a.jsonl
+uv run python -m pllm.x1a smollm2-135m --threads 6 --length 128
 """
 
 import argparse
@@ -54,6 +58,12 @@ def compare(
         if expected[0][step] != got[0][step]:
             break
     return expected[0] == got[0], max_diff
+
+
+def diff_fields(diff: float) -> dict:
+    """The difference as strict JSON: null with non_finite true when it is not finite."""
+    finite = math.isfinite(diff)
+    return {"max_logit_diff": diff if finite else None, "non_finite": not finite}
 
 
 def reference_entries(
@@ -121,7 +131,7 @@ def run_sweep(
                 "index": index,
                 "split": k,
                 "tokens_match": same,
-                "max_logit_diff": diff,
+                **diff_fields(diff),
             }
         del split
     yield {
@@ -129,7 +139,7 @@ def run_sweep(
         "comparisons": total,
         "matched": matched,
         "match_percent": 100.0 * matched / total if total else 0.0,
-        "max_logit_diff": worst,
+        **diff_fields(worst),
         "split_points": points,
         "threads": threads,
         "new_tokens": new_tokens,
@@ -164,31 +174,37 @@ def main(argv: list[str] | None = None) -> int:
         ids_list = prompts.prompts(args.model, args.length)[: args.count]
         points = split_points(ModelConfig.from_file(model_dir / "config.json").num_layers)
         rec.update(length=args.length, new_tokens=args.new_tokens, split_points=points)
+        lines_path = runrecord.output_path(rec, ".jsonl")
+        rec["results_file"] = lines_path.name
         summary = {}
-        for line in run_sweep(
-            lambda: Model.load(model_dir),
-            lambda k: InProcessSplit.load(model_dir, k),
-            ids_list,
-            points,
-            args.new_tokens,
-            args.threads,
-            identity={
-                "model": args.model,
-                "revision": spec.revision,
-                "length": args.length,
-                "new_tokens": args.new_tokens,
-                "threads": args.threads,
-                "prompt_set_sha256": prompts.PROMPTS_SHA256,
-            },
-        ):
-            if line["type"] == "summary":
-                summary = line
-                line = {key: value for key, value in line.items() if key != "reference"}
-            print(json.dumps(line), flush=True)
+        with lines_path.open("w", encoding="utf-8") as out:
+            for line in run_sweep(
+                lambda: Model.load(model_dir),
+                lambda k: InProcessSplit.load(model_dir, k),
+                ids_list,
+                points,
+                args.new_tokens,
+                args.threads,
+                identity={
+                    "model": args.model,
+                    "revision": spec.revision,
+                    "length": args.length,
+                    "new_tokens": args.new_tokens,
+                    "threads": args.threads,
+                    "prompt_set_sha256": prompts.PROMPTS_SHA256,
+                },
+            ):
+                if line["type"] == "summary":
+                    summary = line
+                    line = {key: value for key, value in line.items() if key != "reference"}
+                text = json.dumps(line, allow_nan=False)
+                out.write(text + "\n")
+                print(text, flush=True)
         rec["reference"] = summary["reference"]
         rec["reference_sha256"] = summary["reference_sha256"]
         rec["summary"] = {k: v for k, v in summary.items() if k != "reference"}
-    return 0 if summary["matched"] == summary["comparisons"] else 1
+    passed = summary["matched"] == summary["comparisons"] and not summary["non_finite"]
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
