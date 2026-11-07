@@ -6,20 +6,20 @@ import grpc
 import pytest
 
 from pllm import config
-from pllm.control import ControlService, ExpectedModel, Registry, expected_models, register
+from pllm.control import ControlService, ExpectedModel, Registry, expected_model, register
 from pllm.models import MODELS_DIR, PINNED
 from pllm.proto import protocol_pb2_grpc
 
 MODEL = "smollm2-135m"
 SHA = PINNED[MODEL].files["model.safetensors"]
-EXPECTED = {MODEL: ExpectedModel(bytes.fromhex(SHA), num_layers=30, split_point=15)}
+EXPECTED = ExpectedModel(bytes.fromhex(SHA), num_layers=30, split_point=15)
 ADDR = "10.0.0.2:50051"
 
 
 @pytest.fixture
 def gateway():
     """A Control server on a free localhost port, and a channel to it."""
-    registry = Registry(EXPECTED)
+    registry = Registry(MODEL, EXPECTED)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     protocol_pb2_grpc.add_ControlServicer_to_server(ControlService(registry), server)
     port = server.add_insecure_port("127.0.0.1:0")
@@ -54,7 +54,7 @@ def test_an_accepted_stage_gets_an_epoch_and_is_recorded(gateway):
 
 def test_a_mismatched_model_or_weights_hash_is_rejected(gateway):
     _, channel = gateway
-    assert "model_id 'qwen3-0.6b'" in rejected(channel, model_id="qwen3-0.6b")
+    assert "model_id 'qwen3-0.6b' does not match" in rejected(channel, model_id="qwen3-0.6b")
     assert "weights_sha256" in rejected(channel, weights_sha256="00" * 32)
 
 
@@ -95,12 +95,34 @@ def test_concurrent_registrations_get_distinct_epochs(gateway):
     assert sorted(epochs) == list(range(1, 41))
 
 
+def test_stages_of_two_different_models_cannot_both_register(gateway):
+    registry, channel = gateway
+    register(channel, 0, (0, 15), MODEL, SHA, ADDR)
+    qwen_sha = PINNED["qwen3-0.6b"].files["model.safetensors"]
+    assert "does not match" in rejected(
+        channel, stage=1, layers=(14, 28), model_id="qwen3-0.6b", weights_sha256=qwen_sha
+    )
+    assert set(registry.stages) == {0}
+
+
+def test_the_gateway_fails_at_start_without_the_model_config(tmp_path, monkeypatch):
+    monkeypatch.setattr("pllm.control.MODELS_DIR", tmp_path)
+    with pytest.raises(ValueError, match="missing on the gateway host"):
+        expected_model(MODEL)
+    with pytest.raises(ValueError, match="not a pinned model"):
+        expected_model("gpt-2")
+
+
 @pytest.mark.skipif(
     not (MODELS_DIR / MODEL / "config.json").exists(), reason="model weights not downloaded"
 )
 def test_the_gateway_expects_the_pinned_hash_and_the_committed_split():
-    expected = expected_models()[MODEL]
+    expected = expected_model(MODEL)
     assert expected.weights_sha256 == bytes.fromhex(SHA)
     assert expected.num_layers == 30
     assert expected.layer_range(0) == (0, config.split_point(MODEL))
     assert expected.layer_range(1) == (config.split_point(MODEL), 30)
+    # A split sweep passes its own k, and the range follows it.
+    assert expected_model(MODEL, split_point=10).layer_range(1) == (10, 30)
+    with pytest.raises(ValueError, match="outside 1 to 29"):
+        expected_model(MODEL, split_point=30)

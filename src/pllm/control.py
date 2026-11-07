@@ -1,8 +1,8 @@
 """Stage registration and epochs: the gateway side of Control.Register (R3.3, R4.4).
 
 A stage registers with its index, layer range, model id, weights hash and address. The
-gateway checks each against what it expects and either rejects the stage with
-INVALID_ARGUMENT, naming the field, or accepts it and returns a new epoch.
+gateway serves one model per run and checks each field against it, then either rejects
+the stage with INVALID_ARGUMENT, naming the field, or accepts it and returns a new epoch.
 
 Epochs come from one counter in the gateway, starting at 1 (0 means the gateway as a
 sender). Every accepted registration gets the next value, so a stage that registers
@@ -36,19 +36,23 @@ class ExpectedModel:
         return (0, k) if stage == 0 else (k, self.num_layers)
 
 
-def expected_models() -> dict[str, ExpectedModel]:
-    """The pinned models whose config is present, with their weights hash, layer count
-    and committed split point."""
-    expected = {}
-    for model, pin in PINNED.items():
-        path = MODELS_DIR / model / "config.json"
-        if path.exists():
-            expected[model] = ExpectedModel(
-                bytes.fromhex(pin.files["model.safetensors"]),
-                ModelConfig.from_file(path).num_layers,
-                config.split_point(model),
-            )
-    return expected
+def expected_model(model: str, split_point: int | None = None) -> ExpectedModel:
+    """What the gateway expects for the one model it serves: the pinned weights hash, the
+    layer count and the split point (the committed one unless a sweep passes another).
+
+    Fails at gateway start, not at the first Register, if the model is not pinned or its
+    config is not on this host.
+    """
+    if model not in PINNED:
+        raise ValueError(f"{model!r} is not a pinned model")
+    path = MODELS_DIR / model / "config.json"
+    if not path.exists():
+        raise ValueError(f"{path} is missing on the gateway host; download {model} first")
+    n = ModelConfig.from_file(path).num_layers
+    k = config.split_point(model) if split_point is None else split_point
+    if not 1 <= k <= n - 1:
+        raise ValueError(f"split point {k} for {model} outside 1 to {n - 1}")
+    return ExpectedModel(bytes.fromhex(PINNED[model].files["model.safetensors"]), n, k)
 
 
 class Registration(ValueError):
@@ -68,16 +72,20 @@ class Registered:
 class Registry:
     """Checks registrations and hands out epochs. Safe to call from many threads."""
 
-    def __init__(self, expected: dict[str, ExpectedModel]):
+    def __init__(self, model_id: str, expected: ExpectedModel):
+        self.model_id = model_id
         self.expected = expected
         self.stages: dict[int, Registered] = {}  # latest accepted per stage
         self._last_epoch = 0
         self._lock = threading.Lock()
 
     def register(self, req: protocol_pb2.RegisterReq) -> Registered:
-        model = self.expected.get(req.model_id)
-        if model is None:
-            raise Registration(f"model_id {req.model_id!r} is not one this gateway serves")
+        model = self.expected
+        if req.model_id != self.model_id:
+            raise Registration(
+                f"model_id {req.model_id!r} does not match {self.model_id!r}, "
+                "the model this gateway serves"
+            )
         if req.weights_sha256 != model.weights_sha256:
             raise Registration(f"weights_sha256 does not match the pinned {req.model_id}")
         if req.stage not in STAGES:
