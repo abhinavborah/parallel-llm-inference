@@ -17,8 +17,9 @@ compete with the system's mDNS responder). With several network adapters, pass
     the other:     uv run python -m pllm.netcheck multicast-send
 
 Windows only, from an administrator PowerShell (reading firewall rules needs it): the
-network profile of each adapter and the inbound rules for the Stage 0 port and the
-multicast port.
+network profile of each adapter and the inbound rules for the role ports, the multicast
+test port and UDP 5353, which discovery will use. Only rules that apply to any program or
+to the interpreter running the check count.
 
     uv run python -m pllm.netcheck firewall --roles stage0
 
@@ -28,6 +29,7 @@ Every probe, listen and firewall run writes a run record.
 import argparse
 import json
 import math
+import os
 import socket
 import statistics
 import struct
@@ -41,6 +43,10 @@ from pllm import config, runrecord
 PAYLOAD = 64
 MCAST_GROUP = "224.0.0.251"
 MCAST_PORT = 50059
+# The port discovery (R9.7, optional) will announce on. The multicast test above uses its
+# own port so it does not compete with the system's mDNS responder, so the firewall check
+# looks at this one as well.
+MDNS_PORT = 5353
 MCAST_TAG = b"pllm-netcheck"
 
 
@@ -140,12 +146,16 @@ def parse_multicast(data: bytes) -> dict | None:
 
 
 # Profiles need no rights; rules need an administrator shell, so an error there is
-# reported, never read as "no rule". A rule counts when its local port is the port, a
-# range holding it, or any port for a python program (what the "Allow access" prompt
-# creates). Block rules are listed too: on Windows a block rule wins over an allow rule.
+# reported, never read as "no rule". A rule counts when its local port is the port or a
+# range holding it, or any port for one of the interpreters that run this check (what the
+# "Allow access" prompt creates), and its program is any program or one of those
+# interpreters. Another python on the laptop does not count, and neither does a rule that
+# names its program with an environment variable or a short path. Block rules are listed too:
+# on Windows a block rule wins over an allow rule.
 FIREWALL_SCRIPT = """
 $ErrorActionPreference = 'Stop'
 $wanted = @({wanted})
+$interpreters = @({interpreters})
 $profiles = @(Get-NetConnectionProfile | ForEach-Object {{
   [pscustomobject]@{{ interface = $_.InterfaceAlias; name = $_.Name;
                       category = $_.NetworkCategory.ToString() }} }})
@@ -172,9 +182,10 @@ try {{
         $f = $_
         Get-NetFirewallRule -AssociatedNetFirewallPortFilter $f |
           Where-Object {{ $_.Direction -eq 'Inbound' -and $_.Enabled -eq 'True' }} |
-          ForEach-Object {{ Row $_ $f $want }} }})
+          ForEach-Object {{ Row $_ $f $want }} |
+      Where-Object {{ $_.program -eq 'Any' -or $interpreters -contains $_.program }} }})
     $rules += @(Get-NetFirewallApplicationFilter |
-      Where-Object {{ $_.Program -like '*python*' }} | ForEach-Object {{
+      Where-Object {{ $interpreters -contains $_.Program }} | ForEach-Object {{
         $r = Get-NetFirewallRule -AssociatedNetFirewallApplicationFilter $_
         $f = $r | Get-NetFirewallPortFilter
         if ($r.Direction -eq 'Inbound' -and $r.Enabled -eq 'True' -and
@@ -224,15 +235,44 @@ def parse_firewall(raw: str, wanted: list[tuple[str, int]]) -> dict:
     }
 
 
-def firewall(wanted: list[tuple[str, int]]) -> dict:
+def interpreters() -> list[str]:
+    """The interpreter running this check and the one a virtual environment launches.
+
+    In a virtual environment on Windows python.exe is a launcher, and the process that
+    listens is the base interpreter, so a rule can name either of them.
+    """
+    found = []
+    for path in (sys.executable, getattr(sys, "_base_executable", "")):
+        for candidate in (path, os.path.realpath(path)) if path else ():
+            candidate = os.path.normpath(candidate)
+            if candidate not in found:
+                found.append(candidate)
+    return found
+
+
+def describe_rule(rule: dict) -> str:
+    return (
+        f"rule {rule['name']}: {rule['action']} {rule['protocol']} {rule['ports']}, "
+        f"{rule['profile']}, program {rule.get('program') or 'Any'}"
+    )
+
+
+def wanted_ports(roles: list[str]) -> list[tuple[str, int]]:
+    """The role ports, this check's multicast port and the discovery port."""
+    tcp = [("TCP", e.port) for e in _endpoints(roles).values()]
+    return tcp + [("UDP", MCAST_PORT), ("UDP", MDNS_PORT)]
+
+
+def firewall(wanted: list[tuple[str, int]], programs: list[str] | None = None) -> dict:
     spec = ",".join(f"@{{protocol='{proto}'; port={port}}}" for proto, port in wanted)
+    quoted = ",".join("'" + p.replace("'", "''") + "'" for p in programs or interpreters())
     out = subprocess.run(
         [
             "powershell",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            FIREWALL_SCRIPT.format(wanted=spec),
+            FIREWALL_SCRIPT.format(wanted=spec, interpreters=quoted),
         ],
         capture_output=True,
         text=True,
@@ -273,7 +313,7 @@ def _probe_roles(roles: list[str], count: int) -> None:
 def _firewall(parser: argparse.ArgumentParser, roles: list[str]) -> None:
     if sys.platform != "win32":
         parser.error("the firewall check is for Windows")
-    wanted = [("TCP", e.port) for e in _endpoints(roles).values()] + [("UDP", MCAST_PORT)]
+    wanted = wanted_ports(roles)
     with runrecord.record("network-check") as rec:
         report = firewall(wanted)
         rec.update(check="firewall", **report)
@@ -286,7 +326,7 @@ def _firewall(parser: argparse.ArgumentParser, roles: list[str]) -> None:
         print("run this check again from an administrator PowerShell")
         return
     for r in report["rules"]:
-        print(f"rule {r['name']}: {r['action']} {r['protocol']} {r['ports']}, {r['profile']}")
+        print(describe_rule(r))
     for target, ok in report["allowed_on_private"].items():
         print(f"{target}: {'allowed' if ok else 'NOT allowed'} on the Private profile")
         if not ok:
@@ -295,6 +335,8 @@ def _firewall(parser: argparse.ArgumentParser, roles: list[str]) -> None:
                 f'  New-NetFirewallRule -DisplayName "pllm {port}" -Direction Inbound '
                 f"-Protocol {protocol} -LocalPort {port} -Profile Private -Action Allow"
             )
+    print(f"UDP {MDNS_PORT} is mDNS, which discovery will use; UDP {MCAST_PORT} is only the")
+    print("port of this check's multicast test.")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -314,6 +356,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--interface", **interface)
     sub.add_parser("firewall").add_argument("--roles", **roles)
     args = parser.parse_args(argv)
+    if args.command == "probe" and args.count < 1:
+        parser.error("--count must be at least 1")
 
     if args.command == "serve":
         stop = threading.Event()

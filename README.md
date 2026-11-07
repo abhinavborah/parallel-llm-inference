@@ -47,7 +47,8 @@ power state and dates.
 ## Host checks
 
 Host B memory, with every other program closed and the charger in. Also note Task Manager's
-"Available" figure (Performance, Memory) at the same time:
+"Available" figure (Performance, Memory) at the same time, and write it in the R1.7 row of the
+BRD with the date:
 
 ```
 uv run python -m pllm.hostmem

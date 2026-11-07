@@ -161,6 +161,59 @@ def test_unreadable_rules_give_no_verdict_instead_of_not_allowed():
     assert report["rules_error"] == "Access is denied."
 
 
+def test_the_firewall_script_names_this_interpreter_and_no_other_python(monkeypatch):
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, stdout='{"profiles": [], "rules": []}')
+
+    monkeypatch.setattr(netcheck.subprocess, "run", fake_run)
+    monkeypatch.setattr(netcheck.sys, "executable", r"C:\Envs\O'Neil\venv\python.exe")
+    monkeypatch.setattr(netcheck.sys, "_base_executable", r"C:\Python\python.exe", raising=False)
+    netcheck.firewall(WANTED)
+    (script,) = seen
+    assert "'*python*'" not in script
+    assert "O''Neil" in script  # a quote in a path cannot end the PowerShell string
+    assert "python.exe" in script and "Python" in script
+
+
+def test_interpreters_lists_the_running_and_the_base_interpreter(monkeypatch):
+    monkeypatch.setattr(netcheck.sys, "executable", "/envs/venv/bin/python")
+    monkeypatch.setattr(netcheck.sys, "_base_executable", "/usr/bin/python3", raising=False)
+    found = [p.replace("\\", "/") for p in netcheck.interpreters()]
+    assert any(p.endswith("envs/venv/bin/python") for p in found)
+    assert any(p.endswith("usr/bin/python3") for p in found)
+    assert len(found) == len(set(found))
+
+
+def test_a_rule_line_names_its_program():
+    rule = {
+        "name": "python",
+        "action": "Allow",
+        "protocol": "TCP",
+        "ports": "Any",
+        "profile": "Private",
+        "program": r"C:\Python\python.exe",
+    }
+    assert netcheck.describe_rule(rule).endswith(r"program C:\Python\python.exe")
+    assert netcheck.describe_rule(rule | {"program": ""}).endswith("program Any")
+
+
+def test_the_firewall_check_covers_the_role_ports_and_both_udp_ports():
+    wanted = netcheck.wanted_ports(["stage0", "gateway"])
+    assert wanted[-2:] == [("UDP", 50059), ("UDP", 5353)]
+    assert len([p for p in wanted if p[0] == "TCP"]) == 2
+
+
+def test_probe_rejects_a_count_below_one(capsys):
+    for count in ("0", "-3"):
+        with pytest.raises(SystemExit) as stop:
+            netcheck.main(["probe", "--roles", "stage0", "--count", count])
+        assert stop.value.code == 2
+    assert "--count must be at least 1" in capsys.readouterr().err
+
+
 def test_a_failing_powershell_run_is_raised(monkeypatch):
     def failed(*args, **kwargs):
         return subprocess.CompletedProcess(args, 1, stdout="", stderr="boom")
