@@ -25,6 +25,25 @@ uv run python -m pllm.models smollm2-135m
 uv run python -m pllm.models qwen3-0.6b
 ```
 
+## Reference runner and prompt set
+
+The single-process reference runs the same forward pass on CPU in fp32: it tokenises,
+prefills and decodes greedily, and prints the tokens and the top logit of each step.
+
+```
+uv run python -m pllm.reference smollm2-135m --length 128 --index 0 --new-tokens 16 --threads 4
+uv run python -m pllm.reference smollm2-135m --text "The capital of France is" --threads 4
+```
+
+`data/prompt_set.json` is the fixed prompt set used by every experiment: 50 passages from
+The Adventures of Sherlock Holmes (Project Gutenberg ebook 1661), each cut to 16, 128 and 512
+tokens, with token ids stored per pinned tokenizer. Its sha256 is checked on load. To rebuild
+it from the book's text file:
+
+```
+uv run python -m pllm.prompts path/to/pg1661.txt
+```
+
 ## Hosts and ports
 
 Every process reads its addresses from `config/hosts.toml`. The committed file runs all
