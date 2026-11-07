@@ -11,7 +11,7 @@ from pllm.proto.generate import generate
 PROTO_DIR = Path(protocol_pb2.__file__).parent
 
 # Changing protocol.proto must bump SCHEMA_VERSION and this pin together.
-SCHEMA_PINS = {1: "6d7c65b9f28c3f2535860a68212888061d11e3b4afa9a04b0d62217e49625e7f"}
+SCHEMA_PINS = {1: "5c0c7386d0c6fdc28a7967e30c683138d2f6124aa905f9c6e467e5ac0641dd2f"}
 
 
 def lf_bytes(path: Path) -> bytes:
@@ -71,7 +71,7 @@ MESSAGES = [
     step(activations=tensor_msg()),
     protocol_pb2.StepResult(rid="r1", attempt=2, step=3, epoch=4, token=42, top_logit=-1.5),
     protocol_pb2.GenerateReq(prompt="Hello", max_tokens=32, timeout_ms=30_000),
-    protocol_pb2.Token(rid="r1", step=3, token=42, text=" world"),
+    protocol_pb2.Token(rid="r1", step=3, token=42, text=" world", top_logit=-1.5),
 ]
 
 

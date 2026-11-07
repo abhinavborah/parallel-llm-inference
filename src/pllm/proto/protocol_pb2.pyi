@@ -163,13 +163,15 @@ class GenerateReq(_message.Message):
     def __init__(self, prompt: _Optional[str] = ..., max_tokens: _Optional[int] = ..., timeout_ms: _Optional[int] = ...) -> None: ...
 
 class Token(_message.Message):
-    __slots__ = ("rid", "step", "token", "text")
+    __slots__ = ("rid", "step", "token", "text", "top_logit")
     RID_FIELD_NUMBER: _ClassVar[int]
     STEP_FIELD_NUMBER: _ClassVar[int]
     TOKEN_FIELD_NUMBER: _ClassVar[int]
     TEXT_FIELD_NUMBER: _ClassVar[int]
+    TOP_LOGIT_FIELD_NUMBER: _ClassVar[int]
     rid: str
     step: int
     token: int
     text: str
-    def __init__(self, rid: _Optional[str] = ..., step: _Optional[int] = ..., token: _Optional[int] = ..., text: _Optional[str] = ...) -> None: ...
+    top_logit: float
+    def __init__(self, rid: _Optional[str] = ..., step: _Optional[int] = ..., token: _Optional[int] = ..., text: _Optional[str] = ..., top_logit: _Optional[float] = ...) -> None: ...

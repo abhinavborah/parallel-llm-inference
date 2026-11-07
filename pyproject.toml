@@ -24,6 +24,10 @@ dev = [
     "transformers==5.20.2",
 ]
 
+# The format of uv.lock depends on the uv that writes it, so both laptops use this or newer.
+[tool.uv]
+required-version = ">=0.13.0"
+
 # Linux has no CPU-only torch wheel on PyPI, so CI on Linux takes it from the
 # PyTorch CPU index. macOS and Windows wheels on PyPI are already CPU builds.
 [tool.uv.sources]

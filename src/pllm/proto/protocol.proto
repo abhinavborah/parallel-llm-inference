@@ -130,4 +130,5 @@ message Token {
   uint32 step = 2;
   uint32 token = 3;
   string text = 4;
+  float top_logit = 5;  // logit of this token, for the cross-host agreement report
 }
