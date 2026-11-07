@@ -83,10 +83,17 @@ def record(
     finally:
         rec["status"] = status
         rec["ended"] = datetime.now(UTC).isoformat()
-        out_dir = Path(runs_dir) if runs_dir is not None else RUNS_DIR
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{started:%Y%m%dT%H%M%S%fZ}-{script}.json"
+        path = output_path(rec, ".json", runs_dir)
         path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+
+
+def output_path(rec: dict, suffix: str, runs_dir: str | Path | None = None) -> Path:
+    """A file next to rec's record with the same name and another suffix, for output too
+    large for the record itself. Its folder is created if missing."""
+    out_dir = Path(runs_dir) if runs_dir is not None else RUNS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    started = datetime.fromisoformat(rec["started"])
+    return out_dir / f"{started:%Y%m%dT%H%M%S%fZ}-{rec['script']}{suffix}"
 
 
 def _git(*args: str) -> str:

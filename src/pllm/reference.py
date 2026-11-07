@@ -23,20 +23,27 @@ from pllm.models import MODELS_DIR, PINNED, verify
 DEVICES = ("cpu",)
 
 
-def generate(model: Model, ids: list[int], new_tokens: int) -> tuple[list[int], list[float]]:
-    """Prefill ids, then decode greedily; return the new tokens and the top logit per step."""
+def decode(model: Model, ids: list[int], new_tokens: int) -> tuple[list[int], list[torch.Tensor]]:
+    """Prefill ids, then decode greedily; return the new tokens and the logits behind each."""
     if not ids or new_tokens < 1:
         raise ValueError("need at least one prompt token and one new token")
     cache = model.new_cache()
     logits = model.forward(torch.tensor(ids), 0, cache)[-1]
-    tokens, top = [], []
+    tokens, rows = [], []
     for pos in range(len(ids), len(ids) + new_tokens):
-        value, best = logits.max(dim=-1)
+        _, best = logits.max(dim=-1)
         tokens.append(best.item())
-        top.append(value.item())
+        # A copy, so a stored row does not keep the whole prefill output alive.
+        rows.append(logits.clone())
         if len(tokens) < new_tokens:
             logits = model.forward(best[None], pos, cache)[-1]
-    return tokens, top
+    return tokens, rows
+
+
+def generate(model: Model, ids: list[int], new_tokens: int) -> tuple[list[int], list[float]]:
+    """Prefill ids, then decode greedily; return the new tokens and the top logit per step."""
+    tokens, rows = decode(model, ids, new_tokens)
+    return tokens, [row.max().item() for row in rows]
 
 
 def main(argv: list[str] | None = None) -> None:
