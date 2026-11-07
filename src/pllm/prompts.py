@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("book", type=Path, help=f"the text file from {BOOK['text_url']}")
     args = parser.parse_args(argv)
     with runrecord.record("prompt_set") as rec:
-        rec.update(book_sha256=BOOK["sha256"])
+        rec.update(book_sha256=sha256_of(args.book), pinned_book_sha256=BOOK["sha256"])
         verify(args.book, BOOK["sha256"])
         tokenizers = {}
         for name, spec in PINNED.items():

@@ -3,7 +3,7 @@ import json
 import pytest
 
 from pllm import prompts, runrecord
-from pllm.models import MODELS_DIR, PINNED, ChecksumError
+from pllm.models import MODELS_DIR, PINNED, ChecksumError, sha256_of
 
 
 @pytest.fixture(scope="module")
@@ -59,10 +59,11 @@ def test_every_cut_round_trips(data, model):
 
 
 class CharTokenizer:
-    """One id per character; offset makes two tokenizers give different ids."""
+    """One id per character; offset makes two tokenizers give different ids. A broken
+    tokenizer never round-trips; one with a marker fails only on text containing it."""
 
-    def __init__(self, offset=0, broken=False):
-        self.offset, self.broken = offset, broken
+    def __init__(self, offset=0, broken=False, marker=None):
+        self.offset, self.broken, self.marker = offset, broken, marker
 
     def encode(self, text, add_special_tokens=False):
         ids = [ord(c) + self.offset for c in text]
@@ -70,7 +71,8 @@ class CharTokenizer:
 
     def decode(self, ids):
         text = "".join(chr(i - self.offset) for i in ids)
-        return text + "x" if self.broken else text  # broken: never round-trips
+        fails = self.broken or (self.marker is not None and self.marker in text)
+        return text + "x" if fails else text
 
 
 def synthetic_book(paragraphs=110):
@@ -113,4 +115,29 @@ def test_a_rebuild_with_the_wrong_book_writes_an_error_record(tmp_path, monkeypa
         prompts.main([str(book)])
     (record_file,) = (tmp_path / "runs").glob("*-prompt_set.json")
     rec = json.loads(record_file.read_text(encoding="utf-8"))
-    assert rec["status"] == "error" and rec["book_sha256"] == prompts.BOOK["sha256"]
+    assert rec["status"] == "error"
+    assert rec["book_sha256"] == sha256_of(book) != rec["pinned_book_sha256"]
+
+
+def test_passages_never_overlap_and_skip_a_start_that_does_not_round_trip():
+    """Slots of 3 paragraphs. Paragraphs 30 to 33 are short, so passage 10 spans into slot
+    11 and passage 11 must start after it. Paragraph 6 opens slot 2 but does not
+    round-trip for one tokenizer, so passage 2 must start at paragraph 7."""
+    paras = [
+        f"P{i:03d} " + ("BAD " if i == 6 else "") + "word " * (30 if 30 <= i <= 33 else 120)
+        for i in range(150)
+    ]
+    paras[0] = prompts.FIRST_PARAGRAPH + paras[0]
+    raw = "x\n*** START OF IT ***\n" + "\n\n".join(paras) + "\n*** END OF IT ***\n"
+    keys = [spec.files["tokenizer.json"] for spec in PINNED.values()]
+    tokenizers = {keys[0]: CharTokenizer(), keys[1]: CharTokenizer(offset=7, marker="BAD")}
+    found = prompts.paragraphs(raw)
+    starts = []
+    for passage in prompts.build(raw, tokenizers)["passages"]:
+        parts = passage["text"].split("\n\n")  # the shown text is cut at 512 characters
+        start = next(i for i, p in enumerate(found) if p.startswith(parts[0]))
+        starts.append((start, len(parts)))
+    assert starts[2][0] == 7
+    assert starts[10] == (30, 4) and starts[11][0] == 34
+    for (start, count), (later, _) in zip(starts, starts[1:], strict=False):
+        assert later >= start + count
