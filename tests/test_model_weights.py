@@ -2,7 +2,7 @@
 
 Each model needs its download (uv run python -m pllm.models smollm2-135m qwen3-0.6b)
 and is skipped when its weights are absent, as in CI. Free memory needed: about
-1.5 GB for SmolLM2-135M and about 6 GB for Qwen3-0.6B (ours and the reference in fp32).
+1.5 GB for SmolLM2-135M and about 5 GB for Qwen3-0.6B (ours and the reference in fp32).
 """
 
 import pytest
