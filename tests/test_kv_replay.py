@@ -4,8 +4,8 @@ All runs are fp32, CPU, batch 1, on one host. Two findings:
 
 1. Truncating the cache to the end of an earlier message and appending is bitwise
    equal to a fresh run that sent the same messages up to that point. Truncating
-   inside a message is only agreement (about 1e-7), so stages truncate only at
-   message boundaries.
+   inside a message is only agreement (asserted below 1e-5), so stages truncate only
+   at message boundaries.
 2. Prefill of P+m tokens need not be bitwise equal to prefill of P followed by m
    single-token decodes, because the matrix products reduce over different shapes.
    Replay therefore cannot resend prompt and emitted tokens as one message; it must
@@ -120,6 +120,7 @@ def test_replay_with_the_original_message_shapes_is_bitwise_equal(model):
     merged, merged_cache = run(model, tokens, [16] + [1] * 8)
     report("chunked prompt merged", (first - merged).abs().max(), first_cache, merged_cache)
     assert kv_max_diff(first_cache, merged_cache) < AGREEMENT
+    assert (first - merged).abs().max() < AGREEMENT
 
 
 @pytest.mark.skipif(
