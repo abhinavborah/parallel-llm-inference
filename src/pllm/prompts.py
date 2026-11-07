@@ -18,6 +18,7 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
+from pllm import runrecord
 from pllm.config import REPO_ROOT
 from pllm.models import MODELS_DIR, PINNED, sha256_of, verify
 
@@ -156,19 +157,23 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Rebuild the prompt set from the book file.")
     parser.add_argument("book", type=Path, help=f"the text file from {BOOK['text_url']}")
     args = parser.parse_args(argv)
-    verify(args.book, BOOK["sha256"])
-    tokenizers = {}
-    for name, spec in PINNED.items():
-        path = hf_hub_download(
-            spec.repo, "tokenizer.json", revision=spec.revision, local_dir=MODELS_DIR / name
-        )
-        verify(path, spec.files["tokenizer.json"])
-        tokenizers[spec.files["tokenizer.json"]] = Tokenizer.from_file(path)
-    data = build(args.book.read_text(encoding="utf-8-sig"), tokenizers)
-    PROMPTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # Binary write keeps LF line endings on Windows, so the checksum is the same everywhere.
-    PROMPTS_PATH.write_bytes(dump(data).encode("utf-8"))
-    print(f"wrote {PROMPTS_PATH}, sha256 {sha256_of(PROMPTS_PATH)}")
+    with runrecord.record("prompt_set") as rec:
+        rec.update(book_sha256=BOOK["sha256"])
+        verify(args.book, BOOK["sha256"])
+        tokenizers = {}
+        for name, spec in PINNED.items():
+            path = hf_hub_download(
+                spec.repo, "tokenizer.json", revision=spec.revision, local_dir=MODELS_DIR / name
+            )
+            verify(path, spec.files["tokenizer.json"])
+            tokenizers[spec.files["tokenizer.json"]] = Tokenizer.from_file(path)
+        rec.update(tokenizer_sha256=sorted(tokenizers))
+        data = build(args.book.read_text(encoding="utf-8-sig"), tokenizers)
+        PROMPTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Binary write keeps LF line endings on Windows, so the checksum is the same everywhere.
+        PROMPTS_PATH.write_bytes(dump(data).encode("utf-8"))
+        rec.update(prompts_sha256=sha256_of(PROMPTS_PATH))
+    print(f"wrote {PROMPTS_PATH}, sha256 {rec['prompts_sha256']}")
 
 
 if __name__ == "__main__":
