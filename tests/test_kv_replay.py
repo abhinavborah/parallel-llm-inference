@@ -6,10 +6,15 @@ All runs are fp32, CPU, batch 1, on one host. Two findings:
    equal to a fresh run that sent the same messages up to that point. Truncating
    inside a message is only agreement (about 1e-7), so stages truncate only at
    message boundaries.
-2. Prefill of P+m tokens is not bitwise equal to prefill of P followed by m
+2. Prefill of P+m tokens need not be bitwise equal to prefill of P followed by m
    single-token decodes, because the matrix products reduce over different shapes.
    Replay therefore cannot resend prompt and emitted tokens as one message; it must
    reuse the original message shapes, which is bitwise equal.
+
+Whether different shapes happen to match can depend on the CPU, the BLAS build and the
+thread count, so those tests assert only the agreement bound and print the result:
+
+    uv run pytest tests/test_kv_replay.py -s
 """
 
 import pytest
@@ -21,10 +26,6 @@ from pllm.models import MODELS_DIR, PINNED, verify
 
 SMOLLM2_DIR = MODELS_DIR / "smollm2-135m"
 AGREEMENT = 1e-5
-
-# Measured on torch 2.14.1, macOS arm64, 8 threads, for (P, m) = (16, 8): largest
-# key or value difference 2.09e-7, largest logit difference 4.77e-7.
-EXPECTED_BITWISE_EQUAL = False
 
 
 def run(model, tokens, chunks):
@@ -47,6 +48,13 @@ def kv_max_diff(a, b):
 
 def kv_equal(a, b):
     return all(torch.equal(x, y) for x, y in pairs(a, b))
+
+
+def report(label, logit_diff, a, b):
+    print(
+        f"{label}, {torch.get_num_threads()} threads: kv bitwise equal {kv_equal(a, b)}, "
+        f"max kv diff {kv_max_diff(a, b):.2e}, max logit diff {logit_diff:.2e}"
+    )
 
 
 @pytest.fixture
@@ -82,6 +90,7 @@ def test_truncate_inside_a_message_only_agrees(model):
     _, fresh_cache = run(model, tokens, [10])
     fresh = model.forward(appended, 10, fresh_cache)
 
+    report("truncate inside a message", (redo - fresh).abs().max(), cache, fresh_cache)
     assert (redo - fresh).abs().max() < AGREEMENT
     assert kv_max_diff(cache, fresh_cache) < AGREEMENT
 
@@ -93,9 +102,9 @@ def test_prefill_against_prefill_then_single_token_decodes(model, prefill, decod
     whole, whole_cache = run(model, tokens, [prefill + decodes])
     stepped, stepped_cache = run(model, tokens, [prefill] + [1] * decodes)
 
+    report(f"P={prefill} m={decodes}", (whole - stepped).abs().max(), whole_cache, stepped_cache)
     assert kv_max_diff(whole_cache, stepped_cache) < AGREEMENT
     assert (whole - stepped).abs().max() < AGREEMENT
-    assert kv_equal(whole_cache, stepped_cache) == EXPECTED_BITWISE_EQUAL
 
 
 def test_replay_with_the_original_message_shapes_is_bitwise_equal(model):
@@ -107,9 +116,10 @@ def test_replay_with_the_original_message_shapes_is_bitwise_equal(model):
 
     assert torch.equal(first, again)
     assert kv_equal(first_cache, again_cache)
-    # A chunked prompt replayed as one message does not reproduce the cache.
-    _, merged_cache = run(model, tokens, [16] + [1] * 8)
-    assert not kv_equal(first_cache, merged_cache)
+    # A chunked prompt replayed as one message need not reproduce the cache.
+    merged, merged_cache = run(model, tokens, [16] + [1] * 8)
+    report("chunked prompt merged", (first - merged).abs().max(), first_cache, merged_cache)
+    assert kv_max_diff(first_cache, merged_cache) < AGREEMENT
 
 
 @pytest.mark.skipif(
@@ -122,10 +132,11 @@ def test_smollm2_prefill_against_decodes_and_boundary_truncation():
     torch.manual_seed(1)
     tokens = torch.randint(0, model.config.vocab_size, (24,))
 
-    _, whole_cache = run(model, tokens, [24])
+    whole, whole_cache = run(model, tokens, [24])
     stepped, stepped_cache = run(model, tokens, [16] + [1] * 8)
+    report("smollm2 P=16 m=8", (whole - stepped).abs().max(), whole_cache, stepped_cache)
     assert kv_max_diff(whole_cache, stepped_cache) < 1e-3
-    assert kv_equal(whole_cache, stepped_cache) == EXPECTED_BITWISE_EQUAL
+    assert (whole - stepped).abs().max() < 1e-3
 
     redo = model.forward(tokens[16:20], 16, stepped_cache)
     _, fresh_cache = run(model, tokens, [16])
