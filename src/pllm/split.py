@@ -21,6 +21,7 @@ The split has the same new_cache and forward calls as Model, so the code that dr
 single-process model can drive it too.
 """
 
+import json
 from pathlib import Path
 
 import torch
@@ -35,27 +36,41 @@ LM_HEAD = "lm_head.weight"
 
 
 class MappedEmbedding:
-    """Embedding rows read from the checkpoint on demand through its memory map.
+    """Embedding rows read from the checkpoint file on demand.
 
-    The file is opened for each lookup and closed again, so no handle stays open and
-    only the pages of the requested rows are read into memory.
+    The safetensors header is parsed once. Each lookup opens the file, reads only the
+    bytes of the requested rows and closes it again, so no handle stays open and the
+    rest of the table never enters memory.
     """
+
+    DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        with open(self.path, "rb") as f:
+            size = int.from_bytes(f.read(8), "little")
+            entry = json.loads(f.read(size))[EMBED]
+        if entry["dtype"] not in self.DTYPES:
+            raise ValueError(f"{self.path}: embedding dtype {entry['dtype']} is not supported")
+        self.dtype = self.DTYPES[entry["dtype"]]
+        self.vocab, self.width = entry["shape"]
+        self.row_bytes = self.width * self.dtype.itemsize
+        self.offset = 8 + size + entry["data_offsets"][0]
 
     def __getitem__(self, ids: torch.Tensor) -> torch.Tensor:
         unique, inverse = torch.unique(ids, return_inverse=True)
-        with safe_open(self.path, framework="pt") as f:
-            rows = f.get_slice(EMBED)
-            vocab, width = rows.get_shape()
-            if len(unique) and not 0 <= unique[0] <= unique[-1] < vocab:
-                bad = unique[0] if unique[0] < 0 else unique[-1]
-                raise IndexError(f"token id {bad.item()} outside the embedding of {vocab} rows")
-            if not len(unique):
-                return torch.empty(*ids.shape, width)
-            table = torch.cat([rows[i : i + 1] for i in unique.tolist()]).to(torch.float32)
-        return table[inverse]
+        if not len(unique):
+            return torch.empty(*ids.shape, self.width)
+        if not 0 <= unique[0] <= unique[-1] < self.vocab:
+            bad = unique[0] if unique[0] < 0 else unique[-1]
+            raise IndexError(f"token id {bad.item()} outside the embedding of {self.vocab} rows")
+        data = bytearray()
+        with open(self.path, "rb") as f:
+            for i in unique.tolist():
+                f.seek(self.offset + i * self.row_bytes)
+                data += f.read(self.row_bytes)
+        rows = torch.frombuffer(data, dtype=self.dtype).view(len(unique), self.width)
+        return rows.to(torch.float32)[inverse]
 
 
 def check_layer_range(config: ModelConfig, layer_start: int, layer_end: int) -> None:

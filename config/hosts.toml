@@ -17,3 +17,9 @@ port = 50051
 [stage1]
 host = "127.0.0.1"
 port = 50052
+
+# Split point k per model: stage 0 runs layers 0 to k - 1, stage 1 runs k to the last layer.
+# One number per model, so the two stages cannot leave a gap or overlap.
+[split]
+"smollm2-135m" = 15
+"qwen3-0.6b" = 14
