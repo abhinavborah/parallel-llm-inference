@@ -18,6 +18,16 @@ port = 50051
 host = "127.0.0.1"
 port = 50052
 
+# Where each laptop's supervisor takes kill, suspend and resume requests (optional; without
+# these tables a supervisor listens on its stage's host at port 50061 or 50062).
+[supervisor0]
+host = "127.0.0.1"
+port = 50061
+
+[supervisor1]
+host = "127.0.0.1"
+port = 50062
+
 # Bounds on the largest gRPC message, a prefill of max_batch x max_prompt_tokens positions of
 # hidden-size fp32 values (decision #20). Every server and channel sets its receive limit from
 # these, and the gateway rejects a prompt above max_prompt_tokens. Prefill is not batched
