@@ -80,9 +80,25 @@ local copy, so both laptops agree): stage 0 runs layers 0 to k - 1 and stage 1 t
 layers and sends the hidden states on to stage 1 as a `StepRequest`; the last stage runs
 the LM head, takes the greedy token and its logit and pushes a `StepResult` to the
 gateway's `Results.Push`. Steps are handled in arrival order, and each request id has its
-own KV cache. The position rules, release and fencing by epoch are separate pieces of
-work: `start_pos` is passed to the stage unchanged, a request starts only at position 0,
-and the epoch fields are carried but not checked.
+own KV cache in `pllm.kvstore.KVStore`. Fencing by epoch is a separate piece of work: the
+epoch fields are carried but not checked.
+
+KV cache rules (R3.6). A message whose `start_pos` equals the cached length appends. A lower
+`start_pos` truncates the cache to it and then appends, which is how the gateway replays
+from an earlier message; truncating at the end of an earlier message and appending is
+bitwise equal to a fresh run. A higher `start_pos`, or a request the stage has not seen
+that does not start at 0, is refused: the message is skipped and not passed on, a `GAP`
+Nack is put on the servicer's `nacks` queue, and the stream and the other requests on it
+carry on. `free` releases a request's cache on a stage, does nothing for an unknown request
+and returns the cached count to 0 when every request is freed (`cached_requests` is the
+count a Beat reports). The heartbeat stream that sends Nacks to the gateway and delivers
+Free messages is a separate piece of work, so for now nothing leaves the process and the
+tests call `free` directly. A request costs per position, per stage, `layers x 2 x kv
+heads x head dim x 4` bytes: for SmolLM2-135M 23,040 bytes, so a 528-position request holds
+11.6 MiB on each stage and 8 such requests 93 MiB (steady state; while a step
+appends, a layer's cache is briefly about twice its size). Requests that never receive a Free
+stay cached until the process ends, and the `nacks` queue is unbounded until the heartbeat
+stream drains it.
 
 Activations travel as raw little-endian fp32 bytes with a dtype name and a shape
 (`pllm.wire`), never as JSON, and are bitwise equal on arrival. The receive limit of every

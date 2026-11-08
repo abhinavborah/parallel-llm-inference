@@ -9,11 +9,14 @@ at the next hop is ended with UNAVAILABLE even while the previous hop holds it o
 - The last stage receives hidden states, runs its layers and the LM head, takes the
   greedy token and its logit, and pushes a StepResult to the gateway's Results.Push.
 
-Each request id has its own KV cache, created by its first message at position 0. The
-position rules (truncate, append, reject a gap), release and fencing by epoch are separate
-stories; here start_pos is passed to the stage unchanged and the epoch fields are carried
-but not checked. Caches are not freed until the Free story, and two streams that carry the
-same request id at once are not guarded against each other (fencing, not this story). The
+Each request id has its own KV cache in a KVStore, with the position rules of R3.6: equal
+appends, lower truncates then appends, higher is refused. A refused message is skipped,
+not forwarded, and a GAP Nack goes on the nacks queue; the stream and the other requests on
+it carry on. The nacks queue is unbounded and nothing drains it yet: the heartbeat story
+drains it onto the heartbeat stream and delivers
+Free messages to free(); until then nothing leaves the process and tests call them directly.
+Fencing by epoch is a separate story: the epoch fields are carried but not checked, and two
+streams that carry the same request id at once are not guarded against each other. The
 outbound queue is unbounded; bounded queues and backpressure come with the queue story.
 
 Chain over a single host or two: every address comes from the caller, which reads it from
@@ -29,6 +32,7 @@ import grpc
 import torch
 
 from pllm import wire
+from pllm.kvstore import Gap, KVStore
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
 from pllm.worker import StageWorker
 
@@ -72,11 +76,22 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         self.own_epoch, self.next_epoch = own_epoch, next_epoch
         options = wire.channel_options(worker.stage.config.hidden_size)
         self.channel = grpc.insecure_channel(results_address if last else next_address, options)
-        self.caches: dict[str, object] = {}
-        self._lock = threading.Lock()
+        layers = worker.stage.layer_end - worker.stage.layer_start
+        self.store = KVStore(worker.stage.config, layers, worker.new_cache)
+        self.stage_index = 0 if worker.stage.first else 1
+        self.nacks: queue.Queue = queue.Queue()  # Nacks waiting for the heartbeat stream
 
     def close(self) -> None:
         self.channel.close()
+
+    @property
+    def cached_requests(self) -> int:
+        """The count a Beat reports."""
+        return len(self.store)
+
+    def free(self, message: protocol_pb2.Free) -> bool:
+        """Release a request's cache (R3.9). Freeing one that is not here does nothing."""
+        return self.store.free(message.rid)
 
     # ------------------------------------------------------------------ one hop
 
@@ -109,7 +124,9 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                     continue
                 if request is _DONE:
                     break
-                outbox.put(self._handle(request, context))
+                out = self._handle(request, context)
+                if out is not None:  # None: refused with a Nack, nothing to pass on
+                    outbox.put(out)
         finally:
             outbox.put(_DONE)
         try:
@@ -128,14 +145,28 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                 grpc.StatusCode.INVALID_ARGUMENT,
                 f"length {request.length} but the payload carries {len(inputs)} positions",
             )
-        cache = self._cache(request, context)
+        try:
+            cache = self.store.acquire(request.rid, request.start_pos)
+        except Gap as gap:
+            log.warning("GAP: %s", gap)
+            self.nacks.put(
+                protocol_pb2.Nack(
+                    stage=self.stage_index,
+                    epoch=self.own_epoch,
+                    rid=request.rid,
+                    attempt=request.attempt,
+                    step=request.step,
+                    reason="GAP",
+                )
+            )
+            return None
         try:
             out = self.worker.step(inputs, request.start_pos, cache)
         except (ValueError, IndexError) as err:
-            self._drop(request.rid)  # the cache may be half written
+            self.store.free_cache(request.rid, cache)  # the cache may be half written
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(err))
         except Exception as err:
-            self._drop(request.rid)
+            self.store.free_cache(request.rid, cache)
             log.exception("step %d of %r failed", request.step, request.rid)
             context.abort(grpc.StatusCode.INTERNAL, f"stage failed: {type(err).__name__}")
         if self.last:
@@ -177,25 +208,6 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
             return wire.tensor_from_proto(request.activations)
         except wire.BadTensor as err:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(err))
-
-    def _drop(self, rid: str) -> None:
-        """Forget a request's cache after a failed step, so a retry from position 0 starts
-        clean and a later position is refused as unknown (the gateway replays)."""
-        with self._lock:
-            self.caches.pop(rid, None)
-
-    def _cache(self, request, context):
-        with self._lock:
-            cache = self.caches.get(request.rid)
-            if cache is None:
-                if request.start_pos != 0:
-                    context.abort(
-                        grpc.StatusCode.FAILED_PRECONDITION,
-                        f"request {request.rid!r} is unknown here and starts at "
-                        f"position {request.start_pos}, not 0",
-                    )
-                cache = self.caches[request.rid] = self.worker.new_cache()
-        return cache
 
 
 def serve(
