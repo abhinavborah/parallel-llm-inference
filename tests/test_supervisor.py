@@ -98,8 +98,28 @@ def running():
         sup.stop()
 
 
-def alive(pid):
-    return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+def started_at(pid):
+    return psutil.Process(pid).create_time()
+
+
+def describe(pid):
+    try:
+        proc = psutil.Process(pid)
+        return f"{proc.name()} {proc.status()} {proc.cmdline()}"
+    except psutil.Error as err:
+        return repr(err)
+
+
+def alive(pid, created=None):
+    """True if the process `pid` runs. Pass its `started_at` to ignore a new process that the
+    operating system gave the same pid (Windows reuses pids quickly)."""
+    try:
+        proc = psutil.Process(pid)
+        if created is not None and proc.create_time() != created:
+            return False
+        return proc.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
 
 
 # ----------------------------------------------------------------------- respawn
@@ -109,9 +129,10 @@ def test_a_worker_killed_by_the_fault_injector_is_respawned(tmp_path, running):
     port = free_port()
     sup = running(make(tmp_path, script(tmp_path), port))
     first = sup.pid
+    created = started_at(first)
     faults.kill(first)  # SIGKILL on macOS and Linux, TerminateProcess on Windows
     assert sup.wait_ready(WAIT, restarts=1)
-    assert sup.pid != first and sup.restarts == 1 and not alive(first)
+    assert sup.pid != first and sup.restarts == 1 and not alive(first, created)
     socket.create_connection(("127.0.0.1", port), timeout=2).close()  # listening again
 
 
@@ -190,10 +211,10 @@ def test_stop_leaves_no_worker_behind(tmp_path):
     sup.start()
     assert sup.wait_ready(WAIT)
     pid = sup.pid
+    created = started_at(pid)
     sup.stop()
-    assert (
-        not alive(pid) and names(tmp_path)[-1] == "stopped" and sup.status()["state"] == "stopped"
-    )
+    assert not alive(pid, created), f"worker {pid} still running after stop: {describe(pid)}"
+    assert names(tmp_path)[-1] == "stopped" and sup.status()["state"] == "stopped"
 
 
 def test_a_supervisor_needs_a_command_and_sane_backoff():
