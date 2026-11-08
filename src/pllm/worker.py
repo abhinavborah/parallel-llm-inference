@@ -6,7 +6,7 @@ checkpoint's memory map, so only the rows it is asked for enter RAM (R3.2). Befo
 step it calls the step delay once, which adds nothing unless a sleep is set (R6.1).
 
 Nothing here depends on the operating system (R3.15). The network service that hosts a
-worker is a separate story.
+worker is pllm.stage_service; --serve starts it.
 
 The layer range comes from the split point in the hosts file ([split], R3.1);
 --layers overrides it for tests and split sweeps.
@@ -14,6 +14,9 @@ The layer range comes from the split point in the hosts file ([split], R3.1);
 Usage (loads the stage, logs the load time and RSS, and exits):
 uv run python -m pllm.worker smollm2-135m --stage 0
 uv run python -m pllm.worker smollm2-135m --layers 0:15
+
+Usage (loads the stage, then serves it until Ctrl-C):
+uv run python -m pllm.worker smollm2-135m --stage 0 --serve --threads 6
 """
 
 import argparse
@@ -100,18 +103,51 @@ def main(argv: list[str] | None = None) -> None:
     which.add_argument("--stage", type=int, choices=(0, 1), help="layers from the hosts file")
     which.add_argument("--layers", help="START:END, layers START to END - 1, overrides it")
     parser.add_argument("--step-delay", type=float, default=0.0, help="seconds slept per step")
+    parser.add_argument(
+        "--threads", type=int, help="torch threads for this process (fix it for equality runs)"
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="serve Stage.Steps on this stage's port (needs --stage)",
+    )
     args = parser.parse_args(argv)
     model_dir = MODELS_DIR / args.model
+    if args.threads is not None and args.threads < 1:
+        parser.error("--threads must be at least 1")
+    if args.serve and args.stage is None:
+        parser.error("--serve needs --stage, which names this process's port and next hop")
     try:
         if args.layers is not None:
             start, end = parse_layers(args.layers)
         else:
             start, end = stage_layers(model_dir, args.model, args.stage)
         StepDelay(args.step_delay)  # rejects a negative value
+        hosts = config.load() if args.serve else None
     except (ValueError, OSError) as err:
         parser.error(str(err))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    StageWorker(WorkerConfig(model_dir, start, end, args.step_delay))
+    if args.threads is not None:
+        torch.set_num_threads(args.threads)
+    worker = StageWorker(WorkerConfig(model_dir, start, end, args.step_delay))
+    if not args.serve:
+        return
+
+    from pllm.stage_service import serve  # imports this module, so not at the top
+
+    server, servicer, port = serve(
+        worker,
+        f"0.0.0.0:{getattr(hosts, f'stage{args.stage}').port}",
+        next_address=hosts.stage1.address if args.stage == 0 else None,
+        results_address=hosts.gateway.address if args.stage == 1 else None,
+    )
+    log.info("serving, rss %.0f MiB; Ctrl-C to stop", rss_mib())
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        server.stop(grace=1).wait()
+    finally:
+        servicer.close()
 
 
 if __name__ == "__main__":

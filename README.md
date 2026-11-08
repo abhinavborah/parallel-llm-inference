@@ -62,8 +62,8 @@ range, logs the weight load time and the process RSS, and calls the step delay o
 before each step (zero by default). The first stage reads embedding rows through the
 checkpoint's memory map, so only the rows of the tokens it is given enter memory. The
 rows are widened to fp32 exactly as a full load would, so the results stay bitwise equal
-to the single process on one host. The network service that hosts a worker is a separate
-piece of work.
+to the single process on one host. `--serve` hosts the worker on the network, see
+[Chain over gRPC](#chain-over-grpc).
 
 ```
 uv run python -m pllm.worker smollm2-135m --stage 0
@@ -73,6 +73,37 @@ uv run python -m pllm.worker smollm2-135m --stage 1
 Each command loads the stage, prints the load time and RSS, and exits. The layer range
 comes from the split point under `[split]` in the committed `config/hosts.toml` (never a
 local copy, so both laptops agree): stage 0 runs layers 0 to k - 1 and stage 1 the rest. `--layers START:END` overrides it for tests and split sweeps.
+
+## Chain over gRPC
+
+`pllm.stage_service` serves `Stage.Steps` for a worker. Stage 0 takes token ids, runs its
+layers and sends the hidden states on to stage 1 as a `StepRequest`; the last stage runs
+the LM head, takes the greedy token and its logit and pushes a `StepResult` to the
+gateway's `Results.Push`. Steps are handled in arrival order, and each request id has its
+own KV cache. The position rules, release and fencing by epoch are separate pieces of
+work: `start_pos` is passed to the stage unchanged, a request starts only at position 0,
+and the epoch fields are carried but not checked.
+
+Activations travel as raw little-endian fp32 bytes with a dtype name and a shape
+(`pllm.wire`), never as JSON, and are bitwise equal on arrival. The receive limit of every
+server and channel comes from `[limits]` in the committed `config/hosts.toml`:
+`max_batch x max_prompt_tokens x hidden size x 4` bytes plus a 64 KiB margin, instead of
+gRPC's 4 MiB default.
+
+```
+uv run python -m pllm.worker smollm2-135m --stage 1 --serve --threads 6
+uv run python -m pllm.worker smollm2-135m --stage 0 --serve --threads 6
+```
+
+Each process loads its layers and listens on its port from the hosts file (stage 1 pushes
+results to the gateway's address, stage 0 forwards to stage 1's). `--threads` sets the
+torch thread count of the process, which every step uses (without the option, torch's
+default for the machine); equality runs fix it. On one host, with the same thread
+count, the tokens and top logits through the chain equal the in-process split's
+(`tests/test_chain.py`; the SmolLM2 cases are skipped when the weights are not downloaded,
+the others use a small random model). A stage that fails a step drops that request's
+cache, and a failed next hop ends the stream with UNAVAILABLE even if the sender holds it
+open.
 
 ## Stage registration
 

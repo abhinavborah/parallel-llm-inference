@@ -18,6 +18,14 @@ port = 50051
 host = "127.0.0.1"
 port = 50052
 
+# Bounds on the largest gRPC message, a prefill of max_batch x max_prompt_tokens positions of
+# hidden-size fp32 values (decision #20). Every server and channel sets its receive limit from
+# these, and the gateway rejects a prompt above max_prompt_tokens. Prefill is not batched
+# (decision #41), so max_batch is 1.
+[limits]
+max_batch = 1
+max_prompt_tokens = 512
+
 # Split point k per model: stage 0 runs layers 0 to k - 1, stage 1 runs k to the last layer.
 # Always read from this committed file, never from a local copy, so both laptops use the
 # same k. The values are the even splits; the capacity-aware split replaces them.
