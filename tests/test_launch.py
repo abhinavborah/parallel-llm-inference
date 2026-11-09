@@ -44,8 +44,20 @@ SLEEP = [sys.executable, "-c", "import time; time.sleep(120)"]
 QUIT = [sys.executable, "-c", "raise SystemExit(3)"]
 
 
-def alive(pids):
-    return [p for p in pids if psutil.pid_exists(p) and psutil.Process(p).is_running()]
+def running(pid):
+    try:
+        return psutil.Process(pid).is_running()
+    except psutil.NoSuchProcess:
+        return False
+
+
+def alive(pids, settle=5.0):
+    """The pids still running. A stop has waited for each exit, but Windows can report the
+    process for a moment while it is torn down, so allow a short settle."""
+    end = time.monotonic() + settle
+    while (left := [p for p in pids if running(p)]) and time.monotonic() < end:
+        time.sleep(0.05)
+    return left
 
 
 def children_of_this_test():
