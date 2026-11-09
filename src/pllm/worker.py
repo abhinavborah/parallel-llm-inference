@@ -17,6 +17,9 @@ uv run python -m pllm.worker smollm2-135m --layers 0:15
 
 Usage (loads the stage, then serves it until Ctrl-C):
 uv run python -m pllm.worker smollm2-135m --stage 0 --serve --threads 6
+
+A serving worker registers with the gateway, then keeps a heartbeat stream to it
+(pllm.heartbeat): beats and Nacks go out, frees and route updates come back.
 """
 
 import argparse
@@ -35,6 +38,7 @@ import torch
 from pllm import config, wire
 from pllm.control import register
 from pllm.faults import StepDelay
+from pllm.heartbeat import HEARTBEAT_SECONDS, Heartbeat
 from pllm.model import KVCache, ModelConfig
 from pllm.models import MODELS_DIR, PINNED, sha256_of
 from pllm.split import Stage
@@ -173,6 +177,27 @@ def register_with_gateway(
     return None
 
 
+def join_gateway(
+    gateway: str,
+    stage: int,
+    layers: tuple[int, int],
+    model: str,
+    model_dir: Path,
+    addr: str,
+    servicer,
+    stop: threading.Event,
+    options: list[tuple[str, int]] | None = None,
+    interval: float = HEARTBEAT_SECONDS,
+) -> None:
+    """Register with the gateway, then keep the heartbeat stream open until stop is set or
+    a newer registration replaces this one (R3.3, R3.10). A rejected registration raises."""
+    epoch = register_with_gateway(
+        gateway, stage, layers, model, model_dir, addr, servicer, stop, options=options
+    )
+    if epoch is not None:
+        Heartbeat(gateway, servicer, interval=interval, options=options).run(stop)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Load a stage worker and report its memory.")
     parser.add_argument("model", choices=sorted(PINNED))
@@ -224,9 +249,11 @@ def main(argv: list[str] | None = None) -> None:
     if os.environ.get(PARENT_ENV, "").isdigit():
         exit_when_parent_gone(int(os.environ[PARENT_ENV]))
 
+    options = wire.channel_options(worker.stage.config.hidden_size)
+
     def register_in_background():
         try:
-            register_with_gateway(
+            join_gateway(
                 hosts.gateway.address,
                 args.stage,
                 (start, end),
@@ -235,7 +262,7 @@ def main(argv: list[str] | None = None) -> None:
                 getattr(hosts, f"stage{args.stage}").address,
                 servicer,
                 stop,
-                options=wire.channel_options(worker.stage.config.hidden_size),
+                options=options,
             )
         except BaseException as err:  # a rejected registration ends the worker, loudly
             failure.append(err)

@@ -8,7 +8,8 @@ import pytest
 import torch
 from test_model import tiny_reference
 
-from pllm.kvstore import Gap, KVStore
+from pllm import kvstore
+from pllm.kvstore import Gap, KVStore, Stale
 from pllm.split import Stage
 
 LAYERS = 5
@@ -147,3 +148,61 @@ def test_free_cache_frees_only_the_cache_it_is_given(stage, store):
     assert store.free_cache("a", old) is False and "a" in store
     assert store.free_cache("a", new) is True and "a" not in store
     assert store.free_cache("a", new) is False
+
+
+def test_a_freed_attempt_is_refused_and_a_newer_one_starts_again(stage, store):
+    run(stage, store, "a", TOKENS[:6], 0)
+    assert store.free("a", attempt=2) is True
+    for attempt in (1, 2):  # a step of the freed attempt, or an older one, still in flight
+        with pytest.raises(Stale) as refused:
+            store.acquire("a", 0, attempt)
+        assert (refused.value.attempt, refused.value.newer, refused.value.freed) == (
+            attempt,
+            2,
+            True,
+        )
+    assert "a" not in store
+    assert len(store.acquire("a", 0, attempt=3)) == 0 and "a" in store  # a replay
+
+
+def test_a_free_for_an_older_attempt_keeps_the_newer_attempts_cache(stage, store):
+    store.acquire("a", 0, attempt=1)
+    store.acquire("a", 0, attempt=2)  # a replay has started from the beginning
+    assert store.free("a", attempt=1) is False and "a" in store
+    with pytest.raises(Stale):
+        store.acquire("a", 0, attempt=1)
+    assert store.free("a", attempt=2) is True and "a" not in store
+
+
+def test_an_older_attempt_than_the_cache_has_used_is_refused(stage, store):
+    run(stage, store, "a", TOKENS[:6], 0)
+    store.acquire("a", 6, attempt=3)
+    with pytest.raises(Stale) as refused:
+        store.acquire("a", 6, attempt=2)
+    assert (refused.value.newer, refused.value.freed) == (3, False)
+    assert store.length("a") == 6 and store.attempt("a") == 3
+    assert store.acquire("a", 0, attempt=4) is not None and store.attempt("a") == 4
+
+
+def test_a_free_never_lowers_the_attempt_remembered(stage, store):
+    store.free("a", attempt=3)
+    store.free("a", attempt=1)  # a late Free for an older attempt
+    with pytest.raises(Stale):
+        store.acquire("a", 0, attempt=3)
+
+
+def test_without_an_attempt_nothing_is_remembered(stage, store):
+    store.free("a")
+    store.free("b", attempt=1)
+    assert len(store.acquire("a", 0, attempt=1)) == 0
+    assert len(store.acquire("b", 0)) == 0  # a message with no attempt is not checked
+
+
+def test_only_the_latest_frees_are_remembered(stage, store, monkeypatch):
+    monkeypatch.setattr(kvstore, "MAX_FREED", 3)
+    for rid in "abcd":
+        store.free(rid, attempt=1)
+    assert len(store.acquire("a", 0, attempt=1)) == 0  # forgotten: the oldest of four
+    for rid in "bcd":
+        with pytest.raises(Stale):
+            store.acquire(rid, 0, attempt=1)
