@@ -9,7 +9,7 @@ sender). Every accepted registration gets the next value, so a stage that regist
 again always receives a higher epoch than before, and no two incarnations share one.
 The counter lives only in the gateway process; only workers are restarted.
 
-The heartbeat stream and wiring this into the gateway are separate stories.
+pllm.gateway serves this service; the heartbeat stream is a separate story.
 """
 
 import threading
