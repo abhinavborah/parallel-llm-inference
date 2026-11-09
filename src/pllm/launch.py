@@ -144,8 +144,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     wrong = elsewhere(hosts, args.roles, this_laptop())
     if wrong:
         parser.error(f"the hosts file does not place these on this laptop: {', '.join(wrong)}")
-    if not (MODELS_DIR / args.model / "config.json").is_file():
-        parser.error(f"weights missing: uv run python -m pllm.models {args.model}")
+    # A stage that cannot load is restarted for ever by its supervisor, so refuse here.
+    missing = [f for f in PINNED[args.model].files if not (MODELS_DIR / args.model / f).is_file()]
+    if missing:
+        parser.error(
+            f"model files missing ({', '.join(sorted(missing))}): "
+            f"uv run python -m pllm.models {args.model}"
+        )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     threads = args.threads or default_threads(args.roles)

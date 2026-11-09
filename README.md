@@ -235,14 +235,15 @@ uv run python -m pllm.launch smollm2-135m --roles gateway stage1
 uv run python -m pllm.launch smollm2-135m --roles stage0
 ```
 
-Send a prompt once both stages have registered. Until then the client gets UNAVAILABLE.
+Send a prompt once both stages have registered and received each other's route update, a
+moment later. Until then the client gets UNAVAILABLE and can send the prompt again.
 
 ```
 uv run python -m pllm.client "The capital of France is" --max-tokens 16 --timeout 30
 ```
 
-The launcher refuses a role whose address in the hosts file is not on this laptop, and missing
-weights. By default each stage gets this laptop's physical cores divided by its stages, so on
+The launcher refuses a role whose address in the hosts file is not on this laptop, and a model
+with any pinned file missing. By default each stage gets this laptop's physical cores divided by its stages, so on
 one host each stage gets half; `--threads` sets it. Ctrl-C stops everything. If a process
 exits by itself, the launcher stops the rest and exits with code 1 (a worker that dies is
 not such a case: its supervisor restarts it). Closing the terminal also stops everything on
@@ -255,6 +256,9 @@ available memory and power state at the start, warns on battery, and writes a ru
 
 - Use native Python, not WSL2.
 - Keep the charger in and select the best performance power plan or power mode in Settings.
+- The launcher is one more process on this laptop: about 39 MiB, plus 5 MiB for the virtual
+  environment's `python.exe` trampoline (measured on Windows 11, without `uv` itself), a small
+  part of the roughly 2.5 GB this laptop has for the worker.
 - Allow the Stage 0 port and the supervisor port on the Public profile, from an administrator
   PowerShell:
 

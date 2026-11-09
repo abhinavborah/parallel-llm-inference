@@ -123,7 +123,8 @@ import pathlib, sys
 from pllm import launch, runrecord
 tmp = pathlib.Path(sys.argv[1])
 (tmp / "smollm2-135m").mkdir()
-(tmp / "smollm2-135m" / "config.json").touch()
+for name in launch.PINNED["smollm2-135m"].files:
+    (tmp / "smollm2-135m" / name).touch()
 launch.MODELS_DIR = tmp
 runrecord.RUNS_DIR = tmp / "runs"
 child = "import os, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));"
@@ -168,6 +169,16 @@ def test_main_names_the_download_when_weights_are_missing(tmp_path, monkeypatch,
     monkeypatch.setattr(launch, "MODELS_DIR", tmp_path)
     assert run_main(["smollm2-135m"]) == 2
     assert "uv run python -m pllm.models smollm2-135m" in capsys.readouterr().err
+
+
+def test_main_refuses_a_partial_download(tmp_path, monkeypatch, capsys):
+    (tmp_path / "smollm2-135m").mkdir()
+    (tmp_path / "smollm2-135m" / "config.json").touch()
+    monkeypatch.setattr(launch, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(launch, "run", lambda *_: 0)  # a passed check must not start anything
+    assert run_main(["smollm2-135m", "--roles", "stage1"]) == 2
+    err = capsys.readouterr().err
+    assert "model.safetensors" in err and "uv run python -m pllm.models smollm2-135m" in err
 
 
 def test_main_rejects_zero_threads(capsys):
