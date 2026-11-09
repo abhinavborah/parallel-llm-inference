@@ -30,9 +30,12 @@ Not here: many requests in flight is the next story (#26; the code does not prev
 it is not tested). Requests share one stream to Stage 0, and a stage ends that stream when
 one request's step fails, so every request on it then fails with UNAVAILABLE; #26 has to
 keep one request's failure from ending the others. Each Generate holds a server thread for
-its life. Also not here: the full result filter with epochs and exactly-once delivery (#30),
-recovery and replay (#38, #39), bounded queues (#33). A result that does not match its
-request's attempt and expected step is dropped and counted.
+its life, so serve() caps running requests at max_workers - RESERVED_THREADS and refuses the
+rest with RESOURCE_EXHAUSTED; without the cap, a full pool leaves no thread for Results.Push
+and every running request stalls until its deadline. Also not here: the full result
+filter with epochs and exactly-once delivery (#30), recovery and replay (#38, #39), bounded
+queues (#33). A result that does not match its request's attempt and expected step is
+dropped and counted.
 """
 
 import argparse
@@ -60,6 +63,9 @@ POLL_SECONDS = 0.05  # how often a waiting request checks its deadline, client a
 MAX_UNSENT = 4  # a UTF-8 character spans at most four byte-level tokens
 REPLACEMENT = chr(0xFFFD)  # what an incomplete UTF-8 character decodes to
 STAGES = (0, 1)
+# Server threads kept free of Generate: one for the Results.Push stream from Stage 1, which
+# holds its thread for its life, and one for Control.Register and for refusing requests.
+RESERVED_THREADS = 2
 
 
 @dataclass
@@ -123,6 +129,8 @@ class Gateway(protocol_pb2_grpc.FrontendServicer, protocol_pb2_grpc.ResultsServi
         self.requests: dict[str, Request] = {}
         self.frees = {stage: queue.Queue() for stage in STAGES}
         self.dropped = 0  # results that matched no waiting step
+        self.max_running: int | None = None  # Generate calls at once; serve() sets it
+        self._running = 0
         self._lock = threading.Lock()
         self._link: Link | None = None
 
@@ -214,6 +222,22 @@ class Gateway(protocol_pb2_grpc.FrontendServicer, protocol_pb2_grpc.ResultsServi
 
     def Generate(self, req, context):
         ids = self._admit(req, context)
+        with self._lock:
+            full = self.max_running is not None and self._running >= self.max_running
+            if not full:
+                self._running += 1
+        if full:
+            context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                f"the gateway is running {self.max_running} requests, its limit; try again later",
+            )
+        try:
+            yield from self._generate(req, ids, context)
+        finally:
+            with self._lock:
+                self._running -= 1
+
+    def _generate(self, req, ids: list[int], context):
         link = self._stage0(context)
         request = Request(
             rid=uuid.uuid4().hex[:12],
@@ -306,7 +330,13 @@ class Gateway(protocol_pb2_grpc.FrontendServicer, protocol_pb2_grpc.ResultsServi
 
 
 def serve(gateway: Gateway, bind: str, max_workers: int = 16) -> tuple[grpc.Server, int]:
-    """Serve Control, Frontend and Results on bind (port 0 picks a free one)."""
+    """Serve Control, Frontend and Results on bind (port 0 picks a free one).
+
+    At most max_workers - RESERVED_THREADS requests run at once; more are refused.
+    """
+    if max_workers <= RESERVED_THREADS:
+        raise ValueError(f"max_workers must be above {RESERVED_THREADS}")
+    gateway.max_running = max_workers - RESERVED_THREADS
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers), options=gateway.options
     )

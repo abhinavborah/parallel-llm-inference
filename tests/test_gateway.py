@@ -46,13 +46,21 @@ class System:
     """A gateway, stage 1 pushing to it and stage 0 forwarding to stage 1, all registered."""
 
     def __init__(
-        self, model_dir, k, eos=(), max_bytes=None, delay1=0.0, register=True, tokenizer=None
+        self,
+        model_dir,
+        k,
+        eos=(),
+        max_bytes=None,
+        delay1=0.0,
+        register=True,
+        tokenizer=None,
+        max_workers=16,
     ):
         n = ModelConfig.from_file(model_dir / "config.json").num_layers
         limit = max_bytes or config.max_message_bytes(HIDDEN)
         self.registry = Registry("tiny", ExpectedModel(DIGEST, n, k))
         self.gateway = Gateway(self.registry, tokenizer or Words(), eos, HIDDEN, limit)
-        self.server, port = serve(self.gateway, "127.0.0.1:0")
+        self.server, port = serve(self.gateway, "127.0.0.1:0", max_workers)
         self.address = f"127.0.0.1:{port}"
         self.server1, self.servicer1, port1 = serve_stage(
             StageWorker(WorkerConfig(model_dir, k, n, delay1)),
@@ -448,3 +456,58 @@ def test_generate_runs_alongside_other_requests_without_mixing_them(system):
     for thread in threads:
         thread.join(WAIT)
     assert out == {"a": alone, "b": alone}
+
+
+# -------------------------------------------------------------- server threads
+
+
+def outcomes(run, clients, **kwargs):
+    """Start clients at once; return the token count or the status code of each."""
+    out = [None] * clients
+    gate = threading.Barrier(clients)
+
+    def one(i):
+        gate.wait()
+        try:
+            out[i] = len(run.tokens(**kwargs))
+        except grpc.RpcError as err:
+            out[i] = err.code()
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(clients)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(WAIT)
+    return out
+
+
+def test_a_request_over_the_running_limit_is_refused_and_the_others_finish(system):
+    run = system(delay1=0.3, max_workers=5)  # 5 threads, 2 kept, so 3 requests at once
+    assert run.gateway.max_running == 3
+    streams = [run.call(max_tokens=3, timeout_ms=20_000) for _ in range(3)]
+    firsts = [next(stream) for stream in streams]
+    wait_for(lambda: len(run.gateway.table()) == 3, "three running requests")
+    code, details = code_of(run.call(max_tokens=3))
+    assert code == grpc.StatusCode.RESOURCE_EXHAUSTED and "3 requests" in details
+    assert [len([first, *stream]) for first, stream in zip(firsts, streams, strict=True)] == [
+        3,
+        3,
+        3,
+    ]
+    assert len(run.tokens(max_tokens=3)) == 3  # the slots are given back
+
+
+def test_a_full_thread_pool_refuses_requests_instead_of_stalling_them(system):
+    """The reported fault: as many clients as server threads used to leave none for the
+    results stream, and every request then failed at its deadline."""
+    run = system(delay1=0.2, max_workers=5)
+    out = outcomes(run, 5, max_tokens=3, timeout_ms=10_000)
+    assert grpc.StatusCode.DEADLINE_EXCEEDED not in out
+    assert out.count(3) >= 3
+    assert all(x == 3 or x == grpc.StatusCode.RESOURCE_EXHAUSTED for x in out)
+
+
+def test_serve_needs_threads_beyond_the_reserved_ones(system):
+    run = system()
+    with pytest.raises(ValueError, match="max_workers"):
+        serve(run.gateway, "127.0.0.1:0", gateway.RESERVED_THREADS)

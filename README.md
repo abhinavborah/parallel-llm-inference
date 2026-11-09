@@ -219,7 +219,8 @@ logits equal the single-process reference (tested with small random models).
   weights.
 - A prompt whose prefill would exceed the receive limit from `[limits]` is rejected with
   INVALID_ARGUMENT before anything is sent to Stage 0 (for SmolLM2 at the committed limits,
-  more than 512 tokens).
+  more than 512 tokens). A prompt whose request message is itself larger than the limit in
+  bytes is refused earlier by gRPC with RESOURCE_EXHAUSTED; it does not reach Stage 0 either.
 - The deadline is the client's `timeout_ms`, judged only by the gateway on its own
   monotonic clock. A request past it fails with DEADLINE_EXCEEDED. Carrying the remaining
   time on each hop comes with the deadline story.
@@ -232,8 +233,9 @@ logits equal the single-process reference (tested with small random models).
   stage keeps the cache of every finished request (the per-request cost is under "Chain
   over gRPC"), so restart the workers between long runs. The gateway's queues of frees grow
   by two small messages per request until then.
-- Each running request holds one of the gateway's 16 server threads, so this story serves a
-  few requests at a time; many in flight is the next story. Requests share one stream to
+- Each running request holds one of the gateway's 16 server threads. Two are kept for the
+  results stream and registration, so at most 14 requests run at once and a further one is
+  refused with RESOURCE_EXHAUSTED; many in flight is the next story. Requests share one stream to
   Stage 0, and a step that fails at a stage ends that stream, so the other requests on it
   fail with UNAVAILABLE too.
 - Text is decoded per token, holding back a token that ends inside a character until the
