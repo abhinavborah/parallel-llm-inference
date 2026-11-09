@@ -62,7 +62,7 @@ from concurrent import futures
 import grpc
 import torch
 
-from pllm import wire
+from pllm import metrics, wire
 from pllm.kvstore import Gap, KVStore, Stale
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
 from pllm.worker import StageWorker
@@ -187,6 +187,9 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         outbox: queue.Queue = queue.Queue()
         inbox: queue.Queue = queue.Queue()
         moved = False
+        # Per stream, so a reopened stream cannot report the same message twice. Only the
+        # first stage counts: its outbound hop is the one the gateway cannot see.
+        counters = None if self.last else metrics.Counters()
         with self._route_lock:  # the route this stream keeps for its life
             channel, next_epoch = self.channel, self.next_epoch
             self._inboxes.add(inbox)
@@ -198,6 +201,8 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         except ValueError:  # the channel was closed by a route update a moment ago
             with self._route_lock:
                 self._inboxes.discard(inbox)
+            if counters is not None:
+                metrics.send_counters(context, counters)
             context.abort(grpc.StatusCode.UNAVAILABLE, "the next hop moved; send again")
         # A reader thread feeds the inbox, so this loop can notice a failed next hop while
         # the previous hop holds its stream open and waits (it would otherwise block in
@@ -226,9 +231,13 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                     break
                 out = self._handle(request, context, next_epoch)
                 if out is not None:  # None: refused with a Nack, nothing to pass on
+                    if counters is not None:
+                        counters.count(out)
                     outbox.put(out)
         finally:
             outbox.put(_DONE)
+            if counters is not None:  # here so that every way out of the loop reports
+                metrics.send_counters(context, counters)
             with self._route_lock:
                 self._inboxes.discard(inbox)
         if moved:
