@@ -70,6 +70,31 @@ def split_point(model: str, path: str | Path | None = None) -> int:
     return k
 
 
+FRAMING_MARGIN = 64 * 1024  # bytes added to the largest activation message
+
+
+def max_message_bytes(hidden_size: int, path: str | Path | None = None) -> int:
+    """The receive limit for every gRPC server and channel (decision #20, R3.17).
+
+    The largest message is a prefill of max_batch x max_prompt_tokens positions, each
+    hidden_size fp32 values, plus a margin for the message fields. Read from the committed
+    file, not from PLLM_CONFIG, so every process on both laptops uses the same bound.
+    """
+    path = Path(path) if path is not None else DEFAULT_PATH
+    with open(path, "rb") as f:
+        limits = tomllib.load(f).get("limits", {})
+    values = []
+    for key in ("max_batch", "max_prompt_tokens"):
+        value = limits.get(key)
+        # bool is a subclass of int, so rule it out explicitly
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{path}: [limits] needs a positive whole number for {key!r}")
+        values.append(value)
+    if hidden_size < 1:
+        raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+    return values[0] * values[1] * hidden_size * 4 + FRAMING_MARGIN
+
+
 def _endpoint(data: dict, role: str, path: Path) -> Endpoint:
     section = data.get(role)
     if not isinstance(section, dict):
