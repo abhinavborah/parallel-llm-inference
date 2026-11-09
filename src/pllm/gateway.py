@@ -49,7 +49,10 @@ stage ends the shared stream when a message is malformed, when a step fails insi
 (including running out of memory), or when its next hop fails or a route update moves it;
 every request on the stream then fails with UNAVAILABLE, and recovering them is the recovery
 stories. A request whose prompt and max_tokens exceed the model's context length is refused
-at admission, so no valid request can grow a cache without bound. Equality under
+at admission, so no valid request grows a cache past the model's context. That bounds each
+request, not Host B's memory: with an even split, one request at the cap holds about 180 MiB
+of Stage 0 cache for SmolLM2 (8192 positions) but about 4.4 GiB for Qwen3-0.6B (40960
+positions), more than Host B has. Admission by Host B's KV budget (R5.3) is #34. Equality under
 concurrency rests on each stage handling its stream one step at a time: requests never share
 a model call within a stage. One long prefill at a stage delays every other request's next
 step there (head-of-line blocking). Each Generate holds a

@@ -272,6 +272,9 @@ logits equal the single-process reference (tested with small random models).
   running out of memory), or when its next hop fails or moves; then every request on it
   fails with UNAVAILABLE. A request whose prompt and `max_tokens` together exceed the
   model's context length (8192 positions for SmolLM2) is refused with INVALID_ARGUMENT.
+  This bounds each request, not Host B's memory: with an even split, one request at the
+  cap holds about 180 MiB of Stage 0 cache for SmolLM2 but about 4.4 GiB for Qwen3-0.6B
+  (40960 positions), more than Host B has. Admission by Host B's KV budget (R5.3) is #34.
   One long prefill delays the other requests' next steps at that stage. Bounded queues and
   credits (R5.2) are #33.
 - Text is decoded per token, holding back a token that ends inside a character until the
