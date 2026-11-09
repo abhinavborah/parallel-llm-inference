@@ -46,10 +46,28 @@ one request's step fails, so every request on it then fails with UNAVAILABLE; #2
 keep one request's failure from ending the others. Each Generate holds a server thread for
 its life, so serve() caps running requests at max_workers - RESERVED_THREADS and refuses the
 rest with RESOURCE_EXHAUSTED; without the cap, a full pool leaves no thread for Results.Push
-and every running request stalls until its deadline. Also not here: the full result
-filter with epochs and exactly-once delivery (#30), recovery and replay (#38, #39), bounded
-queues (#33). A result that does not match its request's attempt and expected step is
-dropped and counted.
+and every running request stalls until its deadline. Also not here: recovery and replay
+(#38, #39), bounded queues (#33).
+
+Result filter and exactly-once delivery (R4.7, R4.8): a result is accepted only when its
+request is running and its attempt, its step and its epoch all match the request's attempt,
+the step the request waits on and the live epoch of the last stage. Anything else is dropped
+and counted by reason in discards:
+
+- unknown_request: no running request has that id (a late result after the request ended).
+- stale_attempt: another attempt of the request.
+- stale_epoch: sent by a last stage that is not the registered one (an old incarnation).
+- duplicate: a step the request has already received (the token went to the client once).
+- ahead: a step the request has not asked for yet.
+- stale_nack: a Nack that names no step a running request waits on (the request ended, or
+  another attempt or step), counted when it arrives or when a queued one is taken.
+
+Only an accepted result moves the request on and reaches the client, so each (request,
+step) is streamed once and in order. A result is checked when it arrives and again when the
+request takes it, since a result can be queued just before the step it was for completes or
+before a new last stage registers. A replay (#39) must compare the results of steps below
+len(tokens) with the stored history and not stream them again; the filter itself stays as
+it is, since each replayed step is asked for in turn under the new attempt.
 """
 
 import argparse
@@ -160,7 +178,8 @@ class Gateway(
         self.options = wire.channel_options(hidden_size)
         self.requests: dict[str, Request] = {}
         self.frees = {stage: queue.Queue() for stage in STAGES}
-        self.dropped = 0  # results that matched no waiting step
+        self.dropped = 0  # results and Nacks dropped, all reasons together
+        self.discards: collections.Counter = collections.Counter()  # dropped, by reason
         self.nacks: collections.deque = collections.deque(maxlen=MAX_NACKS)
         self.nack_count = 0
         self._beats: dict[int, tuple[protocol_pb2.Beat, float]] = {}
@@ -260,6 +279,8 @@ class Gateway(
                 and request.attempt == n.attempt
                 and request.expected_step == n.step
             )
+            if not running:  # a request that ended, another attempt or another step
+                self._discard("stale_nack")
         log.warning(
             "stage %d nacked %s attempt %d step %d: %s", n.stage, n.rid, n.attempt, n.step, n.reason
         )
@@ -355,20 +376,44 @@ class Gateway(
 
     # ------------------------------------------------------------------ Results.Push
 
+    def _why_not(self, result: protocol_pb2.StepResult, request: Request | None) -> str | None:
+        """Why result cannot be accepted for request, or None if it can (R4.7)."""
+        if request is None:
+            return "unknown_request"
+        if result.attempt != request.attempt:
+            return "stale_attempt"
+        last = self.registry.stages.get(STAGES[-1])
+        if last is None or result.epoch != last.epoch:
+            return "stale_epoch"
+        if result.step < request.expected_step:
+            return "duplicate"
+        if result.step > request.expected_step:
+            return "ahead"
+        return None
+
+    def _discard(self, reason: str) -> None:
+        """Count a dropped result or Nack. Call with the lock held."""
+        self.dropped += 1
+        self.discards[reason] += 1
+
     def Push(self, request_iterator, context):
         for result in request_iterator:
             with self._lock:
                 request = self.requests.get(result.rid)
-                wanted = request is not None and (result.attempt, result.step) == (
-                    request.attempt,
-                    request.expected_step,
-                )
-                if not wanted:
-                    self.dropped += 1
-            if wanted:
+                reason = self._why_not(result, request)
+                if reason is not None:
+                    self._discard(reason)
+            if reason is None:
                 request.results.put(result)
             else:
-                log.warning("dropped result %s step %d", result.rid, result.step)
+                log.warning(
+                    "dropped result %s attempt %d step %d epoch %d: %s",
+                    result.rid,
+                    result.attempt,
+                    result.step,
+                    result.epoch,
+                    reason,
+                )
         return protocol_pb2.Empty()
 
     # ------------------------------------------------------------------ Frontend.Generate
@@ -493,20 +538,25 @@ class Gateway(
             else:
                 # Checked again here, for a result and a Nack alike: either can be queued
                 # just before the step moved on, and is then for a step already done.
-                current = (result.attempt, result.step) == (
-                    request.attempt,
-                    request.expected_step,
-                )
-                if current and isinstance(result, protocol_pb2.Nack):
-                    context.abort(
-                        grpc.StatusCode.UNAVAILABLE,
-                        f"stage {result.stage} refused step {result.step} of request "
-                        f"{request.rid}: {result.reason}",
+                if isinstance(result, protocol_pb2.Nack):
+                    current = (result.attempt, result.step) == (
+                        request.attempt,
+                        request.expected_step,
                     )
-                if current:
-                    return result
+                    if current:
+                        context.abort(
+                            grpc.StatusCode.UNAVAILABLE,
+                            f"stage {result.stage} refused step {result.step} of request "
+                            f"{request.rid}: {result.reason}",
+                        )
+                    reason = "stale_nack"
+                else:
+                    with self._lock:
+                        reason = self._why_not(result, request)
+                    if reason is None:
+                        return result
                 with self._lock:
-                    self.dropped += 1
+                    self._discard(reason)
             why = link.failure()
             if why is not None:
                 context.abort(grpc.StatusCode.UNAVAILABLE, f"stage 0 stream failed: {why}")
