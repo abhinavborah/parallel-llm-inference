@@ -363,10 +363,19 @@ available memory and power state at the start, warns on battery, and writes a ru
 - The launcher is one more process on this laptop: about 39 MiB, plus 5 MiB for the virtual
   environment's `python.exe` trampoline (measured on Windows 11, without `uv` itself), a small
   part of the roughly 2.5 GB this laptop has for the worker.
+- Stop the launcher with Ctrl-C. On Ctrl-Break `uv` itself exits at once with 0xC000013A, so
+  the shell sees that code while the launcher finishes the stop behind it.
 - The Windows firewall is off for now, on the Public profile (agreed 2026-11-09), so the
-  Stage 0 and supervisor ports need no inbound rule. Both ports have no authentication, so
-  use only a network you trust and turn the firewall back on afterwards.
-  `uv run python -m pllm.netcheck firewall --roles stage0` reports the state.
+  Stage 0 and supervisor ports need no inbound rule.
+  `uv run python -m pllm.netcheck firewall --roles stage0` reports the state. If the firewall
+  is turned back on, allow both ports on the Public profile from an administrator PowerShell:
+
+```
+New-NetFirewallRule -DisplayName "pllm stage 0" -Direction Inbound -Protocol TCP -LocalPort 50051 -Profile Public -Action Allow
+New-NetFirewallRule -DisplayName "pllm supervisor 0" -Direction Inbound -Protocol TCP -LocalPort 50061 -Profile Public -Action Allow
+```
+
+Both ports have no authentication, so use only a network you trust.
 
 ### macOS setup
 
