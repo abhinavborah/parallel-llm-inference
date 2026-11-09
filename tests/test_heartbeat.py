@@ -44,6 +44,17 @@ class Beating(System):
         self.extra = []  # servers started by a test
         for stage in order:
             self.join(stage, self.servicer1 if stage == 1 else self.servicer0)
+        if set(order) == {0, 1}:
+            self.wait_routes()
+
+    def wait_routes(self, servicer0=None, servicer1=None):
+        """Wait until each stage has the other's epoch from its route update, as the
+        stages are up for requests only then (a request sent earlier is refused)."""
+        s0, s1 = servicer0 or self.servicer0, servicer1 or self.servicer1
+        wait_for(
+            lambda: s0.next_epoch == s1.own_epoch and s1.upstream_epoch == s0.own_epoch,
+            "both route updates",
+        )
 
     def join(self, stage, servicer, port=None):
         """Register a stage through Control.Register and open its heartbeat stream."""
@@ -230,7 +241,12 @@ def test_a_step_that_arrives_after_its_free_does_not_cache_again(beating):
     began = time.monotonic()
     with grpc.insecure_channel(f"127.0.0.1:{run.ports[0]}") as channel:
         step = protocol_pb2.StepRequest(
-            rid="late", attempt=1, start_pos=0, length=2, tokens=protocol_pb2.TokenIds(ids=[5, 9])
+            rid="late",
+            attempt=1,
+            start_pos=0,
+            length=2,
+            target_epoch=run.servicer0.own_epoch,
+            tokens=protocol_pb2.TokenIds(ids=[5, 9]),
         )
         protocol_pb2_grpc.StageStub(channel).Steps(iter([step]), timeout=WAIT)
     wait_for(lambda: run.gateway.nack_count == 1, "the Nack at the gateway")
@@ -250,6 +266,7 @@ def test_a_gap_nack_reaches_the_gateway_between_beats(beating):
             step=7,
             start_pos=5,
             length=1,
+            target_epoch=run.servicer0.own_epoch,
             tokens=protocol_pb2.TokenIds(ids=[1]),
         )
         protocol_pb2_grpc.StageStub(channel).Steps(iter([step]), timeout=WAIT)
