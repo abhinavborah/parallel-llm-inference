@@ -9,7 +9,8 @@ sender). Every accepted registration gets the next value, so a stage that regist
 again always receives a higher epoch than before, and no two incarnations share one.
 The counter lives only in the gateway process; only workers are restarted.
 
-pllm.gateway serves this service; the heartbeat stream is a separate story.
+pllm.gateway serves Control with this Registry and adds the heartbeat stream;
+ControlService serves Register alone, for tests and tools.
 """
 
 import threading

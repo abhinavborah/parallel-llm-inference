@@ -46,7 +46,15 @@ class System:
     """A gateway, stage 1 pushing to it and stage 0 forwarding to stage 1, all registered."""
 
     def __init__(
-        self, model_dir, k, eos=(), max_bytes=None, delay1=0.0, register=True, tokenizer=None
+        self,
+        model_dir,
+        k,
+        eos=(),
+        max_bytes=None,
+        delay1=0.0,
+        register=True,
+        tokenizer=None,
+        delay0=0.0,
     ):
         n = ModelConfig.from_file(model_dir / "config.json").num_layers
         limit = max_bytes or config.max_message_bytes(HIDDEN)
@@ -60,7 +68,7 @@ class System:
             results_address=self.address,
         )
         self.server0, self.servicer0, port0 = serve_stage(
-            StageWorker(WorkerConfig(model_dir, 0, k)),
+            StageWorker(WorkerConfig(model_dir, 0, k, delay0)),
             "127.0.0.1:0",
             next_address=f"127.0.0.1:{port1}",
         )
@@ -158,9 +166,9 @@ def test_the_prompt_goes_as_one_message_at_position_zero_then_one_token_per_step
     sent = []
     real = run.servicer0._handle
 
-    def spy(request, context):
+    def spy(request, context, *rest):
         sent.append((request.attempt, request.step, request.start_pos, list(request.tokens.ids)))
-        return real(request, context)
+        return real(request, context, *rest)
 
     run.servicer0._handle = spy
     tokens = [t.token for t in run.tokens(max_tokens=3)]
@@ -402,9 +410,9 @@ def test_the_stage_0_message_carries_its_epoch_and_the_gateway_as_sender(system)
     seen = []
     real = run.servicer0._handle
 
-    def spy(request, context):
+    def spy(request, context, *rest):
         seen.append((request.target_epoch, request.sender_epoch))
-        return real(request, context)
+        return real(request, context, *rest)
 
     run.servicer0._handle = spy
     run.tokens(max_tokens=1)

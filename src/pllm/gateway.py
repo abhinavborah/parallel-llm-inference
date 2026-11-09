@@ -1,8 +1,15 @@
 """The gateway: Frontend.Generate, the decode loop and the request table (R4.1 to R4.3, R4.6).
 
-One gRPC server hosts three services:
+One gRPC server hosts four services:
 
 - Control.Register: stages register here and get their epoch (pllm.control).
+- Control.Heartbeat: each registered stage keeps one stream here (R3.10). The gateway keeps
+  the latest Beat of each stage with the time it arrived on this process's monotonic
+  clock, and the Nacks the stages report (R3.12). It sends back the Free messages queued
+  for that stage and, to Stage 0, a route update naming Stage 1's address and epoch: when
+  Stage 0's stream opens and each time Stage 1 registers (R3.13). A stream whose first Beat
+  is not from the stage's latest registration is refused with FAILED_PRECONDITION, and so
+  is an open stream once its stage registers again.
 - Frontend.Generate: a client sends a prompt, max_tokens and a timeout and receives the
   tokens in order. The gateway tokenises the prompt, gives the request an id and attempt
   1, sends the whole prompt as one message at start_pos 0, then drives greedy decode:
@@ -19,12 +26,13 @@ clock is compared across machines. The remaining budget is not yet carried on ea
 that is the deadline story (#36), so deadline_unix_ms is sent as 0.
 
 When a request ends, for any reason, it leaves the table and a Free for it is queued for
-each stage (R4.6). In the protocol a Free travels to a stage on the heartbeat stream; the
-heartbeat story (#28) drains these queues onto it. Until then frees_for(stage) returns them,
-nothing delivers them, and the queues grow by two small messages per request. A request that
-ends early (deadline, cancel, failure) can still have a step on the data stream; delivering
-its Free on the heartbeat stream must not let that step recreate the cache afterwards, which
-is a requirement on #28.
+each stage (R4.6); that stage's heartbeat stream delivers it. A Free queued while a stage
+has no stream waits for one, and the queue is emptied when the stage registers again,
+because a new process holds none of those caches. A request that ends early (deadline,
+cancel, failure) can still have a step on the data stream; the stage remembers the freed
+attempt and refuses that step (pllm.kvstore), so it cannot create the cache again.
+
+Failure detection from missed beats is not here (#38); beats() gives what it needs.
 
 Not here: many requests in flight is the next story (#26; the code does not prevent it but
 it is not tested). Requests share one stream to Stage 0, and a stage ends that stream when
@@ -36,6 +44,7 @@ request's attempt and expected step is dropped and counted.
 """
 
 import argparse
+import collections
 import json
 import logging
 import queue
@@ -48,7 +57,7 @@ from dataclasses import dataclass, field
 import grpc
 
 from pllm import config, prompts, wire
-from pllm.control import ControlService, Registry, expected_model
+from pllm.control import Registration, Registry, expected_model
 from pllm.model import ModelConfig
 from pllm.models import MODELS_DIR, PINNED
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
@@ -57,9 +66,14 @@ from pllm.stage_service import _DONE, _drain
 log = logging.getLogger("pllm.gateway")
 
 POLL_SECONDS = 0.05  # how often a waiting request checks its deadline, client and link
+MAX_NACKS = 1024  # Nacks kept for the recovery stories; the count covers all of them
+GENERATE_THREADS = 16  # Generate calls served at once; more are refused
 MAX_UNSENT = 4  # a UTF-8 character spans at most four byte-level tokens
 REPLACEMENT = chr(0xFFFD)  # what an incomplete UTF-8 character decodes to
 STAGES = (0, 1)
+# Other streams that each hold a server thread: one heartbeat per stage plus one replaced
+# heartbeat per stage still closing, and Results.Push from Stage 1 plus one reconnecting.
+OTHER_THREADS = 2 * len(STAGES) + 2
 
 
 @dataclass
@@ -110,7 +124,21 @@ class Link:
         self.channel.close()
 
 
-class Gateway(protocol_pb2_grpc.FrontendServicer, protocol_pb2_grpc.ResultsServicer):
+class Session:
+    """One open heartbeat stream from one stage incarnation."""
+
+    def __init__(self, stage: int, epoch: int):
+        self.stage, self.epoch = stage, epoch
+        self.outbox: queue.Queue = queue.Queue()  # route updates for this stream
+        self.superseded = threading.Event()
+        self.closed = threading.Event()
+
+
+class Gateway(
+    protocol_pb2_grpc.ControlServicer,
+    protocol_pb2_grpc.FrontendServicer,
+    protocol_pb2_grpc.ResultsServicer,
+):
     """tokenizer needs encode(text) -> ids and decode(ids) -> text; eos_ids end a request."""
 
     def __init__(self, registry: Registry, tokenizer, eos_ids, hidden_size: int, max_bytes: int):
@@ -123,7 +151,15 @@ class Gateway(protocol_pb2_grpc.FrontendServicer, protocol_pb2_grpc.ResultsServi
         self.requests: dict[str, Request] = {}
         self.frees = {stage: queue.Queue() for stage in STAGES}
         self.dropped = 0  # results that matched no waiting step
+        self.nacks: collections.deque = collections.deque(maxlen=MAX_NACKS)
+        self.nack_count = 0
+        self._beats: dict[int, tuple[protocol_pb2.Beat, float]] = {}
+        self._sessions: dict[int, Session] = {}
         self._lock = threading.Lock()
+        # Register and opening a heartbeat stream run one at a time, so a stream cannot
+        # pass its epoch check just before a newer registration and then become current.
+        self._control = threading.Lock()
+        self._generate_slots = threading.BoundedSemaphore(GENERATE_THREADS)
         self._link: Link | None = None
 
     # ------------------------------------------------------------------ table and frees
@@ -149,6 +185,127 @@ class Gateway(protocol_pb2_grpc.FrontendServicer, protocol_pb2_grpc.ResultsServi
         for stage in STAGES:
             self.frees[stage].put(protocol_pb2.Free(rid=request.rid, attempt=request.attempt))
         log.info("request %s ended (%s) after %d tokens", request.rid, how, len(request.tokens))
+
+    # ------------------------------------------------------------------ Control
+
+    def Register(self, request, context):
+        with self._control:
+            try:
+                entry = self.registry.register(request)
+            except Registration as err:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(err))
+            with self._lock:
+                old = self._sessions.get(entry.stage)
+                stage0 = self._sessions.get(0)
+            if old is not None:
+                old.superseded.set()  # before the drain: it stops taking frees
+            self.frees_for(entry.stage)  # a new process holds none of those caches
+            if entry.stage == 1 and stage0 is not None:
+                stage0.outbox.put(self._route(entry))
+        return protocol_pb2.RegisterResp(epoch=entry.epoch)
+
+    @staticmethod
+    def _route(entry) -> protocol_pb2.ControlMsg:
+        return protocol_pb2.ControlMsg(
+            route_update=protocol_pb2.RouteUpdate(
+                next_stage=entry.stage, addr=entry.addr, epoch=entry.epoch
+            )
+        )
+
+    def beats(self) -> dict[int, dict]:
+        """The latest Beat of each stage and how many seconds ago it arrived."""
+        now = time.monotonic()
+        with self._lock:
+            return {
+                stage: {
+                    "epoch": b.epoch,
+                    "inbox_depth": b.inbox_depth,
+                    "cached_requests": b.cached_requests,
+                    "age_s": round(now - at, 3),
+                }
+                for stage, (b, at) in self._beats.items()
+            }
+
+    def _record(self, session: Session, message: protocol_pb2.StageMsg) -> None:
+        kind = message.WhichOneof("msg")
+        with self._lock:
+            if self._sessions.get(session.stage) is not session:
+                return  # a stream that has been replaced
+            if kind == "beat":
+                self._beats[session.stage] = (message.beat, time.monotonic())
+                return
+            if kind != "nack":
+                return
+            self.nacks.append(message.nack)
+            self.nack_count += 1
+        n = message.nack
+        log.warning(
+            "stage %d nacked %s attempt %d step %d: %s", n.stage, n.rid, n.attempt, n.step, n.reason
+        )
+
+    def Heartbeat(self, request_iterator, context):
+        try:
+            first = next(request_iterator)
+        except (StopIteration, grpc.RpcError):
+            return
+        if first.WhichOneof("msg") != "beat":
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "the first message must be a Beat")
+        stage, epoch = first.beat.stage, first.beat.epoch
+        with self._control:
+            entry = self.registry.stages.get(stage)
+            if entry is None or entry.epoch != epoch:
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"stage {stage} epoch {epoch} is not its latest registration",
+                )
+            session = Session(stage, epoch)
+            with self._lock:
+                old = self._sessions.get(stage)
+                self._sessions[stage] = session
+            if old is not None:
+                old.superseded.set()
+            stage1 = self.registry.stages.get(1) if stage == 0 else None
+            route = self._route(stage1) if stage1 is not None else None
+        self._record(session, first)
+
+        def read():
+            try:
+                for message in request_iterator:
+                    self._record(session, message)
+            except grpc.RpcError:
+                pass  # the stage went away
+            finally:
+                session.closed.set()
+
+        threading.Thread(target=read, name=f"heartbeat-{stage}", daemon=True).start()
+        log.info("heartbeat open from stage %d epoch %d", stage, epoch)
+        try:
+            if route is not None:
+                yield route
+            while not session.closed.is_set() and context.is_active():
+                if session.superseded.is_set():
+                    context.abort(
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        f"stage {stage} registered again after epoch {epoch}",
+                    )
+                try:
+                    yield session.outbox.get_nowait()
+                    continue
+                except queue.Empty:
+                    pass
+                try:
+                    free = self.frees[stage].get(timeout=POLL_SECONDS)
+                except queue.Empty:
+                    continue
+                if session.superseded.is_set():  # taken just as a newer stage registered
+                    self.frees[stage].put(free)
+                    continue
+                yield protocol_pb2.ControlMsg(free=free)
+        finally:
+            with self._lock:
+                if self._sessions.get(stage) is session:
+                    del self._sessions[stage]
+            log.info("heartbeat closed from stage %d epoch %d", stage, epoch)
 
     # ------------------------------------------------------------------ Stage 0 link
 
@@ -213,6 +370,17 @@ class Gateway(protocol_pb2_grpc.FrontendServicer, protocol_pb2_grpc.ResultsServi
         return ids
 
     def Generate(self, req, context):
+        if not self._generate_slots.acquire(blocking=False):
+            context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                f"the gateway is serving {GENERATE_THREADS} requests; try again later",
+            )
+        try:
+            yield from self._generate(req, context)
+        finally:
+            self._generate_slots.release()
+
+    def _generate(self, req, context):
         ids = self._admit(req, context)
         link = self._stage0(context)
         request = Request(
@@ -305,12 +473,16 @@ class Gateway(protocol_pb2_grpc.FrontendServicer, protocol_pb2_grpc.ResultsServi
                 context.abort(grpc.StatusCode.UNAVAILABLE, f"stage 0 stream failed: {why}")
 
 
-def serve(gateway: Gateway, bind: str, max_workers: int = 16) -> tuple[grpc.Server, int]:
-    """Serve Control, Frontend and Results on bind (port 0 picks a free one)."""
+def serve(
+    gateway: Gateway, bind: str, max_workers: int = GENERATE_THREADS + OTHER_THREADS
+) -> tuple[grpc.Server, int]:
+    """Serve Control, Frontend and Results on bind (port 0 picks a free one). Every
+    Generate, heartbeat stream and Results.Push stream holds a thread from one pool;
+    Generate is capped at GENERATE_THREADS so the others always find one free."""
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers), options=gateway.options
     )
-    protocol_pb2_grpc.add_ControlServicer_to_server(ControlService(gateway.registry), server)
+    protocol_pb2_grpc.add_ControlServicer_to_server(gateway, server)
     protocol_pb2_grpc.add_FrontendServicer_to_server(gateway, server)
     protocol_pb2_grpc.add_ResultsServicer_to_server(gateway, server)
     port = server.add_insecure_port(bind)
