@@ -15,7 +15,10 @@ One gRPC server hosts four services:
   stream opens and each time that stage registers: Stage 0 uses it as its next hop
   (R3.13), Stage 1 as the sender epoch it accepts (R3.11). A stream whose first Beat is
   not from the stage's latest registration is refused with FAILED_PRECONDITION, and so is
-  an open stream once its stage registers again.
+  an open stream once its stage registers again. A stage whose epoch was declared dead,
+  with no replacement yet, gets ABORTED when it is next heard from, by a Beat or a new
+  stream; it exits and its supervisor starts a new one. ABORTED is not sent at the declaration: a
+  suspended stage would read it on resume and exit even if a replacement had registered.
 - Frontend.Generate: a client sends a prompt, max_tokens and a timeout and receives the
   tokens in order. The gateway tokenises the prompt, gives the request an id and attempt
   1, sends the whole prompt as one message at start_pos 0, then drives greedy decode:
@@ -148,6 +151,7 @@ class Session:
         self.stage, self.epoch = stage, epoch
         self.outbox: queue.Queue = queue.Queue()  # route updates for this stream
         self.superseded = threading.Event()
+        self.fenced = threading.Event()  # a Beat arrived after this epoch was declared dead
         self.closed = threading.Event()
 
 
@@ -266,6 +270,8 @@ class Gateway(
             if kind == "beat":
                 if self.detector.beat(session.stage, session.epoch):
                     self._beats[session.stage] = (message.beat, time.monotonic())
+                else:
+                    session.fenced.set()
                 return
             if kind != "nack":
                 return
@@ -326,11 +332,9 @@ class Gateway(
             if route is not None:
                 yield route
             while not session.closed.is_set() and context.is_active():
-                if session.superseded.is_set():
-                    context.abort(
-                        grpc.StatusCode.FAILED_PRECONDITION,
-                        f"stage {stage} registered again after epoch {epoch}",
-                    )
+                refusal = self._refusal(session)
+                if refusal is not None:
+                    context.abort(*refusal)
                 try:
                     yield session.outbox.get_nowait()
                     continue
@@ -349,6 +353,23 @@ class Gateway(
                 if self._sessions.get(stage) is session:
                     del self._sessions[stage]
             log.info("heartbeat closed from stage %d epoch %d", stage, epoch)
+
+    def _refusal(self, session: Session) -> tuple[grpc.StatusCode, str] | None:
+        """Why an open stream must end, or None. Superseded comes first, under the lock
+        Register holds: a stage told ABORTED exits, and its respawn would register a third
+        epoch over the replacement."""
+        with self._control:
+            if session.superseded.is_set():
+                return (
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"stage {session.stage} registered again after epoch {session.epoch}",
+                )
+            if session.fenced.is_set():
+                return (
+                    grpc.StatusCode.ABORTED,
+                    f"stage {session.stage} epoch {session.epoch} was declared dead",
+                )
+        return None
 
     def _stream_ended(self, session: Session, why: str) -> None:
         """Declare the stream's epoch dead unless a newer stream or registration replaced it.

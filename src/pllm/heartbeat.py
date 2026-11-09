@@ -15,6 +15,11 @@ but keeps serving (its late outputs are for the fencing story to reject). A rest
 gateway also answers FAILED_PRECONDITION, since it holds no registrations; only workers
 are restarted, so that case is not handled.
 
+If the gateway ends the stream with ABORTED, this epoch was declared dead and no replacement
+has registered. No supervisor would restart a live process, so the stage has to leave:
+declared_dead is set and the worker exits. gRPC itself never generates ABORTED, so a network
+fault cannot cause this.
+
 The stage's nacks queue is unbounded; while the gateway cannot be reached, Nacks wait in it.
 
 A message taken from the nacks queue just before the stream breaks can be lost with it,
@@ -76,6 +81,7 @@ class Heartbeat:
         self.options = options
         self.streams = 0  # streams opened, for the logs and the tests
         self.superseded = False
+        self.declared_dead = False
 
     def run(self, stop: threading.Event) -> None:
         """Send heartbeats until stop is set or a newer registration replaces this stage."""
@@ -91,6 +97,10 @@ class Heartbeat:
                     if err.code() == grpc.StatusCode.FAILED_PRECONDITION:
                         self.superseded = True
                         log.error("heartbeat refused: %s; stopping heartbeats", err.details())
+                        return
+                    if err.code() == grpc.StatusCode.ABORTED:
+                        self.declared_dead = True
+                        log.error("heartbeat refused: %s; leaving", err.details())
                         return
                     if not stop.is_set():
                         log.warning(

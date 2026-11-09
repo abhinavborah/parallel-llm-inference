@@ -288,7 +288,9 @@ clock (`Gateway.beats()`), and the Nacks (`Gateway.nacks`, the last 1024, and
 If the gateway cannot be reached, the stage tries again every second, and its Nacks wait
 in an unbounded queue. When a stage registers again, the gateway ends the old process's
 stream with FAILED_PRECONDITION and that process stops sending heartbeats but keeps
-serving; frees still queued for the old process are dropped. A restarted gateway would
+serving; frees still queued for the old process are dropped. A process whose epoch was
+declared dead with no replacement yet gets ABORTED at its next Beat or stream, exits with
+code 1, and its supervisor starts a new one (see "Failure detection"). A restarted gateway would
 refuse every stream the same way; only workers are restarted.
 
 Limits:
@@ -336,7 +338,7 @@ laptop only.
 Limits:
 
 - A stage that breaks its heartbeat stream is dead to the gateway even if the process is
-  fine, and that process is not restarted: it needs a manual restart.
+  fine, so a network blip now costs a respawn and a weight reload.
 - A worker suspended and never resumed produces no registration, because its supervisor sees
   a live process. The gateway waits.
 

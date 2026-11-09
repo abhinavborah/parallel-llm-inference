@@ -7,6 +7,7 @@ heartbeat, so these need no model weights.
 
 import json
 import logging
+import queue
 import socket as socket_module
 import subprocess
 import sys
@@ -16,16 +17,19 @@ import time
 import grpc
 import pytest
 from test_gateway import DIGEST, HIDDEN, IDS, PROMPT, WAIT, Words, code_of, wait_for
-from test_heartbeat import Beating, reference
+from test_heartbeat import FAST, Beating, reference
 from test_model import tiny_reference
 
 from pllm import config, control, faults
 from pllm.control import ExpectedModel, Registry
 from pllm.detection import MAX_EVENTS, Detector
 from pllm.gateway import Gateway, Session, serve
+from pllm.model import ModelConfig
+from pllm.models import sha256_of
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
 from pllm.stage_service import serve as serve_stage
-from pllm.worker import StageWorker, WorkerConfig
+from pllm.supervisor import Supervisor
+from pllm.worker import StageWorker, WorkerConfig, join_gateway
 
 SECOND = 1_000_000_000
 STAGE, EPOCH = 1, 7
@@ -274,6 +278,8 @@ with grpc.insecure_channel(gateway) as channel:
     ).epoch
 heart = Heartbeat(gateway, servicer, interval=interval, retry=interval)
 heart.run(threading.Event())
+if heart.declared_dead:
+    sys.exit(1)
 marker.write_text("superseded" if heart.superseded else "ended")
 threading.Event().wait()
 """
@@ -525,3 +531,118 @@ def test_close_stops_the_detector_thread(plane):
     assert watcher.is_alive()
     plane.gateway.close()
     assert not watcher.is_alive()
+
+
+# -------------------------------------------------------------- a stage declared dead that lives
+
+
+def test_a_replacement_takes_precedence_over_the_declared_death_of_a_stream(plane):
+    session = Session(1, 7)
+    assert plane.gateway._refusal(session) is None
+    session.fenced.set()
+    assert plane.gateway._refusal(session)[0] == grpc.StatusCode.ABORTED
+    session.superseded.set()  # a late Beat and a Register landed together
+    assert plane.gateway._refusal(session)[0] == grpc.StatusCode.FAILED_PRECONDITION
+
+
+def test_a_stage_resumed_with_no_replacement_is_told_and_exits(plane):
+    proc, epoch = plane.child(1)
+    faults.suspend(proc.pid)
+    plane.detection(path="heartbeat_timeout", epoch=epoch)
+    assert proc.poll() is None  # not told at the declaration: it is suspended
+    faults.resume(proc.pid)
+    assert proc.wait(WAIT) == 1
+    assert plane.registry.stages[1].epoch == epoch  # the epoch is not revived
+    assert len(detected(plane.detector, epoch=epoch)) == 1
+
+
+def test_a_resumed_stage_is_replaced_by_its_supervisor_with_no_manual_step(plane, tmp_path):
+    port = free_port()
+    supervisor = Supervisor(
+        plane.command(1, port),
+        ready_address=("127.0.0.1", port),
+        poll_seconds=0.02,
+        log_path=tmp_path / "events.jsonl",
+    )
+    supervisor.start()
+    try:
+        wait_for(lambda: 1 in plane.beating(), "the first beat")
+        epoch = plane.registry.stages[1].epoch
+        supervisor.apply("suspend")
+        plane.detection(path="heartbeat_timeout", epoch=epoch)
+        supervisor.apply("resume")
+        wait_for(lambda: plane.registry.stages[1].epoch > epoch, "the new registration")
+        new = plane.registry.stages[1].epoch
+        wait_for(lambda: plane.gateway.beats()[1]["epoch"] == new, "a beat from the new epoch")
+        wait_for(lambda: plane.detector.events()[-1]["event"] == "registered", "the record")
+        record = plane.detector.events()[-1]
+        assert (record["old_epoch"], record["new_epoch"]) == (epoch, new)
+        assert not plane.detector.is_dead(new)
+    finally:
+        supervisor.stop()
+
+
+def test_a_stage_resumed_after_a_replacement_stops_beating_and_keeps_running(plane, tmp_path):
+    proc, epoch = plane.child(1)
+    faults.suspend(proc.pid)
+    plane.detection(path="heartbeat_timeout", epoch=epoch)
+    time.sleep(0.3)  # long enough for a status sent at the declaration to be on the wire
+    new = plane.register(1)
+    faults.resume(proc.pid)
+    marker = tmp_path / "marker1"
+    wait_for(marker.exists, "the old process to read the refusal")
+    assert marker.read_text() == "superseded"
+    assert proc.poll() is None  # it keeps serving, for the fencing story to reject
+    beat = plane.gateway.beats()[1]
+    assert beat["epoch"] == epoch and beat["age_s"] >= 2.0  # its late beats did not count
+    assert plane.registry.stages[1].epoch == new
+
+
+def test_a_stream_opened_by_a_dead_epoch_is_refused_at_its_first_beat(plane):
+    epoch = plane.register(0)
+    plane.detector.declare(0, epoch, "stream_break", "broken")
+    code, details = code_of(plane.stream(0, epoch))
+    assert code == grpc.StatusCode.ABORTED and "declared dead" in details
+    assert plane.gateway.beats() == {} and plane.detector.is_dead(epoch)
+
+
+def test_a_worker_whose_epoch_is_declared_dead_ends_with_an_error(tmp_path):
+    """The path a serving worker takes: join_gateway raises and main exits with code 1."""
+    tiny_reference(tmp_path, layers=LAYERS)
+    digest = bytes.fromhex(sha256_of(tmp_path / "model.safetensors"))
+    n = ModelConfig.from_file(tmp_path / "config.json").num_layers
+    gateway = Gateway(Registry("tiny", ExpectedModel(digest, n, K)), None, (), HIDDEN, 2**20)
+    server, port = serve(gateway, "127.0.0.1:0")
+
+    class Stand:
+        stage_index, own_epoch, inbox_depth, cached_requests = 1, 0, 0, 0
+        nacks = queue.Queue()
+
+    raised = []
+
+    def join():
+        try:
+            join_gateway(
+                f"127.0.0.1:{port}",
+                1,
+                (K, n),
+                "tiny",
+                tmp_path,
+                "127.0.0.1:1",
+                Stand(),
+                threading.Event(),
+                interval=FAST,
+            )
+        except RuntimeError as err:
+            raised.append(err)
+
+    thread = threading.Thread(target=join, daemon=True)
+    thread.start()
+    try:
+        wait_for(lambda: 1 in gateway.beats(), "a beat after registering")
+        gateway.detector.declare(1, gateway.registry.stages[1].epoch, "stream_break")
+        thread.join(WAIT)
+        assert not thread.is_alive() and "declared stage 1" in str(raised[0])
+    finally:
+        gateway.close()
+        server.stop(0).wait()

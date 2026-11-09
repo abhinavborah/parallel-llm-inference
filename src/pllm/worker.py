@@ -190,12 +190,17 @@ def join_gateway(
     interval: float = HEARTBEAT_SECONDS,
 ) -> None:
     """Register with the gateway, then keep the heartbeat stream open until stop is set or
-    a newer registration replaces this one (R3.3, R3.10). A rejected registration raises."""
+    a newer registration replaces this one (R3.3, R3.10). A rejected registration raises,
+    and so does an epoch the gateway declared dead, so that the worker ends and its
+    supervisor starts a new one (R6.2)."""
     epoch = register_with_gateway(
         gateway, stage, layers, model, model_dir, addr, servicer, stop, options=options
     )
     if epoch is not None:
-        Heartbeat(gateway, servicer, interval=interval, options=options).run(stop)
+        heart = Heartbeat(gateway, servicer, interval=interval, options=options)
+        heart.run(stop)
+        if heart.declared_dead:
+            raise RuntimeError(f"the gateway declared stage {stage} epoch {epoch} dead")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -264,9 +269,9 @@ def main(argv: list[str] | None = None) -> None:
                 stop,
                 options=options,
             )
-        except BaseException as err:  # a rejected registration ends the worker, loudly
+        except BaseException as err:  # a rejection or a declared death ends the worker
             failure.append(err)
-            log.error("registration failed: %s", err)
+            log.error("leaving the gateway: %s", err)
             server.stop(grace=0)
 
     threading.Thread(target=register_in_background, daemon=True).start()
