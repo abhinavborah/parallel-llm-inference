@@ -148,14 +148,13 @@ and `mono` (monotonic seconds). A `ready` line after a restart carries `respawn_
 from the moment the exit was noticed to the moment the worker accepted a connection on its
 port, which includes loading its layers. Registration follows and is logged by the worker.
 Ctrl-C, SIGTERM or Ctrl-Break stops the supervisor and its worker. If the supervisor is
-force killed instead, its worker notices within about a second and exits, so it does not
-keep the port.
+force killed instead, its worker checks once a second that the supervisor is still running
+and exits when it is not, so it does not keep the port.
 
 Measured on Windows 11 with SmolLM2-135M, stage 1, 2 threads: a worker killed by the fault
 injector was listening again after 4.2 s (run
 `uv run pytest tests/test_supervisor.py -k real_worker --basetemp=<dir>` and read
-`events.jsonl` under it); with the laptop short of memory the same step took 3.9 to 8.1 s
-(`supervisor_cli_smoke`, see the pull request). The supervisor process itself is 36 MiB
+`events.jsonl` under it). A Python process that has imported the supervisor is 36 MiB
 (`uv run python -c "import psutil, pllm.supervisor; print(psutil.Process().memory_info().rss)"`).
 
 Kill, suspend and resume requests go to the supervisor's control port and are applied to
@@ -172,7 +171,16 @@ curl http://<laptop>:50062/status
 
 The address comes from `[supervisor0]` and `[supervisor1]` in the hosts file, and the
 supervisor listens on that host; without the tables it is the stage's host on port 50061 or
-50062. There is no authentication, so keep it on the lab network. `status` reports a worker
+50062. The examples use 50062, stage 1 on the Mac; for stage 0 on the Windows laptop use
+50061. A fault request from the other laptop needs that port open: on the Windows laptop,
+allow it inbound on the Private profile, the same profile as the worker port, from an
+administrator PowerShell:
+
+```
+New-NetFirewallRule -DisplayName "pllm supervisor 0" -Direction Inbound -Protocol TCP -LocalPort 50061 -Profile Private -Action Allow
+```
+
+There is no authentication, so keep it on the lab network. `status` reports a worker
 as suspended from the moment a suspend is applied until it is resumed or replaced; a suspend
 that lands as the worker exits can briefly mislabel its replacement.
 

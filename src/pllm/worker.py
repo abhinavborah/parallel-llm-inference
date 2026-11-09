@@ -32,7 +32,7 @@ import grpc
 import psutil
 import torch
 
-from pllm import config
+from pllm import config, wire
 from pllm.control import register
 from pllm.faults import StepDelay
 from pllm.model import KVCache, ModelConfig
@@ -138,6 +138,7 @@ def register_with_gateway(
     servicer,
     stop: threading.Event,
     retry_seconds: float = REGISTER_RETRY_SECONDS,
+    options: list[tuple[str, int]] | None = None,
 ) -> int | None:
     """Register this stage with the gateway (R3.3) and keep the epoch it returns.
 
@@ -145,12 +146,13 @@ def register_with_gateway(
     starts first, or comes back after a restart, registers as soon as the gateway is up. A
     gateway that rejects the registration (a different model, weights or layer range), or
     answers with any error other than being unreachable, is raised and not retried. Returns
-    the epoch, or None if stop was set first.
+    the epoch, or None if stop was set first. options are the channel's gRPC options;
+    main passes wire.channel_options, as every channel does (decision #20).
     """
     began = time.perf_counter()
     weights = sha256_of(model_dir / "model.safetensors")
     log.info("weights hashed in %.2f s", time.perf_counter() - began)
-    with grpc.insecure_channel(gateway) as channel:
+    with grpc.insecure_channel(gateway, options=options) as channel:
         while not stop.is_set():
             try:
                 epoch = register(channel, stage, layers, model, weights, addr)
@@ -233,6 +235,7 @@ def main(argv: list[str] | None = None) -> None:
                 getattr(hosts, f"stage{args.stage}").address,
                 servicer,
                 stop,
+                options=wire.channel_options(worker.stage.config.hidden_size),
             )
         except BaseException as err:  # a rejected registration ends the worker, loudly
             failure.append(err)

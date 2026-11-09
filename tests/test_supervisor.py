@@ -22,7 +22,7 @@ import grpc
 import psutil
 import pytest
 
-from pllm import config, control, faults
+from pllm import config, control, faults, wire
 from pllm.control import ControlService, ExpectedModel, Registry
 from pllm.models import MODELS_DIR, sha256_of
 from pllm.proto import protocol_pb2_grpc
@@ -482,6 +482,35 @@ def test_a_worker_registers_and_keeps_its_epoch(tmp_path):
     finally:
         gateway.server.stop(0)
     assert epoch == 1 == servicer.own_epoch == gateway.epoch()
+
+
+def test_the_registration_channel_takes_the_shared_options(tmp_path, monkeypatch):
+    digest = weights_file(tmp_path)
+    gateway = Gateway(digest)
+    seen = []
+    real = grpc.insecure_channel
+
+    def spy(target, options=None, **kwargs):
+        seen.append(options)
+        return real(target, options=options, **kwargs)
+
+    monkeypatch.setattr(grpc, "insecure_channel", spy)
+    options = wire.channel_options(576)
+    try:
+        register_with_gateway(
+            f"127.0.0.1:{gateway.port}",
+            1,
+            (15, 30),
+            "smollm2-135m",
+            tmp_path,
+            "127.0.0.1:9",
+            FakeServicer(),
+            threading.Event(),
+            options=options,
+        )
+    finally:
+        gateway.server.stop(0)
+    assert seen == [options]
 
 
 def test_a_worker_that_starts_before_the_gateway_registers_when_it_comes_up(tmp_path):
