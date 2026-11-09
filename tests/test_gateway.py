@@ -55,12 +55,15 @@ class System:
         register=True,
         tokenizer=None,
         delay0=0.0,
+        max_positions=None,
         max_workers=gateway.MAX_RUNNING + gateway.RESERVED_THREADS,
     ):
         n = ModelConfig.from_file(model_dir / "config.json").num_layers
         limit = max_bytes or config.max_message_bytes(HIDDEN)
         self.registry = Registry("tiny", ExpectedModel(DIGEST, n, k))
-        self.gateway = Gateway(self.registry, tokenizer or Words(), eos, HIDDEN, limit)
+        self.gateway = Gateway(
+            self.registry, tokenizer or Words(), eos, HIDDEN, limit, max_positions
+        )
         self.server, port = serve(self.gateway, "127.0.0.1:0", max_workers)
         self.address = f"127.0.0.1:{port}"
         self.server1, self.servicer1, port1 = serve_stage(

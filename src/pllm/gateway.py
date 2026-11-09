@@ -40,16 +40,28 @@ attempt and refuses that step (pllm.kvstore), so it cannot create the cache agai
 
 Failure detection from missed beats is not here (#38); beats() gives what it needs.
 
-Not here: many requests in flight is the next story (#26; the code does not prevent it but
-it is not tested). Requests share one stream to Stage 0, and a stage ends that stream when
-one request's step fails, so every request on it then fails with UNAVAILABLE; #26 has to
-keep one request's failure from ending the others. Each Generate holds a server thread for
-its life, so serve() caps running requests at max_workers - RESERVED_THREADS and refuses the
-rest with RESOURCE_EXHAUSTED; without the cap, a full pool leaves no thread for Results.Push
-and every running request stalls until its deadline. Also not here: the full result
-filter with epochs and exactly-once delivery (#30), recovery and replay (#38, #39), bounded
-queues (#33). A result that does not match its request's attempt and expected step is
-dropped and counted.
+Many requests in flight (R4.5): every request goes to Stage 0 on the one stream, so the
+stages see the requests' steps interleaved in whatever order they arrive, and Stage 0 works
+on one request while Stage 1 works on another. Each request sends its next step only after
+its own result, so its steps stay strictly in order; nothing orders one request against
+another. A request that ends early (cancel, deadline, a refused step) ends only itself. A
+stage ends the shared stream when a message is malformed, when a step fails inside the stage
+(including running out of memory), or when its next hop fails or a route update moves it;
+every request on the stream then fails with UNAVAILABLE, and recovering them is the recovery
+stories. A request whose prompt and max_tokens exceed the model's context length is refused
+at admission, so no valid request grows a cache past the model's context. That bounds each
+request, not Host B's memory: with an even split, one request at the cap holds about 180 MiB
+of Stage 0 cache for SmolLM2 (8192 positions) but about 4.4 GiB for Qwen3-0.6B (40960
+positions), more than Host B has. Admission by Host B's KV budget (R5.3) is #34. Equality under
+concurrency rests on each stage handling its stream one step at a time: requests never share
+a model call within a stage. One long prefill at a stage delays every other request's next
+step there (head-of-line blocking). Each Generate holds a
+server thread for its life, so serve() caps running requests at max_workers -
+RESERVED_THREADS and refuses the rest with RESOURCE_EXHAUSTED; without the cap, a full pool
+leaves no thread for Results.Push and every running request stalls until its deadline. Also
+not here: the full result filter with epochs and exactly-once delivery (#30), recovery and
+replay (#38, #39), bounded queues (#33). A result that does not match its request's attempt
+and expected step is dropped and counted.
 """
 
 import argparse
@@ -151,8 +163,19 @@ class Gateway(
 ):
     """tokenizer needs encode(text) -> ids and decode(ids) -> text; eos_ids end a request."""
 
-    def __init__(self, registry: Registry, tokenizer, eos_ids, hidden_size: int, max_bytes: int):
+    def __init__(
+        self,
+        registry: Registry,
+        tokenizer,
+        eos_ids,
+        hidden_size: int,
+        max_bytes: int,
+        max_positions: int | None = None,
+    ):
+        """max_positions is the model's context length: a request whose prompt and
+        max_tokens together exceed it is refused. None leaves it unchecked."""
         self.registry = registry
+        self.max_positions = max_positions
         self.tokenizer = tokenizer
         self.eos_ids = frozenset(eos_ids)
         self.hidden_size = hidden_size
@@ -381,6 +404,16 @@ class Gateway(
         ids = self.tokenizer.encode(req.prompt)
         if not ids:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "the prompt has no tokens")
+        # Positions past the context length do not raise at a stage (rotary positions are
+        # computed as needed), but each one grows the request's cache on both stages, so an
+        # unbounded max_tokens could run a stage out of memory and end the shared stream.
+        total = len(ids) + req.max_tokens
+        if self.max_positions is not None and total > self.max_positions:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"the prompt has {len(ids)} tokens and max_tokens is {req.max_tokens}; "
+                f"together {total}, above the model's context length of {self.max_positions}",
+            )
         # The prefill is the largest message: Stage 0 sends len(ids) x hidden fp32 values
         # to Stage 1, and every receiver accepts at most max_bytes (decision #20).
         needed = len(ids) * self.hidden_size * 4 + config.FRAMING_MARGIN
@@ -551,6 +584,12 @@ class Tokenizer:
         return self.inner.decode(ids, skip_special_tokens=False)
 
 
+def max_positions(model_dir) -> int | None:
+    """The model's context length from config.json, or None if it does not give one."""
+    value = json.loads((model_dir / "config.json").read_text()).get("max_position_embeddings")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def eos_ids(model_dir) -> list[int]:
     eos = json.loads((model_dir / "config.json").read_text()).get("eos_token_id")
     if eos is None:
@@ -578,6 +617,7 @@ def main(argv: list[str] | None = None) -> None:
         eos_ids(model_dir),
         hidden,
         config.max_message_bytes(hidden),
+        max_positions(model_dir),
     )
     server, _ = serve(gateway, f"0.0.0.0:{hosts.gateway.port}")
     try:
