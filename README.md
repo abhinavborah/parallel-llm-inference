@@ -254,8 +254,8 @@ logits equal the single-process reference (tested with small random models).
   by reason in `Gateway.discards`: `unknown_request` (a late result after the request
   ended), `stale_attempt`, `stale_epoch` (an old Stage 1), `duplicate` (a step already
   delivered), `ahead` (a step not asked for yet) and `stale_nack` (a Nack for no step a
-  running request waits on); `Gateway.dropped` is the total. Only an accepted result reaches the client, so each step of a request is streamed
-  once and in order.
+  running request waits on); `Gateway.dropped` is the total. Only an accepted result
+  reaches the client, so each step of a request is streamed once and in order.
 - When a request ends, for any reason, it leaves the table and a `Free` for it is queued for
   each stage; the stage's heartbeat stream delivers it.
 - Each running request holds one of the gateway's 20 server threads. Six are kept for the
