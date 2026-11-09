@@ -91,14 +91,17 @@ that does not start at 0, is refused: the message is skipped and not passed on, 
 Nack is put on the servicer's `nacks` queue, and the stream and the other requests on it
 carry on. `free` releases a request's cache on a stage, does nothing for an unknown request
 and returns the cached count to 0 when every request is freed (`cached_requests` is the
-count a Beat reports). The heartbeat stream that sends Nacks to the gateway and delivers
-Free messages is a separate piece of work, so for now nothing leaves the process and the
-tests call `free` directly. A request costs per position, per stage, `layers x 2 x kv
+count a Beat reports). A Free names an attempt; the stage remembers the last 4096 frees
+(about 0.8 MiB) and refuses a later message of that attempt or an older one with a
+`STALE_ATTEMPT` Nack, so a step still in flight when its Free arrives cannot cache the
+request again (after 4096 later frees the stage forgets one, and a step that late would
+cache it again). A newer attempt is accepted, and a Free for an older attempt leaves the
+cache a newer attempt holds. `STALE_ATTEMPT` therefore also marks a late step of a request
+that has ended, which needs no action; recovery acts only on one for a running request. The heartbeat stream (under "Heartbeat") sends the Nacks to the
+gateway and delivers the frees. A request costs per position, per stage, `layers x 2 x kv
 heads x head dim x 4` bytes: for SmolLM2-135M 23,040 bytes, so a 528-position request holds
 11.6 MiB on each stage and 8 such requests 93 MiB (steady state; while a step
-appends, a layer's cache is briefly about twice its size). Requests that never receive a Free
-stay cached until the process ends, and the `nacks` queue is unbounded until the heartbeat
-stream drains it.
+appends, a layer's cache is briefly about twice its size).
 
 Activations travel as raw little-endian fp32 bytes with a dtype name and a shape
 (`pllm.wire`), never as JSON, and are bitwise equal on arrival. The receive limit of every
@@ -196,7 +199,8 @@ a higher epoch. `pllm.control.register` is the stage side.
 
 ## Gateway
 
-`pllm.gateway` serves `Control.Register`, `Frontend.Generate` and `Results.Push` on the
+`pllm.gateway` serves `Control.Register`, `Control.Heartbeat`, `Frontend.Generate` and
+`Results.Push` on the
 gateway port from the hosts file. Start it first, then each stage worker with `--serve`
 (they register with it), then send a prompt with the client:
 
@@ -229,17 +233,46 @@ logits equal the single-process reference (tested with small random models).
 - The request table (`Gateway.table()`) lists each running request: id, attempt, tokens so
   far, expected step and seconds to its deadline.
 - When a request ends, for any reason, it leaves the table and a `Free` for it is queued for
-  each stage. Frees travel on the heartbeat stream, which is not built yet; until then each
-  stage keeps the cache of every finished request (the per-request cost is under "Chain
-  over gRPC"), so restart the workers between long runs. The gateway's queues of frees grow
-  by two small messages per request until then.
-- Each running request holds one of the gateway's 16 server threads. Two are kept for the
-  results stream and registration, so at most 14 requests run at once and a further one is
-  refused with RESOURCE_EXHAUSTED; many in flight is the next story. Requests share one stream to
+  each stage; the stage's heartbeat stream delivers it.
+- Each running request holds one of the gateway's 20 server threads. Six are kept for the
+  results stream, registration and the heartbeat streams, so at most 14 requests run at
+  once and a further one is refused with RESOURCE_EXHAUSTED; many in flight is the next
+  story. Requests share one stream to
   Stage 0, and a step that fails at a stage ends that stream, so the other requests on it
   fail with UNAVAILABLE too.
 - Text is decoded per token, holding back a token that ends inside a character until the
   next one completes it (up to four tokens), so a `Token` can carry empty text.
+
+## Heartbeat
+
+A serving worker registers, then keeps one `Control.Heartbeat` stream to the gateway
+(`pllm.heartbeat`). Every 0.5 s it sends a Beat with its stage, epoch, inbox depth and
+cached request count, and it sends each Nack as soon as it is raised, between beats. The
+gateway keeps the latest Beat of each stage with its arrival time on the gateway's own
+clock (`Gateway.beats()`), and the Nacks (`Gateway.nacks`, the last 1024, and
+`nack_count`). It sends back:
+
+- the `Free` messages queued for that stage;
+- to Stage 0, a route update with Stage 1's address and epoch, when Stage 0's stream opens
+  and each time Stage 1 registers. Stage 0 then sends to that address with that target
+  epoch without restarting, on a new channel even at the same address (an old channel
+  that failed while Stage 1 was down would wait out gRPC's reconnect backoff, up to 120
+  s; Stage 0's channels do not share connections, so the new one starts fresh). If the address changed, the old channel is closed, which ends a stream still open
+  on it, and the gateway's next request opens a new one.
+
+If the gateway cannot be reached, the stage tries again every second, and its Nacks wait
+in an unbounded queue. When a stage registers again, the gateway ends the old process's
+stream with FAILED_PRECONDITION and that process stops sending heartbeats but keeps
+serving; frees still queued for the old process are dropped. A restarted gateway would
+refuse every stream the same way; only workers are restarted.
+
+Limits:
+
+- Declaring a stage dead from missed beats, and replaying its requests, come with the
+  recovery stories. A request started between Stage 1's registration and the route update
+  reaching Stage 0 (a few milliseconds) still goes to the old route.
+- A Nack or a `Free` sent just as the stream breaks can be lost with it. A lost `Free`
+  leaves that request's cache on the stage until the process ends.
 
 ## X1a: the split against the single process
 

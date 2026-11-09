@@ -54,7 +54,8 @@ class System:
         delay1=0.0,
         register=True,
         tokenizer=None,
-        max_workers=16,
+        delay0=0.0,
+        max_workers=gateway.MAX_RUNNING + gateway.RESERVED_THREADS,
     ):
         n = ModelConfig.from_file(model_dir / "config.json").num_layers
         limit = max_bytes or config.max_message_bytes(HIDDEN)
@@ -68,7 +69,7 @@ class System:
             results_address=self.address,
         )
         self.server0, self.servicer0, port0 = serve_stage(
-            StageWorker(WorkerConfig(model_dir, 0, k)),
+            StageWorker(WorkerConfig(model_dir, 0, k, delay0)),
             "127.0.0.1:0",
             next_address=f"127.0.0.1:{port1}",
         )
@@ -166,9 +167,9 @@ def test_the_prompt_goes_as_one_message_at_position_zero_then_one_token_per_step
     sent = []
     real = run.servicer0._handle
 
-    def spy(request, context):
+    def spy(request, context, *rest):
         sent.append((request.attempt, request.step, request.start_pos, list(request.tokens.ids)))
-        return real(request, context)
+        return real(request, context, *rest)
 
     run.servicer0._handle = spy
     tokens = [t.token for t in run.tokens(max_tokens=3)]
@@ -410,9 +411,9 @@ def test_the_stage_0_message_carries_its_epoch_and_the_gateway_as_sender(system)
     seen = []
     real = run.servicer0._handle
 
-    def spy(request, context):
+    def spy(request, context, *rest):
         seen.append((request.target_epoch, request.sender_epoch))
-        return real(request, context)
+        return real(request, context, *rest)
 
     run.servicer0._handle = spy
     run.tokens(max_tokens=1)
@@ -482,7 +483,7 @@ def outcomes(run, clients, **kwargs):
 
 
 def test_a_request_over_the_running_limit_is_refused_and_the_others_finish(system):
-    run = system(delay1=0.3, max_workers=5)  # 5 threads, 2 kept, so 3 requests at once
+    run = system(delay1=0.3, max_workers=gateway.RESERVED_THREADS + 3)  # 3 requests at once
     assert run.gateway.max_running == 3
     streams = [run.call(max_tokens=3, timeout_ms=20_000) for _ in range(3)]
     firsts = [next(stream) for stream in streams]
@@ -500,7 +501,7 @@ def test_a_request_over_the_running_limit_is_refused_and_the_others_finish(syste
 def test_a_full_thread_pool_refuses_requests_instead_of_stalling_them(system):
     """The reported fault: as many clients as server threads used to leave none for the
     results stream, and every request then failed at its deadline."""
-    run = system(delay1=0.2, max_workers=5)
+    run = system(delay1=0.2, max_workers=gateway.RESERVED_THREADS + 3)
     out = outcomes(run, 5, max_tokens=3, timeout_ms=10_000)
     assert grpc.StatusCode.DEADLINE_EXCEEDED not in out
     assert out.count(3) >= 3

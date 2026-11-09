@@ -13,7 +13,15 @@ at position 0. For a message that starts at start_pos with the request's cache h
   the message is refused with Gap, which becomes a GAP Nack so the gateway replays.
 
 free releases a request's cache; freeing an unknown request does nothing, so a Free that
-arrives twice is harmless.
+arrives twice is harmless. A Free names an attempt, and the store remembers it: a later
+message for that request with the same or an older attempt is refused with Stale, so a step
+still on the data stream when its Free arrives on the heartbeat stream cannot create the
+cache again. A newer attempt (a replay) is accepted, and a Free for an older attempt does
+not release the cache a newer attempt holds. The store remembers the last MAX_FREED frees,
+about 200 bytes each (the request id and the dictionary entry), so about 0.8 MiB. Limit: once
+MAX_FREED later frees have pushed a request out, a late step of its freed attempt is accepted
+again and creates a cache that no Free will release, until the process ends. That needs a step
+held up while MAX_FREED other requests finish.
 
 Memory cost: a request holds, per position, layers x 2 (keys and values) x kv_heads x
 head_dim x 4 bytes (fp32). SmolLM2-135M has 3 kv heads of 64 and 15 layers per stage, so
@@ -24,11 +32,13 @@ that never receive a Free stay until the process ends; the gateway frees them (R
 """
 
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 
 from pllm.model import KVCache, ModelConfig
 
 FLOAT_BYTES = 4
+MAX_FREED = 4096  # freed (request, attempt) pairs remembered
 
 
 class Gap(Exception):
@@ -40,6 +50,14 @@ class Gap(Exception):
         super().__init__(f"request {rid!r} starts at position {start_pos} but this stage {have}")
 
 
+class Stale(Exception):
+    """A message for an attempt of a request that has already been freed."""
+
+    def __init__(self, rid: str, attempt: int, freed: int):
+        self.rid, self.attempt, self.freed = rid, attempt, freed
+        super().__init__(f"request {rid!r} attempt {attempt} was freed at attempt {freed}")
+
+
 class KVStore:
     def __init__(self, config: ModelConfig, num_layers: int, new_cache: Callable[[], KVCache]):
         self.bytes_per_position = (
@@ -47,19 +65,26 @@ class KVStore:
         )
         self._new_cache = new_cache
         self._caches: dict[str, KVCache] = {}
+        self._freed: OrderedDict[str, int] = OrderedDict()  # rid to the attempt freed
+        self._attempts: dict[str, int] = {}  # rid to the newest attempt its cache served
         self._lock = threading.Lock()
 
-    def acquire(self, rid: str, start_pos: int) -> KVCache:
+    def acquire(self, rid: str, start_pos: int, attempt: int | None = None) -> KVCache:
         """The cache a message starting at start_pos writes to, positioned for it.
 
-        Raises Gap if the message starts past the cache (nothing is changed then).
+        Raises Stale if attempt is given and that attempt of rid, or a newer one, was
+        freed; raises Gap if the message starts past the cache. Nothing is changed then.
         """
         with self._lock:
+            freed = self._freed.get(rid)
+            if attempt is not None and freed is not None and attempt <= freed:
+                raise Stale(rid, attempt, freed)
             cache = self._caches.get(rid)
             if cache is None:
                 if start_pos != 0:
                     raise Gap(rid, start_pos, None)
                 cache = self._caches[rid] = self._new_cache()
+                self._note(rid, attempt)
                 return cache
             length = len(cache)
             if start_pos > length:
@@ -68,11 +93,25 @@ class KVStore:
                 # clone: a slice is a view and would keep the longer storage alive
                 cache.keys = [k[:, :start_pos].clone() for k in cache.keys]
                 cache.values = [v[:, :start_pos].clone() for v in cache.values]
+            self._note(rid, attempt)
             return cache
 
-    def free(self, rid: str) -> bool:
-        """Release a request's cache; False if there was none."""
+    def _note(self, rid: str, attempt: int | None) -> None:
+        if attempt is not None:
+            self._attempts[rid] = max(attempt, self._attempts.get(rid, attempt))
+
+    def free(self, rid: str, attempt: int | None = None) -> bool:
+        """Release a request's cache; False if there was none. With attempt, also refuse
+        later messages of that attempt or an older one (see Stale), and keep a cache that a
+        newer attempt has already used."""
         with self._lock:
+            if attempt is not None:
+                self._freed[rid] = max(attempt, self._freed.pop(rid, attempt))
+                while len(self._freed) > MAX_FREED:
+                    self._freed.popitem(last=False)
+                if self._attempts.get(rid, attempt) > attempt:
+                    return False
+            self._attempts.pop(rid, None)
             return self._caches.pop(rid, None) is not None
 
     def free_cache(self, rid: str, cache: KVCache) -> bool:
@@ -82,6 +121,7 @@ class KVStore:
             if self._caches.get(rid) is not cache:
                 return False
             del self._caches[rid]
+            self._attempts.pop(rid, None)
             return True
 
     def __len__(self) -> int:

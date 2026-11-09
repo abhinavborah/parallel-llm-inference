@@ -213,6 +213,11 @@ def test_stop_leaves_no_worker_behind(tmp_path):
     pid = sup.pid
     created = started_at(pid)
     sup.stop()
+    # stop() has waited for the exit; Windows can still report the process for a moment
+    # while it is torn down, so allow a short settle before calling it left behind
+    end = time.monotonic() + 5.0
+    while alive(pid, created) and time.monotonic() < end:
+        time.sleep(0.05)
     assert not alive(pid, created), f"worker {pid} still running after stop: {describe(pid)}"
     assert names(tmp_path)[-1] == "stopped" and sup.status()["state"] == "stopped"
 
