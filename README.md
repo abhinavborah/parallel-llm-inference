@@ -173,12 +173,8 @@ The address comes from `[supervisor0]` and `[supervisor1]` in the hosts file, an
 supervisor listens on that host; without the tables it is the stage's host on port 50061 or
 50062. The examples use 50062, stage 1 on the Mac; for stage 0 on the Windows laptop use
 50061. A fault request from the other laptop needs that port open: on the Windows laptop,
-allow it inbound on the Private profile, the same profile as the worker port, from an
-administrator PowerShell:
-
-```
-New-NetFirewallRule -DisplayName "pllm supervisor 0" -Direction Inbound -Protocol TCP -LocalPort 50061 -Profile Private -Action Allow
-```
+allow it inbound on the Public profile, the same profile as the worker port (see "Starting
+the system").
 
 There is no authentication, so keep it on the lab network. `status` reports a worker
 as suspended from the moment a suspend is applied until it is resumed or replaced; a suspend
@@ -217,6 +213,69 @@ logits differ in their low bits there, so across hosts compare the stored tokens
 and report agreement. The summary line also gives the inter-op
 thread count. The stored logit summary is the top logit per step, not the full logits. `--length` is 16, 128 (the default)
 or 512; `--count` limits the run to the first prompts.
+
+## Starting the system
+
+`pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway
+through `pllm.gateway` and each stage through `pllm.supervisor`. With no `--roles`, every
+process starts on this laptop (single-host mode, for tests and X1a):
+
+```
+uv run python -m pllm.launch smollm2-135m
+```
+
+For a run across the laptops, set `PLLM_CONFIG` to your hosts file on both (see "Hosts and
+ports"), then start each laptop's share. Order does not matter, since a stage retries until
+the gateway is up:
+
+```
+# macOS (Stage 1 and the gateway)
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0
+```
+
+Send a prompt once both stages have registered. Until then the client gets UNAVAILABLE.
+
+```
+uv run python -m pllm.client "The capital of France is" --max-tokens 16 --timeout 30
+```
+
+The launcher refuses a role whose address in the hosts file is not on this laptop, and missing
+weights. By default each stage gets this laptop's physical cores divided by its stages, so on
+one host each stage gets half; `--threads` sets it. Ctrl-C stops everything. If a process
+exits by itself, the launcher stops the rest and exits with code 1 (a worker that dies is
+not such a case: its supervisor restarts it). Closing the terminal also stops everything on
+macOS. Force killing the launcher leaves its processes running.
+
+Before every run, close other programs and use the same power state. The launcher logs the
+available memory and power state at the start, warns on battery, and writes a run record.
+
+### Windows setup
+
+- Use native Python, not WSL2.
+- Keep the charger in and select the best performance power plan or power mode in Settings.
+- Allow the Stage 0 port and the supervisor port on the Public profile, from an administrator
+  PowerShell:
+
+```
+New-NetFirewallRule -DisplayName "pllm stage 0" -Direction Inbound -Protocol TCP -LocalPort 50051 -Profile Public -Action Allow
+New-NetFirewallRule -DisplayName "pllm supervisor 0" -Direction Inbound -Protocol TCP -LocalPort 50061 -Profile Public -Action Allow
+```
+
+Both ports have no authentication, so remove the rules (`Remove-NetFirewallRule -DisplayName
+"pllm stage 0"`, and the same for the other) when the laptop joins a network you do not trust.
+
+### macOS setup
+
+- Keep the charger in.
+- In System Settings, Network, Firewall, allow incoming connections for the Python that `uv`
+  runs, or accept the prompt the first time a process listens.
+
+### If the network fails
+
+Try in order a direct cable, a phone hotspot, then Tailscale. Only the hosts file changes: set
+each host to that network's address for the laptop and `network` to the network's name.
 
 ## Hosts and ports
 

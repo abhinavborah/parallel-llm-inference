@@ -322,7 +322,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 |---|---|---|---|---|---|
 | R8.1 | Stage 0 on Host B and Stage 1 plus gateway on Host A run as separate processes over the LAN and one request completes end to end. | Must | W2 | A and B (unconfirmed) | Spec R1; Spec R2; D9 |
 | R8.2 | Launch scripts written in Python start each process the same way on macOS and Windows. | Must | W2 | A and B (unconfirmed) | G7; Spec R2 |
-| R8.3 | Windows setup documented and tested: native Python (not WSL2), worker port allowed on the Private firewall profile, charger and performance power plan. | Must | W2 | B (unconfirmed) | Proposal special requirements |
+| R8.3 | Windows setup documented and tested: native Python (not WSL2), worker port allowed on the Private firewall profile, charger and performance power plan. Status: 2026-11-09 (#53): the README uses a Public profile rule limited to the Stage 0 and supervisor ports, as proposed on #7; Member B to confirm. | Must | W2 | B (unconfirmed) | Proposal special requirements |
 | R8.4 | macOS setup documented and tested: incoming connections allowed, charger connected. | Must | W2 | A (unconfirmed) | Proposal special requirements |
 | R8.5 | Network fallbacks (direct cable, phone hotspot, Tailscale) work by changing the configuration file only. | Should | W2 | A (unconfirmed) | Proposal special requirements |
 | R8.6 | Capacity-aware layer split: a function chooses k from each host's measured free memory and speed; Host B receives fewer layers than an even split. | Must | W5 | A (unconfirmed) | Spec R3; Proposal PG3 |
