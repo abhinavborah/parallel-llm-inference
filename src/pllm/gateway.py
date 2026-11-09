@@ -5,11 +5,17 @@ One gRPC server hosts four services:
 - Control.Register: stages register here and get their epoch (pllm.control).
 - Control.Heartbeat: each registered stage keeps one stream here (R3.10). The gateway keeps
   the latest Beat of each stage with the time it arrived on this process's monotonic
-  clock, and the Nacks the stages report (R3.12). It sends back the Free messages queued
-  for that stage and, to Stage 0, a route update naming Stage 1's address and epoch: when
-  Stage 0's stream opens and each time Stage 1 registers (R3.13). A stream whose first Beat
-  is not from the stage's latest registration is refused with FAILED_PRECONDITION, and so
-  is an open stream once its stage registers again.
+  clock, and the Nacks the stages report (R3.12). A Nack for the step a running request is
+  waiting on (same attempt and step) fails that request at once with UNAVAILABLE, naming
+  the stage and the reason; a Nack for another step, such as one a resumed old stage sent
+  late, leaves it running. Failing at once replaces waiting for the deadline; replaying
+  instead comes with the recovery stories (#38, #39). A Nack for a request that has ended
+  needs nothing (a late step of a freed attempt). It sends back the Free messages queued
+  for that stage, and a route update naming the other stage's address and epoch when the
+  stream opens and each time that stage registers: Stage 0 uses it as its next hop
+  (R3.13), Stage 1 as the sender epoch it accepts (R3.11). A stream whose first Beat is
+  not from the stage's latest registration is refused with FAILED_PRECONDITION, and so is
+  an open stream once its stage registers again.
 - Frontend.Generate: a client sends a prompt, max_tokens and a timeout and receives the
   tokens in order. The gateway tokenises the prompt, gives the request an id and attempt
   1, sends the whole prompt as one message at start_pos 0, then drives greedy decode:
@@ -199,18 +205,22 @@ class Gateway(
                 entry = self.registry.register(request)
             except Registration as err:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(err))
+            neighbour = 1 - entry.stage
             with self._lock:
                 old = self._sessions.get(entry.stage)
-                stage0 = self._sessions.get(0)
+                other = self._sessions.get(neighbour)
             if old is not None:
                 old.superseded.set()  # before the drain: it stops taking frees
             self.frees_for(entry.stage)  # a new process holds none of those caches
-            if entry.stage == 1 and stage0 is not None:
-                stage0.outbox.put(self._route(entry))
+            if other is not None:  # Stage 0 learns its next hop, Stage 1 its upstream
+                other.outbox.put(self._route(entry))
         return protocol_pb2.RegisterResp(epoch=entry.epoch)
 
     @staticmethod
     def _route(entry) -> protocol_pb2.ControlMsg:
+        """A route update naming entry's stage. The field is called next_stage, but Stage 1
+        receives one naming stage 0, its upstream, and takes the epoch as the sender epoch
+        it accepts (R3.11); the schema is unchanged."""
         return protocol_pb2.ControlMsg(
             route_update=protocol_pb2.RouteUpdate(
                 next_stage=entry.stage, addr=entry.addr, epoch=entry.epoch
@@ -243,10 +253,18 @@ class Gateway(
                 return
             self.nacks.append(message.nack)
             self.nack_count += 1
-        n = message.nack
+            n = message.nack
+            request = self.requests.get(n.rid)
+            running = (
+                request is not None
+                and request.attempt == n.attempt
+                and request.expected_step == n.step
+            )
         log.warning(
             "stage %d nacked %s attempt %d step %d: %s", n.stage, n.rid, n.attempt, n.step, n.reason
         )
+        if running:  # its step was refused, so it cannot go on: fail it at once (R3.12)
+            request.results.put(n)
 
     def Heartbeat(self, request_iterator, context):
         try:
@@ -269,8 +287,8 @@ class Gateway(
                 self._sessions[stage] = session
             if old is not None:
                 old.superseded.set()
-            stage1 = self.registry.stages.get(1) if stage == 0 else None
-            route = self._route(stage1) if stage1 is not None else None
+            neighbour = self.registry.stages.get(1 - stage)
+            route = self._route(neighbour) if neighbour is not None else None
         self._record(session, first)
 
         def read():
@@ -473,6 +491,12 @@ class Gateway(
             except queue.Empty:
                 pass
             else:
+                if isinstance(result, protocol_pb2.Nack):
+                    context.abort(
+                        grpc.StatusCode.UNAVAILABLE,
+                        f"stage {result.stage} refused step {result.step} of request "
+                        f"{request.rid}: {result.reason}",
+                    )
                 # Checked again here: a duplicate queued just before the step moved on.
                 if (result.attempt, result.step) == (request.attempt, request.expected_step):
                     return result

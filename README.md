@@ -80,8 +80,28 @@ local copy, so both laptops agree): stage 0 runs layers 0 to k - 1 and stage 1 t
 layers and sends the hidden states on to stage 1 as a `StepRequest`; the last stage runs
 the LM head, takes the greedy token and its logit and pushes a `StepResult` to the
 gateway's `Results.Push`. Steps are handled in arrival order, and each request id has its
-own KV cache in `pllm.kvstore.KVStore`. Fencing by epoch is a separate piece of work: the
-epoch fields are carried but not checked.
+own KV cache in `pllm.kvstore.KVStore`.
+
+Fencing (R3.11). Before anything is cached, each message is checked in this order, and a
+refused one is not cached or forwarded; its Nack goes to the gateway on the heartbeat stream:
+
+1. `target_epoch` is not this stage's epoch: `WRONG_EPOCH` (aimed at a dead incarnation).
+2. `sender_epoch` is not the live upstream epoch: `BAD_SENDER`. Stage 0 accepts only the
+   gateway (epoch 0); Stage 1 accepts Stage 0's current epoch, which the gateway sends it as
+   a route update when its heartbeat stream opens and each time Stage 0 registers. This
+   fences a resumed old Stage 0.
+3. an attempt older than the newest one that has used the request's cache: `STALE_ATTEMPT`.
+   A newer attempt is adopted (a replay starts at position 0, which truncates).
+
+The gateway fails a running request at once with UNAVAILABLE when a Nack names its current
+attempt, giving the stage and the reason; replaying it instead comes with the recovery
+stories. A stage takes requests only once both route updates have arrived, a few
+milliseconds after the second stage registers: a request sent before that is refused with
+`WRONG_EPOCH` (or `BAD_SENDER`) and fails at once. When the route update then arrives,
+Stage 0 ends the stream that carried the stale epoch, so the request can be sent again.
+Only a Nack for the step a request is waiting on fails it; one for another step (a late
+message from a resumed old stage) leaves it running. A stage that has not registered yet
+has epoch 0 and accepts any message whose epochs are both 0.
 
 KV cache rules (R3.6). A message whose `start_pos` equals the cached length appends. A lower
 `start_pos` truncates the cache to it and then appends, which is how the gateway replays
@@ -97,8 +117,9 @@ count a Beat reports). A Free names an attempt; the stage remembers the last 409
 request again (after 4096 later frees the stage forgets one, and a step that late would
 cache it again). A newer attempt is accepted, and a Free for an older attempt leaves the
 cache a newer attempt holds. `STALE_ATTEMPT` therefore also marks a late step of a request
-that has ended, which needs no action; recovery acts only on one for a running request. The heartbeat stream (under "Heartbeat") sends the Nacks to the
-gateway and delivers the frees. A request costs per position, per stage, `layers x 2 x kv
+that has ended, which needs no action; recovery acts only on one for a running request.
+The heartbeat stream (under "Heartbeat") sends the Nacks to the gateway and delivers the
+frees. A request costs per position, per stage, `layers x 2 x kv
 heads x head dim x 4` bytes: for SmolLM2-135M 23,040 bytes, so a 528-position request holds
 11.6 MiB on each stage and 8 such requests 93 MiB (steady state; while a step
 appends, a layer's cache is briefly about twice its size).
@@ -257,8 +278,12 @@ clock (`Gateway.beats()`), and the Nacks (`Gateway.nacks`, the last 1024, and
   and each time Stage 1 registers. Stage 0 then sends to that address with that target
   epoch without restarting, on a new channel even at the same address (an old channel
   that failed while Stage 1 was down would wait out gRPC's reconnect backoff, up to 120
-  s; Stage 0's channels do not share connections, so the new one starts fresh). If the address changed, the old channel is closed, which ends a stream still open
-  on it, and the gateway's next request opens a new one.
+  s; Stage 0's channels do not share connections, so the new one starts fresh). A stream
+  still open on the old route is ended with UNAVAILABLE, and the gateway's next request
+  opens a new one.
+- to Stage 1, a route update naming stage 0 with its address and epoch, when Stage 1's
+  stream opens and each time Stage 0 registers. Stage 1 takes that epoch as the only
+  sender epoch it accepts (see "Fencing").
 
 If the gateway cannot be reached, the stage tries again every second, and its Nacks wait
 in an unbounded queue. When a stage registers again, the gateway ends the old process's
@@ -269,8 +294,8 @@ refuse every stream the same way; only workers are restarted.
 Limits:
 
 - Declaring a stage dead from missed beats, and replaying its requests, come with the
-  recovery stories. A request started between Stage 1's registration and the route update
-  reaching Stage 0 (a few milliseconds) still goes to the old route.
+  recovery stories. A request started between a registration and its route update reaching
+  the other stage (a few milliseconds) is refused by fencing and fails at once.
 - A Nack or a `Free` sent just as the stream breaks can be lost with it. A lost `Free`
   leaves that request's cache on the stage until the process ends.
 

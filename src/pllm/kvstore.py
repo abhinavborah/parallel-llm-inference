@@ -12,6 +12,10 @@ at position 0. For a message that starts at start_pos with the request's cache h
 - start_pos > length, or a request this stage has never seen that does not start at 0:
   the message is refused with Gap, which becomes a GAP Nack so the gateway replays.
 
+Attempts (R3.11): the store keeps the newest attempt that has used each cache. A message
+of an older attempt is refused with Stale; a newer attempt is adopted, and its position
+decides as above (a replay starts at 0, which truncates).
+
 free releases a request's cache; freeing an unknown request does nothing, so a Free that
 arrives twice is harmless. A Free names an attempt, and the store remembers it: a later
 message for that request with the same or an older attempt is refused with Stale, so a step
@@ -51,11 +55,13 @@ class Gap(Exception):
 
 
 class Stale(Exception):
-    """A message for an attempt of a request that has already been freed."""
+    """A message for an attempt older than one this stage has already used for its request,
+    or for an attempt that has already been freed (freed is True then)."""
 
-    def __init__(self, rid: str, attempt: int, freed: int):
-        self.rid, self.attempt, self.freed = rid, attempt, freed
-        super().__init__(f"request {rid!r} attempt {attempt} was freed at attempt {freed}")
+    def __init__(self, rid: str, attempt: int, newer: int, freed: bool = True):
+        self.rid, self.attempt, self.newer, self.freed = rid, attempt, newer, freed
+        what = "was freed at attempt" if freed else "is older than attempt"
+        super().__init__(f"request {rid!r} attempt {attempt} {what} {newer}")
 
 
 class KVStore:
@@ -73,12 +79,17 @@ class KVStore:
         """The cache a message starting at start_pos writes to, positioned for it.
 
         Raises Stale if attempt is given and that attempt of rid, or a newer one, was
-        freed; raises Gap if the message starts past the cache. Nothing is changed then.
+        freed, or if a newer attempt has already used rid's cache (R3.11); a newer attempt
+        than the cache has seen is adopted. Raises Gap if the message starts past the
+        cache. Nothing is changed when it raises.
         """
         with self._lock:
             freed = self._freed.get(rid)
             if attempt is not None and freed is not None and attempt <= freed:
                 raise Stale(rid, attempt, freed)
+            known = self._attempts.get(rid)
+            if attempt is not None and known is not None and attempt < known:
+                raise Stale(rid, attempt, known, freed=False)
             cache = self._caches.get(rid)
             if cache is None:
                 if start_pos != 0:
@@ -95,6 +106,11 @@ class KVStore:
                 cache.values = [v[:, :start_pos].clone() for v in cache.values]
             self._note(rid, attempt)
             return cache
+
+    def attempt(self, rid: str) -> int | None:
+        """The newest attempt that has used rid's cache, or None."""
+        with self._lock:
+            return self._attempts.get(rid)
 
     def _note(self, rid: str, attempt: int | None) -> None:
         if attempt is not None:

@@ -82,8 +82,10 @@ class System:
                 self.register(stage)
 
     def register(self, stage):
+        """Register a stage and give both stages the epochs a worker and its heartbeat
+        would: its own epoch, and the route update its neighbour receives."""
         start, end = self.layers[stage]
-        return self.registry.register(
+        entry = self.registry.register(
             protocol_pb2.RegisterReq(
                 stage=stage,
                 layer_start=start,
@@ -93,6 +95,12 @@ class System:
                 addr=f"127.0.0.1:{self.ports[stage]}",
             )
         )
+        servicers = (self.servicer0, self.servicer1)
+        servicers[stage].own_epoch = entry.epoch
+        servicers[1 - stage].route(
+            protocol_pb2.RouteUpdate(next_stage=stage, addr=entry.addr, epoch=entry.epoch)
+        )
+        return entry
 
     def call(self, prompt=PROMPT, max_tokens=8, timeout_ms=WAIT * 1000):
         req = protocol_pb2.GenerateReq(prompt=prompt, max_tokens=max_tokens, timeout_ms=timeout_ms)

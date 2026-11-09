@@ -156,7 +156,11 @@ def test_a_freed_attempt_is_refused_and_a_newer_one_starts_again(stage, store):
     for attempt in (1, 2):  # a step of the freed attempt, or an older one, still in flight
         with pytest.raises(Stale) as refused:
             store.acquire("a", 0, attempt)
-        assert (refused.value.attempt, refused.value.freed) == (attempt, 2)
+        assert (refused.value.attempt, refused.value.newer, refused.value.freed) == (
+            attempt,
+            2,
+            True,
+        )
     assert "a" not in store
     assert len(store.acquire("a", 0, attempt=3)) == 0 and "a" in store  # a replay
 
@@ -168,6 +172,16 @@ def test_a_free_for_an_older_attempt_keeps_the_newer_attempts_cache(stage, store
     with pytest.raises(Stale):
         store.acquire("a", 0, attempt=1)
     assert store.free("a", attempt=2) is True and "a" not in store
+
+
+def test_an_older_attempt_than_the_cache_has_used_is_refused(stage, store):
+    run(stage, store, "a", TOKENS[:6], 0)
+    store.acquire("a", 6, attempt=3)
+    with pytest.raises(Stale) as refused:
+        store.acquire("a", 6, attempt=2)
+    assert (refused.value.newer, refused.value.freed) == (3, False)
+    assert store.length("a") == 6 and store.attempt("a") == 3
+    assert store.acquire("a", 0, attempt=4) is not None and store.attempt("a") == 4
 
 
 def test_a_free_never_lowers_the_attempt_remembered(stage, store):

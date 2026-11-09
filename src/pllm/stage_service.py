@@ -21,15 +21,34 @@ pllm.heartbeat sends the nacks queue to the gateway on the heartbeat stream (R3.
 R3.12), hands each Free it receives to free(), and each route update to route() (R3.13).
 
 route() points the first stage at a restarted second stage: a new channel to its address
-and its epoch as the target epoch. A stream already open keeps the channel it started
-with; it ends when that next hop is gone, and the previous hop's next stream uses the new
-route. The channel is new even at the same address, because a channel that failed to
-connect while the stage was down waits out gRPC's reconnect backoff (up to 120 s); each
-channel keeps its own connections, since gRPC otherwise shares them between channels to
-one address and the new channel would inherit the backoff.
-Fencing by epoch is a separate story: the epoch fields are carried but not checked,
-and two streams that carry the same request id at once are not guarded against each other.
-The outbound queue is unbounded; bounded queues and backpressure come with the queue story.
+and its epoch as the target epoch. A stream already open keeps the channel and target
+epoch it started with, so it is ended with UNAVAILABLE as soon as a route update replaces
+them (within POLL_SECONDS); the previous hop's next stream uses the new route. Without
+this, a stream opened before the route update arrived would go on sending a stale target
+epoch, and every request on it would be refused. The channel is new even at the same
+address, because a channel that failed to connect while the stage was down waits out
+gRPC's reconnect backoff (up to 120 s); each channel keeps its own connections, since gRPC
+otherwise shares them between channels to one address and the new channel would inherit
+the backoff.
+
+Fencing (R3.11), checked on every message before anything is cached, in this order:
+
+1. target_epoch is not this stage's epoch: refused with WRONG_EPOCH (aimed at a dead
+   incarnation of this stage).
+2. sender_epoch is not the live upstream epoch: refused with BAD_SENDER. For the first stage
+   the upstream is the gateway, epoch 0; for the second it is the first stage's epoch, from
+   the latest route update that names stage 0. This fences a resumed old first stage.
+3. attempt older than the newest attempt that has used the request's cache, or an attempt
+   already freed: refused with STALE_ATTEMPT. A newer attempt is adopted.
+
+A refused message is not cached or forwarded and its Nack goes on the nacks queue. Until
+registration and the first route update, the epochs are 0, which is what an unregistered
+chain (as in tests) sends; so a stage that has not registered yet accepts any message with
+both epochs at 0. A step that fails frees its cache without remembering the attempt
+(free_cache), so a late step of an older attempt can start that request again from
+position 0; the gateway has already failed the request by then. Two streams that carry
+the same request id at once are not guarded against each other. The outbound queue is
+unbounded; bounded queues and backpressure come with the queue story.
 
 Chain over a single host or two: every address comes from the caller, which reads it from
 the hosts file. Nothing here depends on the operating system (R3.15).
@@ -66,7 +85,8 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
     next_address is the next stage's Stage service, or None for the last stage, which
     pushes to results_address instead. own_epoch and next_epoch go into the sender and
     target epoch fields of the forwarded message; they are 0 until registration and the
-    first route update supply them.
+    first route update supply them. upstream_epoch is the sender epoch this stage accepts:
+    always 0 (the gateway) for the first stage, and the first stage's epoch for the second.
     """
 
     def __init__(
@@ -86,6 +106,7 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         self.worker = worker
         self.last = last
         self.own_epoch, self.next_epoch = own_epoch, next_epoch
+        self.upstream_epoch = 0
         # Its own connections: by default gRPC shares them between channels to the same
         # address, so a new channel would inherit one still in reconnect backoff.
         self.options = [
@@ -123,15 +144,26 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         return self.store.free(message.rid, message.attempt or None)
 
     def route(self, update: protocol_pb2.RouteUpdate) -> bool:
-        """Send to the next stage at update.addr with target epoch update.epoch (R3.13).
+        """Apply a route update; True if it changed anything.
 
-        Only the first stage has a next stage; an update for any other hop is ignored, and
-        so is one that changes nothing or names an older epoch than the current route;
-        all return False. Streams opened from now on use the new route, on a new channel
+        An update that names the next stage sends to update.addr with target epoch
+        update.epoch (R3.13). An update that names the previous stage sets the sender
+        epoch this stage accepts (R3.11); the gateway, upstream of the first stage, sends
+        none. An update for any other stage, or one that changes nothing or names an older
+        epoch than the current one, is ignored.
+
+        For the next stage, streams opened from now on use the new route, on a new channel
         (see the module notes). If the address changed, the old channel is closed, which
         ends any stream still open on it; at the same address the old channel is left to
         the streams still using it, and is closed once they end and release it.
         """
+        if self.stage_index > 0 and update.next_stage == self.stage_index - 1:
+            with self._route_lock:
+                if update.epoch <= self.upstream_epoch:
+                    return False
+                self.upstream_epoch = update.epoch
+            log.info("stage %d is now upstream with epoch %d", update.next_stage, update.epoch)
+            return True
         if self.last or update.next_stage != self.stage_index + 1 or not update.addr:
             log.warning("ignored route update for stage %d", update.next_stage)
             return False
@@ -154,6 +186,7 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
     def Steps(self, request_iterator, context):
         outbox: queue.Queue = queue.Queue()
         inbox: queue.Queue = queue.Queue()
+        moved = False
         with self._route_lock:  # the route this stream keeps for its life
             channel, next_epoch = self.channel, self.next_epoch
             self._inboxes.add(inbox)
@@ -182,6 +215,9 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         threading.Thread(target=pump, daemon=True).start()
         try:
             while not call.done():
+                if self.channel is not channel:  # a route update replaced this stream's
+                    moved = True  # route; its target epoch is stale from now on
+                    break
                 try:
                     request = inbox.get(timeout=POLL_SECONDS)
                 except queue.Empty:
@@ -195,6 +231,11 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
             outbox.put(_DONE)
             with self._route_lock:
                 self._inboxes.discard(inbox)
+        if moved:
+            context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "the route to the next stage changed; open a new stream",
+            )
         try:
             call.result()
         except grpc.RpcError as err:
@@ -216,7 +257,34 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
             )
         )
 
+    def _fenced(self, request: protocol_pb2.StepRequest) -> str | None:
+        """The Nack reason that refuses request by epoch, or None (R3.11 rules 1 and 2).
+
+        own_epoch and upstream_epoch are read without the lock: each is one int, so a read
+        is never torn, and a message checked just before an update is judged by the epoch
+        a moment earlier, which the gateway learns of at once from the Nack.
+        """
+        if request.target_epoch != self.own_epoch:
+            return "WRONG_EPOCH"
+        if request.sender_epoch != self.upstream_epoch:
+            return "BAD_SENDER"
+        return None
+
     def _handle(self, request: protocol_pb2.StepRequest, context, next_epoch: int):
+        reason = self._fenced(request)
+        if reason is not None:
+            log.warning(
+                "%s: %r step %d target %d sender %d, this stage %d upstream %d",
+                reason,
+                request.rid,
+                request.step,
+                request.target_epoch,
+                request.sender_epoch,
+                self.own_epoch,
+                self.upstream_epoch,
+            )
+            self._nack(request, reason)
+            return None
         inputs = self._inputs(request, context)
         if len(inputs) != request.length:
             context.abort(
