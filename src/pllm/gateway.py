@@ -38,9 +38,12 @@ Not here: many requests in flight is the next story (#26; the code does not prev
 it is not tested). Requests share one stream to Stage 0, and a stage ends that stream when
 one request's step fails, so every request on it then fails with UNAVAILABLE; #26 has to
 keep one request's failure from ending the others. Each Generate holds a server thread for
-its life. Also not here: the full result filter with epochs and exactly-once delivery (#30),
-recovery and replay (#38, #39), bounded queues (#33). A result that does not match its
-request's attempt and expected step is dropped and counted.
+its life, so serve() caps running requests at max_workers - RESERVED_THREADS and refuses the
+rest with RESOURCE_EXHAUSTED; without the cap, a full pool leaves no thread for Results.Push
+and every running request stalls until its deadline. Also not here: the full result
+filter with epochs and exactly-once delivery (#30), recovery and replay (#38, #39), bounded
+queues (#33). A result that does not match its request's attempt and expected step is
+dropped and counted.
 """
 
 import argparse
@@ -67,13 +70,14 @@ log = logging.getLogger("pllm.gateway")
 
 POLL_SECONDS = 0.05  # how often a waiting request checks its deadline, client and link
 MAX_NACKS = 1024  # Nacks kept for the recovery stories; the count covers all of them
-GENERATE_THREADS = 16  # Generate calls served at once; more are refused
 MAX_UNSENT = 4  # a UTF-8 character spans at most four byte-level tokens
 REPLACEMENT = chr(0xFFFD)  # what an incomplete UTF-8 character decodes to
 STAGES = (0, 1)
-# Other streams that each hold a server thread: one heartbeat per stage plus one replaced
-# heartbeat per stage still closing, and Results.Push from Stage 1 plus one reconnecting.
-OTHER_THREADS = 2 * len(STAGES) + 2
+# Server threads kept free of Generate: the Results.Push stream from Stage 1, which holds
+# its thread for its life; one for Control.Register and for refusing requests; and one
+# heartbeat stream per stage plus one replaced heartbeat per stage still closing.
+RESERVED_THREADS = 2 + 2 * len(STAGES)
+MAX_RUNNING = 14  # Generate calls at once with the default pool
 
 
 @dataclass
@@ -155,11 +159,12 @@ class Gateway(
         self.nack_count = 0
         self._beats: dict[int, tuple[protocol_pb2.Beat, float]] = {}
         self._sessions: dict[int, Session] = {}
+        self.max_running: int | None = None  # Generate calls at once; serve() sets it
+        self._running = 0
         self._lock = threading.Lock()
         # Register and opening a heartbeat stream run one at a time, so a stream cannot
         # pass its epoch check just before a newer registration and then become current.
         self._control = threading.Lock()
-        self._generate_slots = threading.BoundedSemaphore(GENERATE_THREADS)
         self._link: Link | None = None
 
     # ------------------------------------------------------------------ table and frees
@@ -370,18 +375,23 @@ class Gateway(
         return ids
 
     def Generate(self, req, context):
-        if not self._generate_slots.acquire(blocking=False):
+        ids = self._admit(req, context)
+        with self._lock:
+            full = self.max_running is not None and self._running >= self.max_running
+            if not full:
+                self._running += 1
+        if full:
             context.abort(
                 grpc.StatusCode.RESOURCE_EXHAUSTED,
-                f"the gateway is serving {GENERATE_THREADS} requests; try again later",
+                f"the gateway is running {self.max_running} requests, its limit; try again later",
             )
         try:
-            yield from self._generate(req, context)
+            yield from self._generate(req, ids, context)
         finally:
-            self._generate_slots.release()
+            with self._lock:
+                self._running -= 1
 
-    def _generate(self, req, context):
-        ids = self._admit(req, context)
+    def _generate(self, req, ids: list[int], context):
         link = self._stage0(context)
         request = Request(
             rid=uuid.uuid4().hex[:12],
@@ -474,11 +484,17 @@ class Gateway(
 
 
 def serve(
-    gateway: Gateway, bind: str, max_workers: int = GENERATE_THREADS + OTHER_THREADS
+    gateway: Gateway, bind: str, max_workers: int = MAX_RUNNING + RESERVED_THREADS
 ) -> tuple[grpc.Server, int]:
-    """Serve Control, Frontend and Results on bind (port 0 picks a free one). Every
-    Generate, heartbeat stream and Results.Push stream holds a thread from one pool;
-    Generate is capped at GENERATE_THREADS so the others always find one free."""
+    """Serve Control, Frontend and Results on bind (port 0 picks a free one).
+
+    Every Generate, heartbeat stream and Results.Push stream holds a thread from one
+    pool. At most max_workers - RESERVED_THREADS requests run at once; more are refused,
+    so the other streams always find a thread.
+    """
+    if max_workers <= RESERVED_THREADS:
+        raise ValueError(f"max_workers must be above {RESERVED_THREADS}")
+    gateway.max_running = max_workers - RESERVED_THREADS
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers), options=gateway.options
     )

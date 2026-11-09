@@ -510,9 +510,15 @@ def test_a_worker_registers_then_keeps_its_heartbeat(tmp_path):
     assert not thread.is_alive()
 
 
-def test_requests_past_the_cap_are_refused_so_heartbeats_keep_a_thread(beating, monkeypatch):
+def test_the_default_pool_keeps_threads_for_both_heartbeats(beating):
+    run = beating()
+    assert run.gateway.max_running == 14  # 20 threads, 6 kept
+    wait_for(lambda: set(run.gateway._sessions) == {0, 1}, "both heartbeat streams")
+
+
+def test_requests_past_the_cap_are_refused_so_heartbeats_keep_a_thread(beating):
     run = beating(delay1=0.5)
-    run.gateway._generate_slots = threading.BoundedSemaphore(1)
+    run.gateway.max_running = 1
     first = run.call(max_tokens=3)
     next(first)  # holds the only slot
     code, details = code_of(run.call(max_tokens=1))
