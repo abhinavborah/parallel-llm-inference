@@ -13,9 +13,12 @@ Each request id has its own KV cache in a KVStore, with the position rules of R3
 appends, lower truncates then appends, higher is refused. A refused message is skipped,
 not forwarded, and a Nack goes on the nacks queue: GAP for a position past the cache,
 STALE_ATTEMPT for an attempt of a request that was already freed. The stream and the other
-requests on it carry on. pllm.heartbeat sends the nacks queue to the gateway on the
-heartbeat stream (R3.10, R3.12), hands each Free it receives to free(), and each route
-update to route() (R3.13).
+requests on it carry on. STALE_ATTEMPT thus covers two cases: the fencing of an older attempt
+(R3.11, the fencing story) and a late step of an attempt that was freed, which is normal after
+a deadline or a cancel. A reader of these Nacks treats one for a request that has already
+ended as harmless; only one for a running request calls for recovery.
+pllm.heartbeat sends the nacks queue to the gateway on the heartbeat stream (R3.10,
+R3.12), hands each Free it receives to free(), and each route update to route() (R3.13).
 
 route() points the first stage at a restarted second stage: a new channel to its address
 and its epoch as the target epoch. A stream already open keeps the channel it started

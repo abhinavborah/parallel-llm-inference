@@ -94,8 +94,10 @@ and returns the cached count to 0 when every request is freed (`cached_requests`
 count a Beat reports). A Free names an attempt; the stage remembers the last 4096 frees
 (about 0.8 MiB) and refuses a later message of that attempt or an older one with a
 `STALE_ATTEMPT` Nack, so a step still in flight when its Free arrives cannot cache the
-request again. A newer attempt is accepted, and a Free for an older attempt leaves the
-cache a newer attempt holds. The heartbeat stream (under "Heartbeat") sends the Nacks to the
+request again (after 4096 later frees the stage forgets one, and a step that late would
+cache it again). A newer attempt is accepted, and a Free for an older attempt leaves the
+cache a newer attempt holds. `STALE_ATTEMPT` therefore also marks a late step of a request
+that has ended, which needs no action; recovery acts only on one for a running request. The heartbeat stream (under "Heartbeat") sends the Nacks to the
 gateway and delivers the frees. A request costs per position, per stage, `layers x 2 x kv
 heads x head dim x 4` bytes: for SmolLM2-135M 23,040 bytes, so a 528-position request holds
 11.6 MiB on each stage and 8 such requests 93 MiB (steady state; while a step

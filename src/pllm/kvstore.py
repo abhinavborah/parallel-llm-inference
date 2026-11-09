@@ -18,7 +18,10 @@ message for that request with the same or an older attempt is refused with Stale
 still on the data stream when its Free arrives on the heartbeat stream cannot create the
 cache again. A newer attempt (a replay) is accepted, and a Free for an older attempt does
 not release the cache a newer attempt holds. The store remembers the last MAX_FREED frees,
-about 200 bytes each (the request id and the dictionary entry), so about 0.8 MiB.
+about 200 bytes each (the request id and the dictionary entry), so about 0.8 MiB. Limit: once
+MAX_FREED later frees have pushed a request out, a late step of its freed attempt is accepted
+again and creates a cache that no Free will release, until the process ends. That needs a step
+held up while MAX_FREED other requests finish.
 
 Memory cost: a request holds, per position, layers x 2 (keys and values) x kv_heads x
 head_dim x 4 bytes (fp32). SmolLM2-135M has 3 kv heads of 64 and 15 layers per stage, so
