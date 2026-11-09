@@ -342,6 +342,45 @@ Every script writes a JSON record to `runs/` (ignored by git) with the commit, m
 revision, split point, thread count, host, OS, network, round-trip time, available memory,
 power state and dates.
 
+## Host checks
+
+Host B memory, with every other program closed and the charger in. Also note Task Manager's
+"Available" figure (Performance, Memory) at the same time, and write it in the R1.7 row of the
+BRD with the date:
+
+```
+uv run python -m pllm.hostmem
+```
+
+It samples available memory for a minute and proposes the worker budget: the lowest reading
+less 0.5 GiB of headroom, rounded down to 0.1 GiB.
+
+Network between the laptops, using the addresses in the hosts file. Stage 0 runs on Windows,
+Stage 1 and the gateway on macOS:
+
+```
+# Windows, then macOS
+uv run python -m pllm.netcheck serve --roles stage0
+uv run python -m pllm.netcheck probe --roles stage0
+# macOS, then Windows
+uv run python -m pllm.netcheck serve --roles stage1 gateway
+uv run python -m pllm.netcheck probe --roles stage1 gateway
+# multicast: listen on one laptop, send from the other, then swap
+uv run python -m pllm.netcheck multicast-listen
+uv run python -m pllm.netcheck multicast-send
+# Windows: network profile and firewall state of each adapter, and a verdict per port
+uv run python -m pllm.netcheck firewall --roles stage0
+```
+
+For now the Windows laptop stays on the Public profile with the Windows firewall off
+(agreed 2026-11-09), so no inbound rule is needed and the check reports every port as
+allowed on Public. If the firewall is turned on again, the check reads the inbound rules
+for the profile in use, which needs an administrator shell (without one it gives no
+verdict), and prints a rule to add for that profile and the interpreter. With several
+network adapters, pass `--interface <this laptop's IP>` to the multicast commands.
+If the direct network fails, try in order a direct cable, a phone hotspot, then Tailscale, and
+change only the hosts file. Every probe, listen and firewall run writes a run record.
+
 ## Development
 
 ```
