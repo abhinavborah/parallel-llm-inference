@@ -21,18 +21,22 @@ uv run python -m pllm.worker smollm2-135m --stage 0 --serve --threads 6
 
 import argparse
 import logging
+import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import grpc
 import psutil
 import torch
 
-from pllm import config
+from pllm import config, wire
+from pllm.control import register
 from pllm.faults import StepDelay
 from pllm.model import KVCache, ModelConfig
-from pllm.models import MODELS_DIR, PINNED
+from pllm.models import MODELS_DIR, PINNED, sha256_of
 from pllm.split import Stage
 
 log = logging.getLogger("pllm.worker")
@@ -96,6 +100,79 @@ def stage_layers(model_dir: Path, model: str, stage: int) -> tuple[int, int]:
     return (0, k) if stage == 0 else (k, n)
 
 
+PARENT_ENV = "PLLM_SUPERVISOR_PID"  # set by pllm.supervisor
+PARENT_POLL_SECONDS = 1.0
+
+
+def exit_when_parent_gone(
+    pid: int, interval: float = PARENT_POLL_SECONDS, leave: Callable[[int], None] = os._exit
+) -> threading.Thread:
+    """Call leave(1) once process pid no longer exists, polling every interval seconds.
+
+    A supervisor that is force killed cannot stop its worker; this keeps the worker from
+    outliving it and holding its port, which would make the next supervisor's worker fail.
+    """
+
+    def watch():
+        while psutil.pid_exists(pid):
+            time.sleep(interval)
+        log.error("supervisor %d is gone; exiting", pid)
+        leave(1)
+
+    thread = threading.Thread(target=watch, name="parent-guard", daemon=True)
+    thread.start()
+    return thread
+
+
+REGISTER_RETRY_SECONDS = 1.0
+RETRY_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+
+
+def register_with_gateway(
+    gateway: str,
+    stage: int,
+    layers: tuple[int, int],
+    model: str,
+    model_dir: Path,
+    addr: str,
+    servicer,
+    stop: threading.Event,
+    retry_seconds: float = REGISTER_RETRY_SECONDS,
+    options: list[tuple[str, int]] | None = None,
+) -> int | None:
+    """Register this stage with the gateway (R3.3) and keep the epoch it returns.
+
+    Tries again every retry_seconds while the gateway is not reachable, so a stage that
+    starts first, or comes back after a restart, registers as soon as the gateway is up. A
+    gateway that rejects the registration (a different model, weights or layer range), or
+    answers with any error other than being unreachable, is raised and not retried. Returns
+    the epoch, or None if stop was set first. options are the channel's gRPC options;
+    main passes wire.channel_options, as every channel does (decision #20).
+    """
+    began = time.perf_counter()
+    weights = sha256_of(model_dir / "model.safetensors")
+    log.info("weights hashed in %.2f s", time.perf_counter() - began)
+    with grpc.insecure_channel(gateway, options=options) as channel:
+        while not stop.is_set():
+            try:
+                epoch = register(channel, stage, layers, model, weights, addr)
+            except grpc.RpcError as err:
+                if err.code() not in RETRY_CODES:
+                    raise  # a rejection or a protocol error will not fix itself
+                log.warning("gateway %s not ready (%s); retrying", gateway, err.code().name)
+                stop.wait(retry_seconds)
+                continue
+            servicer.own_epoch = epoch
+            log.info(
+                "registered stage %d with epoch %d after %.2f s",
+                stage,
+                epoch,
+                time.perf_counter() - began,
+            )
+            return epoch
+    return None
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Load a stage worker and report its memory.")
     parser.add_argument("model", choices=sorted(PINNED))
@@ -142,12 +219,39 @@ def main(argv: list[str] | None = None) -> None:
         results_address=hosts.gateway.address if args.stage == 1 else None,
     )
     log.info("serving, rss %.0f MiB; Ctrl-C to stop", rss_mib())
+    stop = threading.Event()
+    failure: list[BaseException] = []
+    if os.environ.get(PARENT_ENV, "").isdigit():
+        exit_when_parent_gone(int(os.environ[PARENT_ENV]))
+
+    def register_in_background():
+        try:
+            register_with_gateway(
+                hosts.gateway.address,
+                args.stage,
+                (start, end),
+                args.model,
+                model_dir,
+                getattr(hosts, f"stage{args.stage}").address,
+                servicer,
+                stop,
+                options=wire.channel_options(worker.stage.config.hidden_size),
+            )
+        except BaseException as err:  # a rejected registration ends the worker, loudly
+            failure.append(err)
+            log.error("registration failed: %s", err)
+            server.stop(grace=0)
+
+    threading.Thread(target=register_in_background, daemon=True).start()
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:
         server.stop(grace=1).wait()
     finally:
+        stop.set()
         servicer.close()
+    if failure:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

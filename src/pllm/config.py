@@ -55,6 +55,28 @@ def load(path: str | Path | None = None) -> HostConfig:
     return HostConfig(network=network, **endpoints)
 
 
+SUPERVISOR_BASE_PORT = 50061  # stage 0 uses this, stage 1 the next port
+
+
+def supervisor_endpoint(stage: int, path: str | Path | None = None) -> Endpoint:
+    """Where the supervisor of stage 0 or 1 takes fault-control requests.
+
+    A [supervisor0] or [supervisor1] table sets it. Without one, the supervisor shares its
+    stage's host on port 50061 or 50062, so a hosts file written before supervisors
+    existed keeps working.
+    """
+    if stage not in (0, 1):
+        raise ValueError(f"stage must be 0 or 1, got {stage}")
+    path = Path(path) if path is not None else config_path()
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    role = f"supervisor{stage}"
+    if role in data:
+        return _endpoint(data, role, path)
+    fallback = _endpoint(data, f"stage{stage}", path)
+    return Endpoint(fallback.host, SUPERVISOR_BASE_PORT + stage)
+
+
 def split_point(model: str, path: str | Path | None = None) -> int:
     """The split point k for model from the [split] table: stage 0 has layers 0 to k - 1.
 

@@ -121,6 +121,69 @@ the others use a small random model). A stage that fails a step drops that reque
 cache, and a failed next hop ends the stream with UNAVAILABLE even if the sender holds it
 open.
 
+Once it is listening, a worker registers with the gateway at the gateway address in the
+hosts file (R3.3) and keeps the epoch it is given. It hashes `model.safetensors` first, which
+takes a second or so, and tries again every second while the gateway is not reachable. A
+gateway that rejects the registration (another model, weights or layer range) ends the worker
+with exit code 1.
+
+## Supervisor
+
+`pllm.supervisor` runs one laptop's worker as a child process and restarts it whenever it
+exits, for any reason, with no manual step (R6.2). A worker that dies while loading, or
+within 5 s of it starting to listen, is a crash: it is restarted after a growing pause of 0,
+0.5, 1, 2 and then 5 s, and the supervisor never gives up, so a worker that the gateway keeps
+rejecting is restarted every 5 s until someone fixes the configuration. A worker that is
+killed through the control port is not counted as a crash. A worker that has not started
+listening after 3 minutes is killed and started again. A suspended worker is alive, so it is
+not restarted; noticing a stalled worker is the gateway's job (R6.3).
+
+```
+uv run python -m pllm.supervisor smollm2-135m --stage 1 --threads 6
+```
+
+It writes JSON lines to `runs/supervisor_stage1.jsonl` (`--log` changes the path): `spawned`,
+`ready`, `exited`, `backoff`, `fault` and `stopped`, each with `time` (this laptop's clock)
+and `mono` (monotonic seconds). A `ready` line after a restart carries `respawn_seconds`:
+from the moment the exit was noticed to the moment the worker accepted a connection on its
+port, which includes loading its layers. Registration follows and is logged by the worker.
+Ctrl-C, SIGTERM or Ctrl-Break stops the supervisor and its worker. If the supervisor is
+force killed instead, its worker checks once a second that the supervisor is still running
+and exits when it is not, so it does not keep the port.
+
+Measured on Windows 11 with SmolLM2-135M, stage 1, 2 threads: a worker killed by the fault
+injector was listening again after 4.2 s (run
+`uv run pytest tests/test_supervisor.py -k real_worker --basetemp=<dir>` and read
+`events.jsonl` under it). A Python process that has imported the supervisor is 36 MiB
+(`uv run python -c "import psutil, pllm.supervisor; print(psutil.Process().memory_info().rss)"`).
+
+Kill, suspend and resume requests go to the supervisor's control port and are applied to
+the worker's process tree through `pllm.faults` (SIGKILL on macOS and Linux, TerminateProcess
+on Windows). A POST must send `Content-Type: application/json`, which a web page cannot do
+to another host without a preflight that the server never answers:
+
+```
+curl -X POST -H "Content-Type: application/json" http://<laptop>:50062/kill
+curl -X POST -H "Content-Type: application/json" http://<laptop>:50062/suspend
+curl -X POST -H "Content-Type: application/json" http://<laptop>:50062/resume
+curl http://<laptop>:50062/status
+```
+
+The address comes from `[supervisor0]` and `[supervisor1]` in the hosts file, and the
+supervisor listens on that host; without the tables it is the stage's host on port 50061 or
+50062. The examples use 50062, stage 1 on the Mac; for stage 0 on the Windows laptop use
+50061. A fault request from the other laptop needs that port open: on the Windows laptop,
+allow it inbound on the Private profile, the same profile as the worker port, from an
+administrator PowerShell:
+
+```
+New-NetFirewallRule -DisplayName "pllm supervisor 0" -Direction Inbound -Protocol TCP -LocalPort 50061 -Profile Private -Action Allow
+```
+
+There is no authentication, so keep it on the lab network. `status` reports a worker
+as suspended from the moment a suspend is applied until it is resumed or replaced; a suspend
+that lands as the worker exits can briefly mislabel its replacement.
+
 ## Stage registration
 
 `pllm.control` holds the gateway side of `Control.Register`; the gateway serves one model per
