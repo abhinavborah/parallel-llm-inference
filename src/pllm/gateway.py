@@ -38,7 +38,12 @@ because a new process holds none of those caches. A request that ends early (dea
 cancel, failure) can still have a step on the data stream; the stage remembers the freed
 attempt and refuses that step (pllm.kvstore), so it cannot create the cache again.
 
-Failure detection from missed beats is not here (#38); beats() gives what it needs.
+Failure detection is pllm.detection. A heartbeat stream that breaks, a stage silent past the
+heartbeat timeout and a step past the step timeout are each recorded with gateway timestamps.
+The first two declare the stage's epoch dead: requests are refused with UNAVAILABLE until a
+new registration gives the stage a higher epoch, and the neighbour then gets a route update.
+Only the heartbeat stream names a dead stage: Stage 0 also ends its data stream when Stage 1
+dies or a route moves. Requests in flight behave as before; replaying them is #39.
 
 Not here: many requests in flight is the next story (#26; the code does not prevent it but
 it is not tested). Requests share one stream to Stage 0, and a stage ends that stream when
@@ -47,7 +52,7 @@ keep one request's failure from ending the others. Each Generate holds a server 
 its life, so serve() caps running requests at max_workers - RESERVED_THREADS and refuses the
 rest with RESOURCE_EXHAUSTED; without the cap, a full pool leaves no thread for Results.Push
 and every running request stalls until its deadline. Also not here: the full result
-filter with epochs and exactly-once delivery (#30), recovery and replay (#38, #39), bounded
+filter with epochs and exactly-once delivery (#30), replay (#39), bounded
 queues (#33). A result that does not match its request's attempt and expected step is
 dropped and counted.
 """
@@ -67,6 +72,7 @@ import grpc
 
 from pllm import config, prompts, wire
 from pllm.control import Registration, Registry, expected_model
+from pllm.detection import Detector
 from pllm.model import ModelConfig
 from pllm.models import MODELS_DIR, PINNED
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
@@ -97,6 +103,7 @@ class Request:
     tokens: list[int] = field(default_factory=list)
     expected_step: int = 0
     results: queue.Queue = field(default_factory=queue.Queue)
+    step_due_ns: int | None = None  # detector clock; None once the step's record is written
 
     def row(self) -> dict:
         return {
@@ -172,6 +179,9 @@ class Gateway(
         # pass its epoch check just before a newer registration and then become current.
         self._control = threading.Lock()
         self._link: Link | None = None
+        self.detector = Detector()
+        self._stopping = threading.Event()
+        self._watcher: threading.Thread | None = None
 
     # ------------------------------------------------------------------ table and frees
 
@@ -201,6 +211,7 @@ class Gateway(
 
     def Register(self, request, context):
         with self._control:
+            previous = self.registry.stages.get(request.stage)
             try:
                 entry = self.registry.register(request)
             except Registration as err:
@@ -212,8 +223,14 @@ class Gateway(
             if old is not None:
                 old.superseded.set()  # before the drain: it stops taking frees
             self.frees_for(entry.stage)  # a new process holds none of those caches
+            if previous is not None:  # a respawn can beat detection
+                self.detector.declare(previous.stage, previous.epoch, "replaced")
+            queued = None
             if other is not None:  # Stage 0 learns its next hop, Stage 1 its upstream
                 other.outbox.put(self._route(entry))
+                queued = self.detector.now()
+            old_epoch = previous.epoch if previous is not None else None
+            self.detector.registered(entry.stage, old_epoch, entry.epoch, queued)
         return protocol_pb2.RegisterResp(epoch=entry.epoch)
 
     @staticmethod
@@ -247,7 +264,8 @@ class Gateway(
             if self._sessions.get(session.stage) is not session:
                 return  # a stream that has been replaced
             if kind == "beat":
-                self._beats[session.stage] = (message.beat, time.monotonic())
+                if self.detector.beat(session.stage, session.epoch):
+                    self._beats[session.stage] = (message.beat, time.monotonic())
                 return
             if kind != "nack":
                 return
@@ -292,13 +310,15 @@ class Gateway(
         self._record(session, first)
 
         def read():
+            why = "closed"
             try:
                 for message in request_iterator:
                     self._record(session, message)
-            except grpc.RpcError:
-                pass  # the stage went away
+            except grpc.RpcError:  # the stage went away
+                why = "broken"
             finally:
                 session.closed.set()
+                self._stream_ended(session, why)
 
         threading.Thread(target=read, name=f"heartbeat-{stage}", daemon=True).start()
         log.info("heartbeat open from stage %d epoch %d", stage, epoch)
@@ -330,6 +350,25 @@ class Gateway(
                     del self._sessions[stage]
             log.info("heartbeat closed from stage %d epoch %d", stage, epoch)
 
+    def _stream_ended(self, session: Session, why: str) -> None:
+        """Declare the stream's epoch dead unless a newer stream or registration replaced it.
+        Not judged by _sessions: on a kill the generator can remove the session first."""
+        entry = self.registry.stages.get(session.stage)
+        current = entry is not None and entry.epoch == session.epoch
+        if current and not session.superseded.is_set():
+            self.detector.declare(session.stage, session.epoch, "stream_break", why)
+
+    def watch(self) -> None:
+        """Start the thread that expires silent stages; close() stops it. It is not a pool
+        thread, so RESERVED_THREADS does not count it."""
+
+        def run():
+            while not self._stopping.wait(POLL_SECONDS):
+                self.detector.expire()
+
+        self._watcher = threading.Thread(target=run, name="failure-detector", daemon=True)
+        self._watcher.start()
+
     # ------------------------------------------------------------------ Stage 0 link
 
     def _stage0(self, context) -> Link:
@@ -337,6 +376,12 @@ class Gateway(
         for stage in STAGES:
             if stage not in stages:
                 context.abort(grpc.StatusCode.UNAVAILABLE, f"stage {stage} is not registered")
+            if self.detector.is_dead(stages[stage].epoch):
+                context.abort(
+                    grpc.StatusCode.UNAVAILABLE,
+                    f"stage {stage} epoch {stages[stage].epoch} is dead; waiting for it to "
+                    "register again",
+                )
         entry = stages[0]
         with self._lock:
             link = self._link
@@ -348,6 +393,9 @@ class Gateway(
         return link
 
     def close(self) -> None:
+        self._stopping.set()
+        if self._watcher is not None:
+            self._watcher.join()
         with self._lock:
             if self._link is not None:
                 self._link.close()
@@ -425,6 +473,7 @@ class Gateway(
             unsent: list[int] = []  # tokens whose text is not complete yet
             while True:
                 step = request.expected_step
+                request.step_due_ns = self.detector.now() + self.detector.step_timeout_ns
                 link.outbox.put(
                     protocol_pb2.StepRequest(
                         rid=request.rid,
@@ -486,6 +535,9 @@ class Gateway(
                 )
             if not context.is_active():
                 return None
+            if request.step_due_ns is not None and self.detector.now() >= request.step_due_ns:
+                request.step_due_ns = None  # one record per step
+                self.detector.step_deadline(request.rid, request.expected_step)
             try:
                 result = request.results.get(timeout=min(left, POLL_SECONDS))
             except queue.Empty:
@@ -534,6 +586,7 @@ def serve(
     if port == 0:
         raise OSError(f"could not listen on {bind}")
     server.start()
+    gateway.watch()
     log.info("gateway listening on port %d", port)
     return server, port
 

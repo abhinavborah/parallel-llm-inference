@@ -293,11 +293,52 @@ refuse every stream the same way; only workers are restarted.
 
 Limits:
 
-- Declaring a stage dead from missed beats, and replaying its requests, come with the
-  recovery stories. A request started between a registration and its route update reaching
-  the other stage (a few milliseconds) is refused by fencing and fails at once.
+- A request started between a registration and its route update reaching the other stage
+  (a few milliseconds) is refused by fencing and fails at once.
 - A Nack or a `Free` sent just as the stream breaks can be lost with it. A lost `Free`
   leaves that request's cache on the stage until the process ends.
+
+## Failure detection
+
+The gateway watches each stage incarnation by its epoch (`pllm.detection`, read with
+`Gateway.detector.events()`), and logs each record as one JSON line.
+
+| Path | Fires when | Effect |
+|---|---|---|
+| `stream_break` | the heartbeat stream of the latest registration ends | epoch declared dead |
+| `heartbeat_timeout` | no Beat for 2.0 s (four intervals), checked every 0.05 s | epoch declared dead |
+| `replaced` | a new registration arrives before either of the above | epoch declared dead |
+| `step_deadline` | a step has no result 10 s after it was sent, once per step | record only |
+
+A declared epoch is never revived; the first declaration writes the only record. Requests
+are refused with UNAVAILABLE until the stage registers again. The new registration gets a
+higher epoch, and the neighbour gets a route update. Requests already running behave as
+before; replaying them is not done yet.
+
+A step deadline names a suspect, the stage whose last beat is older than half the heartbeat
+timeout, and declares nothing. A slow stage still beats, so its supervisor would never send
+the registration a declaration waits for, and the gateway cannot tell which stage holds a
+late step. The request carries on to its own deadline.
+
+Every reported time is an integer from `time.perf_counter_ns` on the gateway, in a field
+ending in `_ns`, so intervals subtract directly. `time` is the wall clock, a label only.
+Detection records:
+
+- `detected`: `path`, `stage`, `epoch`, `declared`, `t_ns`, `time`, `last_beat_ns`,
+  `since_last_beat_ns`, `rid`, `step`, `detail` (`stage` and `epoch` are the suspect or null
+  for a step deadline).
+- `registered`: `stage`, `old_epoch`, `new_epoch`, `t_ns`, `time`, `waited_ns` (from the
+  declaration), `route_queued_ns` (null if the neighbour had no stream).
+
+The two timeouts are provisional: the beat gaps behind the 2.0 s value were measured on one
+laptop only.
+
+Limits:
+
+- A stage that breaks its heartbeat stream is dead to the gateway even if the process is
+  fine, and that process is not restarted: it needs a manual restart.
+- A worker suspended and never resumed produces no registration, because its supervisor sees
+  a live process. The gateway waits.
 
 ## X1a: the split against the single process
 
