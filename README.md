@@ -70,14 +70,15 @@ uv run python -m pllm.netcheck probe --roles stage1 gateway
 # multicast: listen on one laptop, send from the other, then swap
 uv run python -m pllm.netcheck multicast-listen
 uv run python -m pllm.netcheck multicast-send
-# Windows, administrator PowerShell: network profiles and inbound rules for the
-# Stage 0 port and the multicast port
+# Windows: network profile and firewall state of each adapter, and a verdict per port
 uv run python -m pllm.netcheck firewall --roles stage0
 ```
 
-The Windows adapter on the laptops' network must be on the Private profile, with inbound
-rules for the Stage 0 port and the multicast port. Reading firewall rules needs an
-administrator shell; without one the check reports that and gives no verdict. With several
+For now the Windows laptop stays on the Public profile with the Windows firewall off
+(agreed 2026-11-09), so no inbound rule is needed and the check reports every port as
+allowed on Public. If the firewall is turned on again, the check reads the inbound rules
+for the profile in use, which needs an administrator shell (without one it gives no
+verdict), and prints a rule to add for that profile and the interpreter. With several
 network adapters, pass `--interface <this laptop's IP>` to the multicast commands.
 If the direct network fails, try in order a direct cable, a phone hotspot, then Tailscale, and
 change only the hosts file. Every probe, listen and firewall run writes a run record.

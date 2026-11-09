@@ -16,10 +16,12 @@ compete with the system's mDNS responder). With several network adapters, pass
     one laptop:    uv run python -m pllm.netcheck multicast-listen
     the other:     uv run python -m pllm.netcheck multicast-send
 
-Windows only, from an administrator PowerShell (reading firewall rules needs it): the
-network profile of each adapter and the inbound rules for the role ports, the multicast
-test port and UDP 5353, which discovery will use. Only rules that apply to any program or
-to the interpreter running the check count.
+Windows only: the network profile of each adapter, whether the firewall is on for it, and
+a verdict per port on each profile in use. With the firewall off on a profile, every port
+passes there. With it on, the inbound rules for the role ports, the multicast test port and
+UDP 5353 (which discovery will use) decide, and reading them needs an administrator
+PowerShell. Only rules that apply to any program or to the interpreter running the check
+count.
 
     uv run python -m pllm.netcheck firewall --roles stage0
 
@@ -159,6 +161,11 @@ $interpreters = @({interpreters})
 $profiles = @(Get-NetConnectionProfile | ForEach-Object {{
   [pscustomobject]@{{ interface = $_.InterfaceAlias; name = $_.Name;
                       category = $_.NetworkCategory.ToString() }} }})
+$firewallOn = @{{}}
+try {{
+  Get-NetFirewallProfile | ForEach-Object {{
+    $firewallOn[$_.Name] = ($_.Enabled.ToString() -eq 'True') }}
+}} catch {{ }}
 function Covers($localPorts, $port) {{
   foreach ($p in @($localPorts)) {{
     if ("$p" -eq "$port") {{ return $true }}
@@ -193,7 +200,7 @@ try {{
             @($f.LocalPort) -contains 'Any') {{ Row $r $f $want }} }})
   }}
 }} catch {{ $rulesError = $_.Exception.Message }}
-@{{ profiles = $profiles; rules = $rules; rules_error = $rulesError }} |
+@{{ profiles = $profiles; firewall = $firewallOn; rules = $rules; rules_error = $rulesError }} |
   ConvertTo-Json -Depth 4 -Compress
 """
 
@@ -204,35 +211,88 @@ def _as_list(value) -> list:
     return value if isinstance(value, list) else [value]
 
 
-def _on_private(rule: dict) -> bool:
-    return rule["profile"] == "Any" or "Private" in rule["profile"]
+# The firewall profile that applies to an adapter of each network category.
+PROFILE_OF = {"Public": "Public", "Private": "Private", "DomainAuthenticated": "Domain"}
+
+
+def _applies(rule: dict, profile: str) -> bool:
+    return rule["profile"] == "Any" or profile in rule["profile"]
 
 
 def parse_firewall(raw: str, wanted: list[tuple[str, int]]) -> dict:
-    """Profiles, matching rules and a verdict per wanted (protocol, port).
+    """Profiles, firewall state, matching rules and a verdict per profile and port.
 
-    The verdict is None when the rules could not be read, True when an allow rule
-    covers the port on the Private profile and no block rule does, else False.
+    A verdict is given for each wanted (protocol, port) on each profile an adapter is on.
+    It is True when the firewall is off on that profile, or when an allow rule covers the
+    port there and no block rule does; None when the firewall is on (or its state is
+    unknown) and the rules could not be read; else False.
     """
     data = json.loads(raw)
     rules = _as_list(data.get("rules"))
     error = data.get("rules_error")
-    verdicts = {}
-    for protocol, port in wanted:
-        matching = [
-            r for r in rules if r["protocol"] == protocol and r["port"] == port and _on_private(r)
-        ]
-        allowed = any(r["action"] == "Allow" for r in matching)
-        blocked = any(r["action"] == "Block" for r in matching)
-        verdicts[f"{protocol} {port}"] = None if error else allowed and not blocked
+    firewall_on = data.get("firewall") or {}
     profiles = _as_list(data.get("profiles"))
+    in_use = sorted({PROFILE_OF.get(p["category"], p["category"]) for p in profiles})
+    allowed = {}
+    for profile in in_use:
+        verdicts = {}
+        for protocol, port in wanted:
+            matching = [
+                r
+                for r in rules
+                if r["protocol"] == protocol and r["port"] == port and _applies(r, profile)
+            ]
+            if firewall_on.get(profile) is False:
+                verdict = True
+            elif error:
+                verdict = None
+            else:
+                verdict = any(r["action"] == "Allow" for r in matching) and not any(
+                    r["action"] == "Block" for r in matching
+                )
+            verdicts[f"{protocol} {port}"] = verdict
+        allowed[profile] = verdicts
     return {
         "profiles": profiles,
-        "public_networks": [p["name"] for p in profiles if p["category"] != "Private"],
+        "firewall_on": firewall_on,
         "rules": rules,
         "rules_error": error,
-        "allowed_on_private": verdicts,
+        "allowed": allowed,
     }
+
+
+def firewall_lines(report: dict, program: str) -> list[str]:
+    """What the firewall check prints: each adapter's profile and firewall state, the
+    rules found, and a verdict per profile in use and port, with a rule to add when one
+    is missing (for that profile and the interpreter that runs the workers)."""
+    lines = []
+    for p in report["profiles"]:
+        state = report["firewall_on"].get(PROFILE_OF.get(p["category"], p["category"]))
+        fw = "firewall on" if state else "firewall off" if state is False else "firewall unknown"
+        lines.append(f"network {p['name']} on {p['interface']}: {p['category']}, {fw}")
+    unread = any(v is None for verdicts in report["allowed"].values() for v in verdicts.values())
+    if report["rules_error"] and unread:
+        lines.append(f"could not read the firewall rules: {report['rules_error']}")
+        lines.append("run this check again from an administrator PowerShell")
+    lines += [describe_rule(r) for r in report["rules"]]
+    for profile, verdicts in report["allowed"].items():
+        off = report["firewall_on"].get(profile) is False
+        for target, ok in verdicts.items():
+            if ok is None:
+                lines.append(f"{target} on {profile}: no verdict, the rules could not be read")
+                continue
+            note = " (firewall off)" if off else ""
+            lines.append(f"{target} on {profile}: {'allowed' if ok else 'NOT allowed'}{note}")
+            if not ok:
+                protocol, port = target.split()
+                lines.append(
+                    f'  New-NetFirewallRule -DisplayName "pllm {port}" -Direction Inbound '
+                    f"-Protocol {protocol} -LocalPort {port} -Profile {profile} "
+                    f'-Program "{program}" -Action Allow'
+                )
+    lines.append(f"UDP {MDNS_PORT} is mDNS, which discovery will use; UDP {MCAST_PORT} is only the")
+    lines.append("port of this check's multicast test.")
+    return lines
 
 
 def interpreters() -> list[str]:
@@ -317,26 +377,9 @@ def _firewall(parser: argparse.ArgumentParser, roles: list[str]) -> None:
     with runrecord.record("network-check") as rec:
         report = firewall(wanted)
         rec.update(check="firewall", **report)
-    for p in report["profiles"]:
-        print(f"network {p['name']} on {p['interface']}: {p['category']}")
-    if report["public_networks"]:
-        print("the adapter on the laptops' LAN must be Private; set it in Windows Settings")
-    if report["rules_error"]:
-        print(f"could not read the firewall rules: {report['rules_error']}")
-        print("run this check again from an administrator PowerShell")
-        return
-    for r in report["rules"]:
-        print(describe_rule(r))
-    for target, ok in report["allowed_on_private"].items():
-        print(f"{target}: {'allowed' if ok else 'NOT allowed'} on the Private profile")
-        if not ok:
-            protocol, port = target.split()
-            print(
-                f'  New-NetFirewallRule -DisplayName "pllm {port}" -Direction Inbound '
-                f"-Protocol {protocol} -LocalPort {port} -Profile Private -Action Allow"
-            )
-    print(f"UDP {MDNS_PORT} is mDNS, which discovery will use; UDP {MCAST_PORT} is only the")
-    print("port of this check's multicast test.")
+    # The last entry is the base interpreter, the process that listens (see interpreters).
+    for line in firewall_lines(report, interpreters()[-1]):
+        print(line)
 
 
 def main(argv: list[str] | None = None) -> None:

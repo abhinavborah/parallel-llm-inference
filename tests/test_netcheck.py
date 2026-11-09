@@ -126,25 +126,49 @@ def rule(action, protocol="TCP", port=50051, profile="Private"):
     }
 
 
-def test_firewall_verdict_per_port_and_public_networks():
+def report_for(profiles, firewall, rules=(), error=None, wanted=WANTED):
     raw = json.dumps(
-        {
-            "profiles": [
-                {"interface": "Ethernet", "name": "lab", "category": "Private"},
-                {"interface": "VPN", "name": "vpn", "category": "Public"},
-            ],
-            "rules": [rule("Allow"), rule("Allow", "UDP", netcheck.MCAST_PORT, "Public")],
-            "rules_error": None,
-        }
+        {"profiles": profiles, "firewall": firewall, "rules": list(rules), "rules_error": error}
     )
-    report = netcheck.parse_firewall(raw, WANTED)
-    assert report["allowed_on_private"] == {"TCP 50051": True, f"UDP {netcheck.MCAST_PORT}": False}
-    assert report["public_networks"] == ["vpn"]
+    return netcheck.parse_firewall(raw, wanted)
+
+
+LAB = {"interface": "Ethernet", "name": "lab", "category": "Private"}
+VPN = {"interface": "VPN", "name": "vpn", "category": "Public"}
+HOTSPOT = {"interface": "Wi-Fi", "name": "lg", "category": "Public"}
+ON = {"Domain": True, "Private": True, "Public": True}
+UDP_TEST = f"UDP {netcheck.MCAST_PORT}"
+
+
+def test_each_port_is_judged_on_the_profile_its_adapter_is_on():
+    rules = [rule("Allow"), rule("Allow", "UDP", netcheck.MCAST_PORT, "Public")]
+    report = report_for([LAB, VPN], ON, rules)
+    assert report["allowed"] == {
+        "Private": {"TCP 50051": True, UDP_TEST: False},
+        "Public": {"TCP 50051": False, UDP_TEST: True},
+    }
+
+
+def test_a_profile_with_the_firewall_off_passes_without_rules_or_an_administrator():
+    report = report_for([HOTSPOT], ON | {"Public": False}, error="Access is denied.")
+    assert report["allowed"] == {"Public": {"TCP 50051": True, UDP_TEST: True}}
+    lines = netcheck.firewall_lines(report, r"C:\Python\python.exe")
+    assert "network lg on Wi-Fi: Public, firewall off" in lines
+    assert "TCP 50051 on Public: allowed (firewall off)" in lines
+    assert not any("New-NetFirewallRule" in line or "administrator" in line for line in lines)
+    assert not any("Private" in line for line in lines)
+
+
+def test_a_missing_rule_is_suggested_for_the_profile_in_use_and_the_interpreter():
+    lines = netcheck.firewall_lines(report_for([HOTSPOT], ON), r"C:\Python\python.exe")
+    assert "TCP 50051 on Public: NOT allowed" in lines
+    (suggested,) = [line for line in lines if "-LocalPort 50051" in line]
+    assert "-Profile Public" in suggested and r'-Program "C:\Python\python.exe"' in suggested
 
 
 def test_a_block_rule_wins_over_an_allow_rule():
-    raw = json.dumps({"profiles": [], "rules": [rule("Allow"), rule("Block", profile="Any")]})
-    assert netcheck.parse_firewall(raw, WANTED[:1])["allowed_on_private"] == {"TCP 50051": False}
+    report = report_for([LAB], ON, [rule("Allow"), rule("Block", profile="Any")], wanted=WANTED[:1])
+    assert report["allowed"] == {"Private": {"TCP 50051": False}}
 
 
 def test_a_single_profile_object_is_read_as_a_list():
@@ -154,11 +178,19 @@ def test_a_single_profile_object_is_read_as_a_list():
     assert report["rules"] == []
 
 
-def test_unreadable_rules_give_no_verdict_instead_of_not_allowed():
-    raw = json.dumps({"profiles": [], "rules": [], "rules_error": "Access is denied."})
-    report = netcheck.parse_firewall(raw, WANTED)
-    assert set(report["allowed_on_private"].values()) == {None}
-    assert report["rules_error"] == "Access is denied."
+def test_unreadable_rules_give_no_verdict_where_the_firewall_is_on():
+    report = report_for([LAB, VPN], ON | {"Public": False}, error="Access is denied.")
+    assert set(report["allowed"]["Private"].values()) == {None}
+    assert set(report["allowed"]["Public"].values()) == {True}
+    lines = netcheck.firewall_lines(report, "python")
+    assert "TCP 50051 on Private: no verdict, the rules could not be read" in lines
+    assert "run this check again from an administrator PowerShell" in lines
+
+
+def test_an_unknown_firewall_state_is_judged_by_the_rules():
+    report = report_for([HOTSPOT], {}, [rule("Allow", profile="Public")], wanted=WANTED[:1])
+    assert report["allowed"] == {"Public": {"TCP 50051": True}}
+    assert "network lg on Wi-Fi: Public, firewall unknown" in netcheck.firewall_lines(report, "p")
 
 
 def test_the_firewall_script_names_this_interpreter_and_no_other_python(monkeypatch):
@@ -227,10 +259,9 @@ def test_a_failing_powershell_run_is_raised(monkeypatch):
 def test_the_firewall_query_runs_on_windows():
     report = netcheck.firewall(WANTED)
     assert report["profiles"], "every Windows host has a network profile"
-    if report["rules_error"] is None:
-        assert set(report["allowed_on_private"]) == {"TCP 50051", f"UDP {netcheck.MCAST_PORT}"}
-    else:
-        assert set(report["allowed_on_private"].values()) == {None}
+    assert set(report["firewall_on"]) == {"Domain", "Private", "Public"}, "read without admin"
+    for verdicts in report["allowed"].values():
+        assert set(verdicts) == {"TCP 50051", UDP_TEST}
 
 
 def test_a_failed_role_is_recorded_with_the_others(echo_server, tmp_path, monkeypatch):
