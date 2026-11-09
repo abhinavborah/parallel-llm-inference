@@ -248,6 +248,14 @@ logits equal the single-process reference (tested with small random models).
   down), fails the request with UNAVAILABLE. Recovery and replay come later.
 - The request table (`Gateway.table()`) lists each running request: id, attempt, tokens so
   far, expected step and seconds to its deadline.
+- Result filter and exactly-once delivery (R4.7, R4.8). A result is accepted only when its
+  request is running and its attempt, its step and its epoch match the request's attempt,
+  the step it waits on and the live epoch of Stage 1. Anything else is dropped and counted
+  by reason in `Gateway.discards`: `unknown_request` (a late result after the request
+  ended), `stale_attempt`, `stale_epoch` (an old Stage 1), `duplicate` (a step already
+  delivered), `ahead` (a step not asked for yet) and `stale_nack` (a Nack for no step a
+  running request waits on); `Gateway.dropped` is the total. Only an accepted result
+  reaches the client, so each step of a request is streamed once and in order.
 - When a request ends, for any reason, it leaves the table and a `Free` for it is queued for
   each stage; the stage's heartbeat stream delivers it.
 - Each running request holds one of the gateway's 20 server threads. Six are kept for the
