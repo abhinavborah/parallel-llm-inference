@@ -212,6 +212,19 @@ class Chain:
                 send[rid] = [out[rid][0][-1]]
         return out
 
+    def send(self, rid, step, start_pos, ids):
+        """Put one request on the client stream."""
+        self.outbox.put(
+            protocol_pb2.StepRequest(
+                rid=rid,
+                attempt=1,
+                step=step,
+                start_pos=start_pos,
+                length=len(ids),
+                tokens=protocol_pb2.TokenIds(ids=ids),
+            )
+        )
+
     def generate(self, ids, new_tokens, rid="r"):
         """Prefill ids, then decode greedily; return the tokens and their top logits."""
         return self.generate_many({rid: ids}, new_tokens)[rid]
@@ -269,7 +282,7 @@ def test_each_request_id_has_its_own_cache(tmp_path, make_chain):
     assert len({tuple(tokens) for tokens, _ in alone.values()}) == 3  # the prompts differ
     # steps of the three requests alternate on one stream, each with its own cache
     assert chain.generate_many(prompts_, 6) == alone
-    assert set(chain.servicer0.caches) == set(chain.servicer1.caches) == set(prompts_)
+    assert chain.servicer0.store.rids() == chain.servicer1.store.rids() == set(prompts_)
 
 
 WIDE = 2048  # a hidden size whose 512-token prefill is 4 MiB, over gRPC's default limit
@@ -365,13 +378,6 @@ def test_a_stage_rejects_what_it_cannot_run(tmp_path, make_chain):
             grpc.StatusCode.INVALID_ARGUMENT,
             "outside the embedding",
         ),
-        # a request this stage has not seen cannot start past position 0
-        (
-            chain.port0,
-            dict(base, start_pos=5, tokens=tokens),
-            grpc.StatusCode.FAILED_PRECONDITION,
-            "unknown",
-        ),
     ]
     for port, fields, code, text in cases:
         got, details = one_message(port, protocol_pb2.StepRequest(**fields))
@@ -417,7 +423,7 @@ def test_a_failed_step_drops_the_cache_of_that_request(tmp_path, make_chain):
         with pytest.raises(grpc.RpcError) as err:
             protocol_pb2_grpc.StageStub(channel).Steps(iter([first, bad]), timeout=WAIT)
     assert err.value.code() == grpc.StatusCode.INVALID_ARGUMENT
-    assert "x" not in chain.servicer0.caches
+    assert "x" not in chain.servicer0.store
 
 
 def test_an_unexpected_error_in_a_stage_is_internal_and_drops_the_cache(
@@ -435,7 +441,7 @@ def test_an_unexpected_error_in_a_stage_is_internal_and_drops_the_cache(
     )
     code, details = one_message(chain.port0, request)
     assert code == grpc.StatusCode.INTERNAL and details == "stage failed: RuntimeError"
-    assert "x" not in chain.servicer0.caches
+    assert "x" not in chain.servicer0.store
 
 
 def test_every_step_runs_with_the_process_thread_count(tmp_path, make_chain):
@@ -464,6 +470,135 @@ def test_the_last_stage_needs_a_results_address_and_the_others_a_next_hop(tmp_pa
         serve(StageWorker(WorkerConfig(tmp_path, 2, LAYERS)), "127.0.0.1:0")
     with pytest.raises(ValueError, match="next stage's address"):
         serve(StageWorker(WorkerConfig(tmp_path, 0, 2)), "127.0.0.1:0")
+
+
+# ------------------------------------------------------- position rules and release
+
+
+def no_result_within(chain, seconds=1.0):
+    """True if nothing arrives at the gateway's Results in that time."""
+    try:
+        chain.collector.results.get(timeout=seconds)
+    except queue.Empty:
+        return True
+    return False
+
+
+def test_a_message_past_the_cache_is_nacked_and_the_stream_carries_on(tmp_path, make_chain):
+    tiny_reference(tmp_path, layers=LAYERS)
+    chain = make_chain(tmp_path, 2)
+    ids = [5, 9, 100, 3]
+    expected = generate(InProcessSplit.load(tmp_path, 2), ids, 4)
+    chain.send("lost", 7, 5, [1])  # a request this stage has never seen, starting at 5
+    chain.outbox.put(
+        protocol_pb2.StepRequest(
+            rid="late",
+            attempt=3,
+            step=2,
+            start_pos=99,
+            length=1,
+            tokens=protocol_pb2.TokenIds(ids=[1]),
+        )
+    )
+    # the stream is not ended by the refusals: a good request on it still completes
+    assert chain.generate(ids, 4) == expected
+    nacks = [chain.servicer0.nacks.get(timeout=WAIT) for _ in range(2)]
+    first = nacks[0]
+    assert (first.reason, first.stage, first.rid, first.attempt, first.step) == (
+        "GAP",
+        0,
+        "lost",
+        1,
+        7,
+    )
+    assert (nacks[1].rid, nacks[1].attempt, nacks[1].step) == ("late", 3, 2)
+    assert chain.servicer0.nacks.empty()
+    # nothing was forwarded for them, and they created no state on either stage
+    assert chain.servicer1.nacks.empty()
+    assert chain.servicer0.store.rids() == chain.servicer1.store.rids() == {"r"}
+
+
+def test_the_second_stage_nacks_when_it_lacks_the_cache_the_first_has(tmp_path, make_chain):
+    tiny_reference(tmp_path, layers=LAYERS)
+    chain = make_chain(tmp_path, 2)
+    chain.generate([5, 9, 100, 3], 3, rid="a")
+    chain.servicer1.free(protocol_pb2.Free(rid="a"))  # as if stage 1 had restarted
+    chain.send("a", 3, 6, [7])  # the next decode step: stage 0 has position 6, stage 1 none
+    nack = chain.servicer1.nacks.get(timeout=WAIT)
+    assert (nack.reason, nack.stage, nack.rid, nack.step) == ("GAP", 1, "a", 3)
+    assert no_result_within(chain) and chain.servicer0.nacks.empty()
+
+
+def test_a_replay_from_an_earlier_message_gives_the_same_results(tmp_path, make_chain):
+    tiny_reference(tmp_path, layers=LAYERS)
+    chain = make_chain(tmp_path, 2)
+    ids = [5, 9, 100, 3, 42]
+    tokens, tops = chain.generate(ids, 4)  # messages: prefill at 0, then one token each
+    n = len(ids)
+    # resend the step at position n, below the 8 positions cached: truncate then append
+    chain.send("r", 1, n, [tokens[0]])
+    again = chain.result()
+    assert (again.token, again.top_logit) == (tokens[1], tops[1])
+    chain.send("r", 2, n + 1, [tokens[1]])
+    again = chain.result()
+    assert (again.token, again.top_logit) == (tokens[2], tops[2])
+    assert chain.servicer0.store.length("r") == n + 2
+    assert chain.servicer1.store.length("r") == n + 2
+
+
+def test_a_replay_from_position_zero_restarts_the_request(tmp_path, make_chain):
+    tiny_reference(tmp_path, layers=LAYERS)
+    chain = make_chain(tmp_path, 2)
+    ids = [5, 9, 100, 3, 42]
+    tokens, tops = chain.generate(ids, 3)
+    chain.send("r", 0, 0, ids)
+    first = chain.result()
+    assert (first.token, first.top_logit) == (tokens[0], tops[0])
+    assert chain.servicer0.store.length("r") == len(ids)
+
+
+def test_free_on_both_stages_returns_the_cached_count_to_zero(tmp_path, make_chain):
+    tiny_reference(tmp_path, layers=LAYERS)
+    chain = make_chain(tmp_path, 2)
+    chain.generate_many({"a": [5, 9, 100], "b": [1, 2, 3, 4]}, 3)
+    assert chain.servicer0.cached_requests == chain.servicer1.cached_requests == 2
+    for servicer in (chain.servicer0, chain.servicer1):
+        assert servicer.free(protocol_pb2.Free(rid="a")) is True
+    assert chain.servicer0.cached_requests == chain.servicer1.cached_requests == 1
+    for servicer in (chain.servicer0, chain.servicer1):
+        servicer.free(protocol_pb2.Free(rid="b", attempt=1))
+        assert servicer.free(protocol_pb2.Free(rid="b")) is False  # a second Free is harmless
+    assert chain.servicer0.cached_requests == chain.servicer1.cached_requests == 0
+
+
+def test_a_freed_request_cannot_continue_on_the_chain(tmp_path, make_chain):
+    tiny_reference(tmp_path, layers=LAYERS)
+    chain = make_chain(tmp_path, 2)
+    chain.generate([5, 9, 100, 3], 2, rid="a")
+    for servicer in (chain.servicer0, chain.servicer1):
+        servicer.free(protocol_pb2.Free(rid="a"))
+    chain.send("a", 2, 5, [7])
+    assert chain.servicer0.nacks.get(timeout=WAIT).reason == "GAP"
+    assert no_result_within(chain)
+
+
+def test_a_step_that_fails_after_truncating_leaves_nothing_to_continue_from(tmp_path, make_chain):
+    tiny_reference(tmp_path, layers=LAYERS)
+    chain = make_chain(tmp_path, 2)
+    chain.generate([5, 9, 100, 3, 42], 2)  # rid "r" holds 6 positions on both stages
+    # a replay from position 3 whose token is outside the vocabulary: the cache is truncated
+    # to 3, then the step fails
+    bad = protocol_pb2.StepRequest(
+        rid="r", attempt=2, step=1, start_pos=3, length=1, tokens=protocol_pb2.TokenIds(ids=[9999])
+    )
+    code, _ = one_message(chain.port0, bad)
+    assert code == grpc.StatusCode.INVALID_ARGUMENT and "r" not in chain.servicer0.store
+    # a retry at position 3 finds nothing to continue from: a GAP, not a half-written cache
+    chain.send("r", 1, 3, [7])
+    assert chain.servicer0.nacks.get(timeout=WAIT).reason == "GAP"
+    # and the request can start again from the beginning
+    chain.send("r", 0, 0, [5, 9, 100])
+    assert chain.result().step == 0
 
 
 # ------------------------------------------------------------- the real model
