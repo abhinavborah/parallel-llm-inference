@@ -93,8 +93,8 @@ refused one is not cached or forwarded; its Nack goes to the gateway on the hear
 3. an attempt older than the newest one that has used the request's cache: `STALE_ATTEMPT`.
    A newer attempt is adopted (a replay starts at position 0, which truncates).
 
-The gateway fails a running request at once with UNAVAILABLE when a Nack names its current
-attempt, giving the stage and the reason; replaying it instead comes with the recovery
+The gateway fails a running request at once with UNAVAILABLE when a Nack names the step it
+is waiting on (same attempt and step), giving the stage and the reason; replaying it instead comes with the recovery
 stories. A stage takes requests only once both route updates have arrived, a few
 milliseconds after the second stage registers: a request sent before that is refused with
 `WRONG_EPOCH` (or `BAD_SENDER`) and fails at once. When the route update then arrives,

@@ -491,14 +491,19 @@ class Gateway(
             except queue.Empty:
                 pass
             else:
-                if isinstance(result, protocol_pb2.Nack):
+                # Checked again here, for a result and a Nack alike: either can be queued
+                # just before the step moved on, and is then for a step already done.
+                current = (result.attempt, result.step) == (
+                    request.attempt,
+                    request.expected_step,
+                )
+                if current and isinstance(result, protocol_pb2.Nack):
                     context.abort(
                         grpc.StatusCode.UNAVAILABLE,
                         f"stage {result.stage} refused step {result.step} of request "
                         f"{request.rid}: {result.reason}",
                     )
-                # Checked again here: a duplicate queued just before the step moved on.
-                if (result.attempt, result.step) == (request.attempt, request.expected_step):
+                if current:
                     return result
                 with self._lock:
                     self.dropped += 1

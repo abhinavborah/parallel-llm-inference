@@ -280,3 +280,17 @@ def test_a_nack_for_another_step_does_not_fail_the_request(beating):
     )
     run.gateway._record(run.gateway._sessions[1], late)
     assert len([first, *call]) == 3
+
+
+def test_a_nack_queued_for_a_step_already_done_is_dropped(beating):
+    """The gateway decides on a Nack under its lock but queues it after; if the step's
+    result is taken first, the Nack arrives for a step already done and must not fail the
+    next one."""
+    run = beating(delay1=0.3)
+    call = run.call(max_tokens=3)
+    first = next(call)  # step 0 is done; the request now waits on step 1
+    request = run.gateway.requests[first.rid]
+    before = run.gateway.dropped
+    request.results.put(protocol_pb2.Nack(stage=1, rid=first.rid, attempt=1, step=0, reason="GAP"))
+    assert len([first, *call]) == 3
+    assert run.gateway.dropped == before + 1
