@@ -253,7 +253,7 @@ clock (`Gateway.beats()`), and the Nacks (`Gateway.nacks`, the last 1024, and
   and each time Stage 1 registers. Stage 0 then sends to that address with that target
   epoch without restarting, on a new channel even at the same address (an old channel
   that failed while Stage 1 was down would wait out gRPC's reconnect backoff, up to 120
-  s). If the address changed, the old channel is closed, which ends a stream still open
+  s; Stage 0's channels do not share connections, so the new one starts fresh). If the address changed, the old channel is closed, which ends a stream still open
   on it, and the gateway's next request opens a new one.
 
 If the gateway cannot be reached, the stage tries again every second, and its Nacks wait

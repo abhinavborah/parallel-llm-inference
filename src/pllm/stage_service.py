@@ -21,7 +21,9 @@ route() points the first stage at a restarted second stage: a new channel to its
 and its epoch as the target epoch. A stream already open keeps the channel it started
 with; it ends when that next hop is gone, and the previous hop's next stream uses the new
 route. The channel is new even at the same address, because a channel that failed to
-connect while the stage was down waits out gRPC's reconnect backoff (up to 120 s).
+connect while the stage was down waits out gRPC's reconnect backoff (up to 120 s); each
+channel keeps its own connections, since gRPC otherwise shares them between channels to
+one address and the new channel would inherit the backoff.
 Fencing by epoch is a separate story: the epoch fields are carried but not checked,
 and two streams that carry the same request id at once are not guarded against each other.
 The outbound queue is unbounded; bounded queues and backpressure come with the queue story.
@@ -81,7 +83,12 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         self.worker = worker
         self.last = last
         self.own_epoch, self.next_epoch = own_epoch, next_epoch
-        self.options = wire.channel_options(worker.stage.config.hidden_size)
+        # Its own connections: by default gRPC shares them between channels to the same
+        # address, so a new channel would inherit one still in reconnect backoff.
+        self.options = [
+            *wire.channel_options(worker.stage.config.hidden_size),
+            ("grpc.use_local_subchannel_pool", 1),
+        ]
         self.next_address = results_address if last else next_address
         self.channel = grpc.insecure_channel(self.next_address, self.options)
         self._route_lock = threading.Lock()
