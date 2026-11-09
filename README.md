@@ -257,10 +257,23 @@ logits equal the single-process reference (tested with small random models).
   each stage; the stage's heartbeat stream delivers it.
 - Each running request holds one of the gateway's 20 server threads. Six are kept for the
   results stream, registration and the heartbeat streams, so at most 14 requests run at
-  once and a further one is refused with RESOURCE_EXHAUSTED; many in flight is the next
-  story. Requests share one stream to
-  Stage 0, and a step that fails at a stage ends that stream, so the other requests on it
-  fail with UNAVAILABLE too.
+  once and a further one is refused with RESOURCE_EXHAUSTED.
+- Many requests run at once (R4.5). They share one stream to Stage 0, so the stages see
+  their steps interleaved and Stage 0 works on one request while Stage 1 works on another:
+  in `tests/test_concurrency.py` each stage sleeps 0.1 s per step instead of computing,
+  so 4 requests of 5 tokens one after another are 20 steps of 0.2 s, while together the
+  stages overlap and the work fits in about 21 slots of 0.1 s; the test checks that
+  together takes under three quarters of one after another. That shows the stages
+  overlapping, not model throughput, which the benchmarks measure.
+  Each request's own steps stay strictly in order and give the tokens it gives alone; no
+  order between requests is promised, and a shorter request started later can finish
+  first. A cancel, a deadline or a refused step ends only its own request. A stage ends
+  the shared stream when a message is malformed, when a step fails inside it (including
+  running out of memory), or when its next hop fails or moves; then every request on it
+  fails with UNAVAILABLE. A request whose prompt and `max_tokens` together exceed the
+  model's context length (8192 positions for SmolLM2) is refused with INVALID_ARGUMENT.
+  One long prefill delays the other requests' next steps at that stage. Bounded queues and
+  credits (R5.2) are #33.
 - Text is decoded per token, holding back a token that ends inside a character until the
   next one completes it (up to four tokens), so a `Token` can carry empty text.
 
