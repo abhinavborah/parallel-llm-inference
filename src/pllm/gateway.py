@@ -28,8 +28,13 @@ The gateway keeps one stream open to the registered Stage 0 and reopens it when 
 registers again with another address or epoch. Requests share that stream.
 
 Deadlines are judged here only, on this process's monotonic clock (decision #32): no
-clock is compared across machines. The remaining budget is not yet carried on each hop;
-that is the deadline story (#36), so deadline_unix_ms is sent as 0.
+clock is compared across machines. Each step sent to Stage 0 carries budget_ms, the time
+left on the request's deadline, and Stage 0 passes on what is left of it to Stage 1 (R5.4);
+a stage drops a step whose budget ran out before it ran (pllm.stage_service). A waiting
+request checks its deadline at least every POLL_SECONDS and fails with DEADLINE_EXCEEDED
+once it has passed, whatever a stage does, so no request hangs (R5.6). The tolerance is that
+interval plus thread scheduling and the error's way to the client; the tests assert 0.5 s on
+loopback.
 
 When a request ends, for any reason, it leaves the table and a Free for it is queued for
 each stage (R4.6); that stage's heartbeat stream delivers it. A Free queued while a stage
@@ -115,7 +120,7 @@ from pllm.control import Registration, Registry, expected_model
 from pllm.model import ModelConfig
 from pllm.models import MODELS_DIR, PINNED
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
-from pllm.stage_service import _DONE, _drain
+from pllm.stage_service import _DONE, _drain, budget_ms
 
 log = logging.getLogger("pllm.gateway")
 
@@ -622,6 +627,7 @@ class Gateway(
                         target_epoch=link.epoch,
                         sender_epoch=0,
                         tokens=protocol_pb2.TokenIds(ids=send),
+                        budget_ms=budget_ms(request.deadline, time.monotonic()),
                     )
                 )
                 try:

@@ -95,6 +95,8 @@ message TokenIds {
 }
 
 message StepRequest {
+  reserved 9;  // was deadline_unix_ms, an absolute wall-clock time
+  reserved "deadline_unix_ms";
   string rid = 1;
   uint32 attempt = 2;
   uint32 step = 3;
@@ -103,11 +105,14 @@ message StepRequest {
   uint64 target_epoch = 6;  // epoch of the receiving stage
   uint64 sender_epoch = 7;  // epoch of the sending stage, 0 for the gateway
   bool replay = 8;  // part of a chunked replay
-  int64 deadline_unix_ms = 9;
   oneof payload {
     TokenIds tokens = 10;
     Tensor activations = 11;
   }
+  // Milliseconds left until the request's deadline when the message was sent; 0 means
+  // none. A receiver turns it into a deadline on its own monotonic clock on arrival, so
+  // no clock is compared across machines.
+  uint32 budget_ms = 12;
 }
 
 message StepResult {

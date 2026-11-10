@@ -242,8 +242,21 @@ logits equal the single-process reference (tested with small random models).
   more than 512 tokens). A prompt whose request message is itself larger than the limit in
   bytes is refused earlier by gRPC with RESOURCE_EXHAUSTED; it does not reach Stage 0 either.
 - The deadline is the client's `timeout_ms`, judged only by the gateway on its own
-  monotonic clock. A request past it fails with DEADLINE_EXCEEDED. Carrying the remaining
-  time on each hop comes with the deadline story.
+  monotonic clock: no clock is compared across machines. A waiting request checks its
+  deadline at least every 0.05 s and fails with DEADLINE_EXCEEDED once it has passed,
+  whatever a stage does, so no request hangs, even with a stage suspended (R5.6). The
+  stated tolerance is 0.5 s after the deadline, asserted on loopback; across laptops, add
+  the one-way delay of the error to the client. Delays between stages do not add, because
+  only the gateway judges the deadline.
+- Each step carries `budget_ms`, the time left on the request's deadline when it was sent
+  (R5.4). A stage turns it into a deadline on its own monotonic clock when the message
+  arrives, and Stage 0 passes on what is left to Stage 1. A step still waiting at a stage
+  when that deadline passes is dropped before it runs, with no Nack, and counted in the
+  stage's `expired`. A stage's deadline falls after the gateway's by the time the message
+  spent in transit, so a step it drops belongs to a request the gateway has already
+  failed. A message held in transit, for example in a suspended stage's socket buffer,
+  gets its deadline only when read and can still run late; the gateway drops its result.
+  A budget of 0 means no deadline.
 - A stage that is not registered, or a stream to Stage 0 that fails (Stage 0 or Stage 1
   down), fails the request with UNAVAILABLE. Recovery and replay come later.
 - The request table (`Gateway.table()`) lists each running request: id, attempt, tokens so
@@ -271,10 +284,10 @@ logits equal the single-process reference (tested with small random models).
     before each step and gives it back when the result comes. Waiting requests get a
     credit in arrival order, and a request giving one back queues behind them for its
     next step. A running request has at most one step in the pipeline, so credits bind
-    only below the 14 running slots. While
-    requests run normally this bounds the steps at each stage; a request that fails (a
-    deadline, a refusal, a cancel) gives its credit back while its step may still be at a
-    stage, so there the stage inbox is the hard bound.
+    only below the 14 running slots. While requests run normally this bounds the steps
+    at each stage; a request that fails (a deadline, a refusal, a cancel) gives its
+    credit back while its step may still be at a stage, so there the stage inbox is the
+    hard bound.
   - `stage_inbox` (16, at least `credits`): messages each stream's inbox, and its queue to
     the next hop, may hold at a stage. A full inbox stops the stage reading, so gRPC flow
     control slows the sender; on a healthy stream nothing is dropped. A stream that ends

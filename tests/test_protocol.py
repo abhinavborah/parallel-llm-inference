@@ -11,7 +11,10 @@ from pllm.proto.generate import generate
 PROTO_DIR = Path(protocol_pb2.__file__).parent
 
 # Changing protocol.proto must bump SCHEMA_VERSION and this pin together.
-SCHEMA_PINS = {1: "5c0c7386d0c6fdc28a7967e30c683138d2f6124aa905f9c6e467e5ac0641dd2f"}
+SCHEMA_PINS = {
+    1: "5c0c7386d0c6fdc28a7967e30c683138d2f6124aa905f9c6e467e5ac0641dd2f",
+    2: "dac7535c5753a470a65725e0d1dbdb14993622da7ee8ab8496ac28efd0e83a5c",
+}
 
 
 def lf_bytes(path: Path) -> bytes:
@@ -40,7 +43,7 @@ def step(**payload) -> protocol_pb2.StepRequest:
         target_epoch=5,
         sender_epoch=4,
         replay=True,
-        deadline_unix_ms=1_790_000_000_123,
+        budget_ms=30_000,
         **payload,
     )
 
