@@ -364,6 +364,46 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
   with no `run_end` is from a run that did not stop cleanly. Send SIGINT, or CTRL_BREAK on
   Windows, not a forced kill.
 
+## Report
+
+One command builds every table and plot from the metrics files (`pllm.report`). Reported
+numbers come from it, never from the dashboard.
+
+```
+uv run python -m pllm.report                  # every runs/*.metrics.jsonl
+uv run python -m pllm.report LOG_OR_DIR ...   # given files, or those in each folder
+uv run python -m pllm.report --out DIR        # default runs/report
+```
+
+It writes `runs.csv` and `index.md` with one row per run, and a folder per run with
+`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `latency_cdf.png` and, when the
+stages sent beats, `utilisation.png`. The report is built beside the output folder and
+then replaces it whole, so a failed build leaves the old one. The command refuses a folder
+it did not make, a file, and a folder that holds a log; anything added to a folder it made
+is replaced with it. `runs/` is not committed.
+
+Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
+
+- Completed requests ended at end of sequence or at `max_tokens`; only they give latencies
+  and throughput. The others are counted per outcome.
+- TTFT is the first token minus arrival at the gateway, so time in the admission queue
+  counts. TPOT is (last token minus first token) / (output tokens - 1), for requests with
+  at least two tokens. End-to-end is the last token minus arrival.
+- p50, p95 and p99 interpolate linearly between the nearest ranks (numpy's default). Each
+  table gives n: a p99 of fewer than 100 requests is an interpolation.
+- Throughput is the output tokens of completed requests over the window, from the first
+  arrival of any request to the last token of a completed one.
+- Busy time per stage is read off the beat totals at the two ends of the window, by
+  straight-line interpolation between beats, separately per epoch. Since the totals count
+  a step still running, the error at each end is at most the time between the two beats
+  around it (0.5 s when beats are steady). `max_beat_gap_s` in `stages.csv` is the longest
+  stretch of the window with no beat from that stage, for example a late first beat, a
+  heartbeat that reconnected or beats that stopped, and `summary.md` warns when it is over
+  1 s. Utilisation is busy time over the window; two streams working at once on one stage
+  can push it above 1.
+
+Plots for each experiment (X2 to X9) are added here by that experiment.
+
 ## Heartbeat
 
 A serving worker registers, then keeps one `Control.Heartbeat` stream to the gateway
