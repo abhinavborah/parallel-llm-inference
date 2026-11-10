@@ -308,7 +308,7 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 
 | `type` | When | Fields |
 |---|---|---|
-| `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `split`, `network` |
+| `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `argv` |
 | `hop` | Each message the gateway sends or receives | `t_ns`, `hop`, `msg`, `phase`, `rid`, `attempt`, `step`, `bytes`, `payload_bytes`, `positions`, `accepted` |
 | `request` | Each request's end | `t_ns`, `rid`, `attempt`, `outcome`, `code`, `prompt_tokens`, `max_tokens`, `output_tokens`, `arrived_ns`, `first_token_ns`, `last_token_ns` |
 | `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
@@ -327,6 +327,12 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 - `stage0_stage1_complete` is false when a stream ended with no valid report, for example
   because Stage 0 died, or was stopped at the same time as the gateway. Its totals are then
   a lower bound. For complete totals stop the gateway first, while the stages are up.
+- The gateway runs no model and measures no round-trip time, so the `run` line has no thread
+  count and no `rtt_ms`. The launcher's run record has the thread count, and the network
+  check has the round-trip time.
+- `accepted` is the verdict when a result arrives. A result accepted then can still be
+  dropped when its request takes it from the queue, for example after a new Stage 1
+  registers. Such a drop is counted in `Gateway.discards`, not in this file.
 - A message queued just as its stream ended is counted although it was not sent. A file
   with no `run_end` is from a run that did not stop cleanly. Send SIGINT, or CTRL_BREAK on
   Windows, not a forced kill.

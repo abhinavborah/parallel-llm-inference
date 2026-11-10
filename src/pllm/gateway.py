@@ -97,6 +97,7 @@ import json
 import logging
 import queue
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -793,8 +794,11 @@ def main(argv: list[str] | None = None) -> None:
             {
                 "commit": runrecord.commit_hash(),
                 "model": args.model,
+                "revision": PINNED[args.model].revision,
                 "split": expected.split_point,
                 "network": hosts.network,
+                **runrecord.machine(),
+                "argv": sys.argv,
             },
         )
     except (ValueError, OSError) as err:

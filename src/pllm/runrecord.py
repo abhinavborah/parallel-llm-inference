@@ -39,6 +39,17 @@ def power_state() -> dict | None:
     return {"plugged_in": battery.power_plugged, "percent": battery.percent}
 
 
+def machine() -> dict:
+    """The fields that say which laptop produced a number and in what state it was."""
+    return {
+        "host": socket.gethostname(),
+        "os": platform.platform(),
+        "python": platform.python_version(),
+        "available_memory_bytes": psutil.virtual_memory().available,
+        "power": power_state(),
+    }
+
+
 @contextmanager
 def record(
     script: str,
@@ -68,13 +79,9 @@ def record(
         "revision": revision,
         "split": split,
         "threads": threads,
-        "host": socket.gethostname(),
-        "os": platform.platform(),
-        "python": platform.python_version(),
         "network": network,
         "rtt_ms": rtt_ms,
-        "available_memory_bytes": psutil.virtual_memory().available,
-        "power": power_state(),
+        **machine(),
     }
     status = "error"
     try:
