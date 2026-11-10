@@ -246,7 +246,8 @@ logits equal the single-process reference (tested with small random models).
   deadline at least every 0.05 s and fails with DEADLINE_EXCEEDED once it has passed,
   whatever a stage does, so no request hangs, even with a stage suspended (R5.6). The
   stated tolerance is 0.5 s after the deadline, asserted on loopback; across laptops, add
-  the one-way delay of the error to the client.
+  the one-way delay of the error to the client. Delays between stages do not add, because
+  only the gateway judges the deadline.
 - Each step carries `budget_ms`, the time left on the request's deadline when it was sent
   (R5.4). A stage turns it into a deadline on its own monotonic clock when the message
   arrives, and Stage 0 passes on what is left to Stage 1. A step still waiting at a stage
