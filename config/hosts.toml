@@ -35,6 +35,15 @@ port = 50062
 [limits]
 max_batch = 1
 max_prompt_tokens = 512
+# Flow control (R5.1, R5.2). admission_queue: requests that may wait at the gateway for a
+# running slot; one more is refused with RESOURCE_EXHAUSTED (0 refuses as soon as the
+# running slots are full). credits: steps in flight in the pipeline at once; a running
+# request has at most one, so this binds only below the gateway's 14 running slots.
+# stage_inbox: messages a stage holds waiting; at least credits, so it does not fill while
+# the gateway keeps to its credits.
+admission_queue = 8
+credits = 8
+stage_inbox = 16
 
 # Split point k per model: stage 0 runs layers 0 to k - 1, stage 1 runs k to the last layer.
 # Always read from this committed file, never from a local copy, so both laptops use the

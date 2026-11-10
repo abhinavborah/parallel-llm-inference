@@ -47,8 +47,20 @@ chain (as in tests) sends; so a stage that has not registered yet accepts any me
 both epochs at 0. A step that fails frees its cache without remembering the attempt
 (free_cache), so a late step of an older attempt can start that request again from
 position 0; the gateway has already failed the request by then. Two streams that carry
-the same request id at once are not guarded against each other. The outbound queue is
-unbounded; bounded queues and backpressure come with the queue story.
+the same request id at once are not guarded against each other.
+
+Bounded queues (R5.2): each stream's inbox (messages read and not yet handled) and outbox
+(messages handled and not yet sent on) hold at most inbox_size messages. A full inbox stops
+the reader taking messages off the stream, so gRPC's flow control slows the previous hop
+down; a full outbox stops the handler, which then lets the inbox fill. On a healthy stream
+nothing is dropped: backpressure travels back to the gateway, whose credits keep the
+pipeline below these bounds in normal running (inbox_size is at least the credits,
+config.flow_limits).
+inbox_peak is the deepest any inbox has been. None leaves both queues unbounded. A stream
+that ends discards what its queues hold, as an unbounded one did; if its route changed
+while the outbox was full, the computed message is not sent and the outbound call is
+cancelled, so its end does not wait for the old channel to be released. Its requests fail
+with UNAVAILABLE as for any route change.
 
 Deadlines (R5.4, decision #32): each StepRequest carries budget_ms, the time left on the
 request's deadline when it was sent. A stage turns it into a deadline on its own monotonic
@@ -105,6 +117,18 @@ def budget_ms(deadline: float | None, now: float) -> int:
     return min(MAX_BUDGET_MS, max(1, math.ceil((deadline - now) * 1000)))
 
 
+def _offer(box: queue.Queue, item, give_up) -> bool:
+    """Put item on a bounded queue, waiting while it is full; False if give_up() turned
+    true first. Waiting in short steps lets a full queue never block a stream for good."""
+    while True:
+        try:
+            box.put(item, timeout=POLL_SECONDS)
+            return True
+        except queue.Full:
+            if give_up():
+                return False
+
+
 def _drain(outbox: queue.Queue):
     """Messages for an outbound stream, in the order they were put."""
     while (item := outbox.get()) is not _DONE:
@@ -129,6 +153,7 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         results_address: str | None = None,
         own_epoch: int = 0,
         next_epoch: int = 0,
+        inbox_size: int | None = None,
     ):
         last = worker.stage.last
         if last and results_address is None:
@@ -153,6 +178,9 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         self.store = KVStore(worker.stage.config, layers, worker.new_cache)
         self.stage_index = 0 if worker.stage.first else 1
         self.nacks: queue.Queue = queue.Queue()  # Nacks waiting for the heartbeat stream
+        self.inbox_size = inbox_size or 0  # 0: unbounded
+        self.inbox_peak = 0  # the deepest any stream's inbox has been
+        self._peak_lock = threading.Lock()
         self.expired = 0  # messages dropped because their deadline passed before they ran
         self._expired_lock = threading.Lock()  # streams run on several threads
 
@@ -218,8 +246,9 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
     # ------------------------------------------------------------------ one hop
 
     def Steps(self, request_iterator, context):
-        outbox: queue.Queue = queue.Queue()
-        inbox: queue.Queue = queue.Queue()
+        outbox: queue.Queue = queue.Queue(self.inbox_size)
+        inbox: queue.Queue = queue.Queue(self.inbox_size)
+        ended = threading.Event()  # set when this handler stops taking from the inbox
         moved = False
         # Per stream, so a reopened stream cannot report the same message twice. Only the
         # first stage counts: its outbound hop is the one the gateway cannot see.
@@ -245,11 +274,19 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         def pump():
             try:
                 for request in request_iterator:  # the deadline is set on arrival
-                    inbox.put((request, due(request.budget_ms, time.monotonic())))
+                    item = (request, due(request.budget_ms, time.monotonic()))
+                    if not _offer(inbox, item, ended.is_set):
+                        return
+                    depth = inbox.qsize()
+                    with self._peak_lock:
+                        self.inbox_peak = max(self.inbox_peak, depth)
             except grpc.RpcError:
                 pass  # the previous hop cancelled or dropped; this handler is ending too
             finally:
-                inbox.put(_DONE)
+                _offer(inbox, _DONE, ended.is_set)
+
+        def stuck() -> bool:  # stop waiting on a full outbox: the stream is ending
+            return call.done() or self.channel is not channel
 
         threading.Thread(target=pump, daemon=True).start()
         try:
@@ -271,9 +308,11 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                 if out is not None:  # None: refused with a Nack, nothing to pass on
                     if counters is not None:
                         counters.count(out)
-                    outbox.put(out)
+                    _offer(outbox, out, stuck)
         finally:
-            outbox.put(_DONE)
+            ended.set()
+            if not _offer(outbox, _DONE, stuck):
+                call.cancel()  # the outbound stream must end even with its queue full
             if counters is not None:  # here so that every way out of the loop reports
                 metrics.send_counters(context, counters)
             with self._route_lock:
@@ -423,6 +462,7 @@ def serve(
     own_epoch: int = 0,
     next_epoch: int = 0,
     max_workers: int = 8,
+    inbox_size: int | None = None,
 ) -> tuple[grpc.Server, StageServicer, int]:
     """Start serving a worker on bind (for example '0.0.0.0:50051'; port 0 picks a free
     one). Returns the running server, its servicer and the port it listens on."""
@@ -432,6 +472,7 @@ def serve(
         results_address=results_address,
         own_epoch=own_epoch,
         next_epoch=next_epoch,
+        inbox_size=inbox_size,
     )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers),

@@ -403,7 +403,7 @@ def test_a_request_with_no_stages_registered_writes_a_rejected_line(metered):
 
 
 def test_a_request_over_the_cap_writes_a_rejected_line(metered):
-    run, path = metered(delay1=0.3, max_workers=gateway_module.RESERVED_THREADS + 1)
+    run, path = metered(delay1=0.3, max_workers=gateway_module.RESERVED_THREADS + 1, max_queued=0)
     stream = run.call(max_tokens=3)
     next(stream)
     code, _ = code_of(run.call(max_tokens=1))
@@ -412,6 +412,28 @@ def test_a_request_over_the_cap_writes_a_rejected_line(metered):
     end_run(run)
     outcomes = sorted((r["outcome"], r["code"]) for r in of_type(lines(path), "request"))
     assert outcomes == [("max_tokens", None), ("rejected", "RESOURCE_EXHAUSTED")]
+
+
+def test_a_request_that_leaves_the_admission_queue_writes_one_line(metered):
+    run, path = metered(delay1=0.1, max_workers=gateway_module.RESERVED_THREADS + 1, max_queued=2)
+    first = run.call(max_tokens=12, timeout_ms=20_000)
+    next(first)  # holds the only running slot
+    code, _ = code_of(run.call(max_tokens=2, timeout_ms=200))
+    assert code == grpc.StatusCode.DEADLINE_EXCEEDED
+    queued = run.call(max_tokens=2, timeout_ms=20_000)
+    give_up = time.monotonic() + 2
+    while not run.gateway._waiting and time.monotonic() < give_up:
+        time.sleep(0.01)
+    queued.cancel()
+    while run.gateway._waiting and time.monotonic() < give_up:
+        time.sleep(0.01)
+    assert len(list(first)) == 11
+    end_run(run)
+    assert sorted((r["outcome"], r["code"]) for r in of_type(lines(path), "request")) == [
+        ("cancelled by the client", None),
+        ("max_tokens", None),
+        ("rejected", "DEADLINE_EXCEEDED"),
+    ]
 
 
 # -------------------------------------------------------------- fault injection

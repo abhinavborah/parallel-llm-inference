@@ -66,9 +66,24 @@ concurrency rests on each stage handling its stream one step at a time: requests
 a model call within a stage. One long prefill at a stage delays every other request's next
 step there (head-of-line blocking). Each Generate holds a
 server thread for its life, so serve() caps running requests at max_workers -
-RESERVED_THREADS and refuses the rest with RESOURCE_EXHAUSTED; without the cap, a full pool
-leaves no thread for Results.Push and every running request stalls until its deadline. Also
-not here: recovery and replay (#38, #39), bounded queues (#33).
+RESERVED_THREADS; without the cap, a full pool leaves no thread for Results.Push and every
+running request stalls until its deadline. Also not here: recovery and replay (#38, #39).
+
+Flow control (R5.1, R5.2). Admission: a request that finds every running slot taken waits
+in a first-in, first-out queue of max_queued places; one that finds the queue full is
+refused at once with RESOURCE_EXHAUSTED. A slot that frees goes to the head of the queue.
+Time in the queue counts against the request's deadline, and a request whose deadline
+passes there fails with DEADLINE_EXCEEDED; one whose client goes away leaves the queue. A
+waiting request holds a server thread too, so serve() adds max_queued threads to the pool.
+Credits: a request takes one of `credits` before it sends each step and gives it back when
+the step's result has come (or the request ends). Requests waiting for a credit get one in
+arrival order, and a request giving its credit back waits behind them for its next step.
+Each request has at most one step in the pipeline, and that step is at one stage at a
+time, so at most `credits` steps are at any stage. A request that is waiting for a credit
+when its deadline passes fails with DEADLINE_EXCEEDED. queue_peak and in_flight_peak record
+the deepest the queue has been and the most steps in flight at once. A step whose request
+failed at its deadline can still be at a stage after its credit came back; the stage's
+bounded inbox (pllm.stage_service) is the hard bound there.
 
 Result filter and exactly-once delivery (R4.7, R4.8): a result is accepted only when its
 request is running and its attempt, its step and its epoch all match the request's attempt,
@@ -128,6 +143,7 @@ STAGES = (0, 1)
 # heartbeat stream per stage plus one replaced heartbeat per stage still closing.
 RESERVED_THREADS = 2 + 2 * len(STAGES)
 MAX_RUNNING = 14  # Generate calls at once with the default pool
+MAX_QUEUED = 8  # requests waiting for a running slot; [limits] admission_queue sets it
 
 
 @dataclass
@@ -223,9 +239,13 @@ class Gateway(
         hidden_size: int,
         max_bytes: int,
         max_positions: int | None = None,
+        max_queued: int = MAX_QUEUED,
+        credits: int | None = None,
     ):
         """max_positions is the model's context length: a request whose prompt and
-        max_tokens together exceed it is refused. None leaves it unchecked."""
+        max_tokens together exceed it is refused. None leaves it unchecked. max_queued is
+        the admission queue's size and credits the steps in flight at once (None: no
+        limit beyond the running slots)."""
         self.registry = registry
         self.max_positions = max_positions
         self.tokenizer = tokenizer
@@ -243,6 +263,13 @@ class Gateway(
         self._sessions: dict[int, Session] = {}
         self.max_running: int | None = None  # Generate calls at once; serve() sets it
         self._running = 0
+        self.max_queued = max_queued
+        self._waiting: collections.deque = collections.deque()  # one Event per waiting request
+        self.queue_peak = 0
+        self.credits = credits
+        self._in_flight = 0  # steps sent whose result has not come
+        self.in_flight_peak = 0
+        self._credit_waiting: collections.deque = collections.deque()  # one Event per waiter
         self._lock = threading.Lock()
         # Register and opening a heartbeat stream run one at a time, so a stream cannot
         # pass its epoch check just before a newer registration and then become current.
@@ -286,10 +313,12 @@ class Gateway(
         )
         log.info("request %s ended (%s) after %d tokens", request.rid, how, len(request.tokens))
 
-    def _rejected(self, req, context, arrived: int, prompt_tokens: int | None) -> None:
-        """The line of a request refused before it entered the table."""
+    def _rejected(
+        self, req, context, arrived: int, prompt_tokens: int | None, how: str = "rejected"
+    ) -> None:
+        """The line of a request that ended before it entered the table."""
         self.recorder.request(
-            "rejected",
+            how,
             context.code(),
             rid=None,
             attempt=None,
@@ -558,26 +587,106 @@ class Gateway(
         ids = None
         try:
             ids = self._admit(req, context)
-            with self._lock:
-                full = self.max_running is not None and self._running >= self.max_running
-                if not full:
-                    self._running += 1
-            if full:
-                context.abort(
-                    grpc.StatusCode.RESOURCE_EXHAUSTED,
-                    f"the gateway is running {self.max_running} requests, "
-                    "its limit; try again later",
-                )
+            deadline = time.monotonic() + req.timeout_ms / 1000  # time in the queue counts
+            entered = self._enter(deadline, context)
         except Exception:
             self._rejected(req, context, arrived, len(ids) if ids else None)
             raise
+        if not entered:  # the client went away while the request was queued
+            self._rejected(req, context, arrived, len(ids), "cancelled by the client")
+            return
         try:
-            yield from self._generate(req, ids, context, arrived)
+            yield from self._generate(req, ids, deadline, context, arrived)
         finally:
-            with self._lock:
+            self._leave()
+
+    # ------------------------------------------------------------------ flow control
+
+    def _enter(self, deadline: float, context) -> bool:
+        """Take a running slot, waiting in the admission queue if every slot is taken
+        (R5.1). Refuses at once when the queue is full; False if the client went away."""
+        with self._lock:
+            if self.max_running is None or (self._running < self.max_running and not self._waiting):
+                self._running += 1
+                return True
+            full = len(self._waiting) >= self.max_queued
+            if not full:
+                ticket = threading.Event()  # set when a leaving request hands over its slot
+                self._waiting.append(ticket)
+                self.queue_peak = max(self.queue_peak, len(self._waiting))
+        if full:
+            context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                f"the gateway is running {self.max_running} requests and {self.max_queued} "
+                "more are waiting, its limits; try again later",
+            )
+        while not ticket.wait(POLL_SECONDS):
+            expired = time.monotonic() >= deadline
+            gone = not context.is_active()
+            if expired or gone:
+                with self._lock:
+                    handed = ticket.is_set()  # the slot came just now: pass it on
+                    if not handed:
+                        self._waiting.remove(ticket)
+                if handed:
+                    self._leave()
+                if gone:
+                    return False
+                context.abort(
+                    grpc.StatusCode.DEADLINE_EXCEEDED,
+                    "the request passed its deadline waiting for a running slot",
+                )
+        return True
+
+    def _leave(self) -> None:
+        """Give up a running slot: to the head of the queue if a request waits."""
+        with self._lock:
+            if self._waiting:
+                self._waiting.popleft().set()  # the slot passes on; _running is unchanged
+            else:
                 self._running -= 1
 
-    def _generate(self, req, ids: list[int], context, arrived: int):
+    def _take_credit(self, request: Request, context) -> bool:
+        """Take a credit to send the request's next step (R5.2), waiting first in, first out
+        behind the requests already waiting. False if the client went away; a deadline
+        that passes while waiting fails the request."""
+        with self._lock:
+            if self.credits is None or (
+                self._in_flight < self.credits and not self._credit_waiting
+            ):
+                self._in_flight += 1
+                self.in_flight_peak = max(self.in_flight_peak, self._in_flight)
+                return True
+            ticket = threading.Event()  # set when a returned credit is handed to this request
+            self._credit_waiting.append(ticket)
+        while not ticket.wait(POLL_SECONDS):
+            expired = time.monotonic() >= request.deadline
+            gone = not context.is_active()
+            if expired or gone:
+                with self._lock:
+                    handed = ticket.is_set()  # the credit came just now: pass it on
+                    if not handed:
+                        self._credit_waiting.remove(ticket)
+                if handed:
+                    self._give_credit()
+                if gone:
+                    return False
+                context.abort(
+                    grpc.StatusCode.DEADLINE_EXCEEDED,
+                    f"request {request.rid} passed its deadline waiting for a credit "
+                    f"at step {request.expected_step}",
+                )
+        return True
+
+    def _give_credit(self) -> None:
+        """Give a credit back: to the first waiting request if one waits."""
+        with self._lock:
+            if self._credit_waiting:
+                self._credit_waiting.popleft().set()  # passes on; _in_flight is unchanged
+            else:
+                self._in_flight -= 1
+
+    def _generate(self, req, ids: list[int], deadline: float, context, arrived: int):
         try:
             link = self._stage0(context)
         except Exception:
@@ -586,7 +695,7 @@ class Gateway(
         request = Request(
             rid=uuid.uuid4().hex[:12],
             attempt=1,
-            deadline=time.monotonic() + req.timeout_ms / 1000,
+            deadline=deadline,
             prompt_len=len(ids),
             max_tokens=req.max_tokens,
             arrived_ns=arrived,
@@ -599,6 +708,9 @@ class Gateway(
             unsent: list[int] = []  # tokens whose text is not complete yet
             while True:
                 step = request.expected_step
+                if not self._take_credit(request, context):
+                    how = "cancelled by the client"
+                    return
                 message = protocol_pb2.StepRequest(
                     rid=request.rid,
                     attempt=request.attempt,
@@ -613,7 +725,10 @@ class Gateway(
                 # Before the put, so that a fast result cannot appear to precede its send.
                 self.recorder.hop(metrics.GATEWAY_STAGE0, message)
                 link.outbox.put(message)
-                result = self._wait(request, link, context)
+                try:
+                    result = self._wait(request, link, context)
+                finally:
+                    self._give_credit()  # the result came, or the request is ending
                 if result is None:
                     how = "cancelled by the client"
                     return
@@ -706,14 +821,16 @@ def serve(
     """Serve Control, Frontend and Results on bind (port 0 picks a free one).
 
     Every Generate, heartbeat stream and Results.Push stream holds a thread from one
-    pool. At most max_workers - RESERVED_THREADS requests run at once; more are refused,
-    so the other streams always find a thread.
+    pool. At most max_workers - RESERVED_THREADS requests run at once and gateway.max_queued
+    more wait for a slot, each on a thread of its own; the pool has max_workers +
+    max_queued threads, so the other streams always find one. Any more are refused.
     """
     if max_workers <= RESERVED_THREADS:
         raise ValueError(f"max_workers must be above {RESERVED_THREADS}")
     gateway.max_running = max_workers - RESERVED_THREADS
     server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=max_workers), options=gateway.options
+        futures.ThreadPoolExecutor(max_workers=max_workers + gateway.max_queued),
+        options=gateway.options,
     )
     protocol_pb2_grpc.add_ControlServicer_to_server(gateway, server)
     protocol_pb2_grpc.add_FrontendServicer_to_server(gateway, server)
@@ -787,6 +904,7 @@ def main(argv: list[str] | None = None) -> None:
         expected = expected_model(args.model, args.split_point)
         hidden = ModelConfig.from_file(model_dir / "config.json").hidden_size
         tokenizer = Tokenizer(args.model)
+        limits = config.flow_limits()
         started = {"started": datetime.now(UTC).isoformat(), "script": "gateway"}
         path = args.metrics or runrecord.output_path(started, ".metrics.jsonl")
         recorder = metrics.Recorder(
@@ -811,6 +929,8 @@ def main(argv: list[str] | None = None) -> None:
         hidden,
         config.max_message_bytes(hidden),
         max_positions(model_dir),
+        max_queued=limits.admission_queue,
+        credits=limits.credits,
     )
     gateway.recorder = recorder
     done = stop_event()
