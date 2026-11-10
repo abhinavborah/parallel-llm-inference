@@ -271,9 +271,30 @@ logits equal the single-process reference (tested with small random models).
   reaches the client, so each step of a request is streamed once and in order.
 - When a request ends, for any reason, it leaves the table and a `Free` for it is queued for
   each stage; the stage's heartbeat stream delivers it.
-- Each running request holds one of the gateway's 20 server threads. Six are kept for the
+- Each running request holds one of the gateway's server threads. Six are kept for the
   results stream, registration and the heartbeat streams, so at most 14 requests run at
-  once and a further one is refused with RESOURCE_EXHAUSTED.
+  once.
+- Flow control (R5.1, R5.2), set under `[limits]` in `config/hosts.toml`:
+  - `admission_queue` (8): a request that finds all 14 running slots taken waits in a
+    first-in, first-out queue of this size; one that finds the queue full is refused at
+    once with RESOURCE_EXHAUSTED. Time in the queue counts against the deadline, and a
+    client that goes away leaves the queue. Each waiting request holds a thread too, so
+    the pool is 20 + 8 threads.
+  - `credits` (8): steps in flight in the pipeline at once. A request takes a credit
+    before each step and gives it back when the result comes. Waiting requests get a
+    credit in arrival order, and a request giving one back queues behind them for its
+    next step. A running request has at most one step in the pipeline, so credits bind
+    only below the 14 running slots. While requests run normally this bounds the steps
+    at each stage; a request that fails (a deadline, a refusal, a cancel) gives its
+    credit back while its step may still be at a stage, so there the stage inbox is the
+    hard bound.
+  - `stage_inbox` (16, at least `credits`): messages each stream's inbox, and its queue to
+    the next hop, may hold at a stage. A full inbox stops the stage reading, so gRPC flow
+    control slows the sender; on a healthy stream nothing is dropped. A stream that ends
+    (a route change, a failed next hop) discards what it held, as before.
+  - `Gateway.queue_peak`, `Gateway.in_flight_peak` and each stage's `inbox_peak` record the
+    deepest each has been; `tests/test_backpressure.py` checks them against the bounds
+    under overload.
 - Many requests run at once (R4.5). They share one stream to Stage 0, so the stages see
   their steps interleaved and Stage 0 works on one request while Stage 1 works on another:
   in `tests/test_concurrency.py` each stage sleeps 0.1 s per step instead of computing,
@@ -291,8 +312,7 @@ logits equal the single-process reference (tested with small random models).
   This bounds each request, not Host B's memory: with an even split, one request at the
   cap holds about 180 MiB of Stage 0 cache for SmolLM2 but about 4.4 GiB for Qwen3-0.6B
   (40960 positions), more than Host B has. Admission by Host B's KV budget (R5.3) is #34.
-  One long prefill delays the other requests' next steps at that stage. Bounded queues and
-  credits (R5.2) are #33.
+  One long prefill delays the other requests' next steps at that stage.
 - Text is decoded per token, holding back a token that ends inside a character until the
   next one completes it (up to four tokens), so a `Token` can carry empty text.
 

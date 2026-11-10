@@ -57,12 +57,22 @@ class System:
         delay0=0.0,
         max_positions=None,
         max_workers=gateway.MAX_RUNNING + gateway.RESERVED_THREADS,
+        max_queued=gateway.MAX_QUEUED,
+        credits=None,
+        inbox_size=None,
     ):
         n = ModelConfig.from_file(model_dir / "config.json").num_layers
         limit = max_bytes or config.max_message_bytes(HIDDEN)
         self.registry = Registry("tiny", ExpectedModel(DIGEST, n, k))
         self.gateway = Gateway(
-            self.registry, tokenizer or Words(), eos, HIDDEN, limit, max_positions
+            self.registry,
+            tokenizer or Words(),
+            eos,
+            HIDDEN,
+            limit,
+            max_positions,
+            max_queued=max_queued,
+            credits=credits,
         )
         self.server, port = serve(self.gateway, "127.0.0.1:0", max_workers)
         self.address = f"127.0.0.1:{port}"
@@ -70,11 +80,13 @@ class System:
             StageWorker(WorkerConfig(model_dir, k, n, delay1)),
             "127.0.0.1:0",
             results_address=self.address,
+            inbox_size=inbox_size,
         )
         self.server0, self.servicer0, port0 = serve_stage(
             StageWorker(WorkerConfig(model_dir, 0, k, delay0)),
             "127.0.0.1:0",
             next_address=f"127.0.0.1:{port1}",
+            inbox_size=inbox_size,
         )
         self.ports = {0: port0, 1: port1}
         self.layers = {0: (0, k), 1: (k, n)}
@@ -494,7 +506,8 @@ def outcomes(run, clients, **kwargs):
 
 
 def test_a_request_over_the_running_limit_is_refused_and_the_others_finish(system):
-    run = system(delay1=0.3, max_workers=gateway.RESERVED_THREADS + 3)  # 3 requests at once
+    # 3 requests at once and no admission queue
+    run = system(delay1=0.3, max_workers=gateway.RESERVED_THREADS + 3, max_queued=0)
     assert run.gateway.max_running == 3
     streams = [run.call(max_tokens=3, timeout_ms=20_000) for _ in range(3)]
     firsts = [next(stream) for stream in streams]
@@ -512,7 +525,7 @@ def test_a_request_over_the_running_limit_is_refused_and_the_others_finish(syste
 def test_a_full_thread_pool_refuses_requests_instead_of_stalling_them(system):
     """The reported fault: as many clients as server threads used to leave none for the
     results stream, and every request then failed at its deadline."""
-    run = system(delay1=0.2, max_workers=gateway.RESERVED_THREADS + 3)
+    run = system(delay1=0.2, max_workers=gateway.RESERVED_THREADS + 3, max_queued=0)
     out = outcomes(run, 5, max_tokens=3, timeout_ms=10_000)
     assert grpc.StatusCode.DEADLINE_EXCEEDED not in out
     assert out.count(3) >= 3

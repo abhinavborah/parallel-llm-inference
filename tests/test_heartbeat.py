@@ -536,6 +536,7 @@ def test_the_default_pool_keeps_threads_for_both_heartbeats(beating):
 def test_requests_past_the_cap_are_refused_so_heartbeats_keep_a_thread(beating):
     run = beating(delay1=0.5)
     run.gateway.max_running = 1
+    run.gateway.max_queued = 0  # refused at once, not queued
     first = run.call(max_tokens=3)
     next(first)  # holds the only slot
     code, details = code_of(run.call(max_tokens=1))
