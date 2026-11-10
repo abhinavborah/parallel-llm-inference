@@ -14,6 +14,7 @@ PROTO_DIR = Path(protocol_pb2.__file__).parent
 SCHEMA_PINS = {
     1: "5c0c7386d0c6fdc28a7967e30c683138d2f6124aa905f9c6e467e5ac0641dd2f",
     2: "dac7535c5753a470a65725e0d1dbdb14993622da7ee8ab8496ac28efd0e83a5c",
+    3: "dad5fccdcab81130c7a97ac931b2672cc179af631f74fd1b98b6f43a76b904ec",
 }
 
 
@@ -60,7 +61,9 @@ MESSAGES = [
         addr="192.168.1.20:50051",
     ),
     protocol_pb2.RegisterResp(epoch=2**40),
-    protocol_pb2.Beat(stage=1, epoch=3, inbox_depth=4, cached_requests=5),
+    protocol_pb2.Beat(
+        stage=1, epoch=3, inbox_depth=4, cached_requests=5, busy_ns=2**40 + 7, steps=9
+    ),
     protocol_pb2.Nack(stage=1, epoch=3, rid="r1", attempt=2, step=9, reason="GAP"),
     protocol_pb2.StageMsg(beat=protocol_pb2.Beat(stage=1, epoch=3)),
     protocol_pb2.StageMsg(nack=protocol_pb2.Nack(rid="r1", reason="WRONG_EPOCH")),

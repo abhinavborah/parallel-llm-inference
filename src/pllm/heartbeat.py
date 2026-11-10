@@ -2,9 +2,11 @@
 
 After a stage registers it opens one bidirectional stream to the gateway and keeps it:
 
-- Every interval seconds it sends a Beat with its stage, epoch, inbox depth and cached
-  request count. Each Nack the stage raises is sent as soon as it is on the nacks queue,
-  between beats, so the gateway learns of a refusal without waiting for a timeout.
+- Every interval seconds it sends a Beat with its stage, epoch, inbox depth, cached
+  request count, and running totals of the time it has spent handling steps and the steps
+  it has handled (durations on its own clock; the gateway stamps each Beat with its
+  own). Each Nack the stage raises is sent as soon as it is on the nacks queue, between
+  beats, so the gateway learns of a refusal without waiting for a timeout.
 - From the gateway it receives Free messages, which release a request's cache on this
   stage, and route updates, which point the first stage at a restarted second stage.
 
@@ -42,12 +44,15 @@ POLL_SECONDS = 0.05  # how often the sender checks that it should stop
 
 def beat(servicer) -> protocol_pb2.StageMsg:
     """The Beat for a stage servicer's current state."""
+    busy_ns, steps = servicer.busy
     return protocol_pb2.StageMsg(
         beat=protocol_pb2.Beat(
             stage=servicer.stage_index,
             epoch=servicer.own_epoch,
             inbox_depth=servicer.inbox_depth,
             cached_requests=servicer.cached_requests,
+            busy_ns=busy_ns,
+            steps=steps,
         )
     )
 

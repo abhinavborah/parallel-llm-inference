@@ -330,6 +330,7 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 |---|---|---|
 | `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `argv` |
 | `hop` | Each message the gateway sends or receives | `t_ns`, `hop`, `msg`, `phase`, `rid`, `attempt`, `step`, `bytes`, `payload_bytes`, `positions`, `accepted` |
+| `beat` | Each stage heartbeat (every 0.5 s) | `t_ns`, `stage`, `epoch`, `busy_ns`, `steps` |
 | `request` | Each request's end | `t_ns`, `rid`, `attempt`, `outcome`, `code`, `prompt_tokens`, `max_tokens`, `output_tokens`, `arrived_ns`, `first_token_ns`, `last_token_ns` |
 | `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
 | `run_end` | Run end | `t_ns`, `links`, `links_unreported`, `stage0_stage1_complete`, `write_errors` |
@@ -341,6 +342,12 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 - `outcome` is `end of sequence`, `max_tokens`, `cancelled by the client`, `failed` or
   `rejected`, and `code` is the gRPC status the gateway set. A send time is when the message
   was queued for its stream, not when it left the laptop.
+- `busy_ns` and `steps` in a `beat` are the stage's running totals since that process
+  started: time spent handling steps, including a step still running, measured on the
+  stage's own clock, and the steps handled, not counting those refused with a Nack. They
+  are durations, never compared with a gateway time; `t_ns` is when the beat arrived. A
+  restarted stage has a new `epoch` and counts from zero. Two streams working at once on
+  one stage both count, so `busy_ns` can grow faster than the clock.
 - Stage 0 to Stage 1 never passes the gateway, so it has byte totals but no `hop` lines and
   no latency of its own. Stage 0 counts each stream and returns the counts, with no
   timestamp, on that stream's gRPC trailing metadata.
@@ -360,10 +367,11 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 ## Heartbeat
 
 A serving worker registers, then keeps one `Control.Heartbeat` stream to the gateway
-(`pllm.heartbeat`). Every 0.5 s it sends a Beat with its stage, epoch, inbox depth and
-cached request count, and it sends each Nack as soon as it is raised, between beats. The
-gateway keeps the latest Beat of each stage with its arrival time on the gateway's own
-clock (`Gateway.beats()`), and the Nacks (`Gateway.nacks`, the last 1024, and
+(`pllm.heartbeat`). Every 0.5 s it sends a Beat with its stage, epoch, inbox depth, cached
+request count and its busy time and step totals, and it sends each Nack as soon as it is
+raised, between beats. The gateway keeps the latest Beat of each stage with its arrival
+time on the gateway's own clock (`Gateway.beats()`), writes each one to the metrics file,
+and keeps the Nacks (`Gateway.nacks`, the last 1024, and
 `nack_count`). It sends back:
 
 - the `Free` messages queued for that stage;

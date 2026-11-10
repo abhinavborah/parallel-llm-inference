@@ -444,6 +444,7 @@ def test_a_stream_from_an_old_epoch_is_refused(beating):
 
     class Old:
         stage_index, own_epoch, inbox_depth, cached_requests = 1, old_epoch, 0, 0
+        busy = (0, 0)
         nacks = queue.Queue()
 
     heart = Heartbeat(run.address, Old(), interval=FAST, retry=FAST)

@@ -172,6 +172,24 @@ class Recorder:
                 }
             )
 
+    def beat(self, stage: int, beat) -> None:
+        """One stage heartbeat: the stage's running busy and step totals (R7.6), stamped
+        with this clock when it arrives. The totals are durations on the stage's own clock,
+        never compared with a time here."""
+        if self._file is None:
+            return
+        with self._lock:
+            self._write(
+                {
+                    "type": "beat",
+                    "t_ns": self.clock(),
+                    "stage": stage,
+                    "epoch": beat.epoch,
+                    "busy_ns": beat.busy_ns,
+                    "steps": beat.steps,
+                }
+            )
+
     def request(self, outcome: str, code, **fields) -> None:
         """A request's end. code is the gRPC status the gateway set, or None if it set none."""
         with self._lock:

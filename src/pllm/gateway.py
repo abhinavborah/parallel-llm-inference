@@ -376,12 +376,17 @@ class Gateway(
 
     def _record(self, session: Session, message: protocol_pb2.StageMsg) -> None:
         kind = message.WhichOneof("msg")
+        if kind == "beat":
+            with self._lock:
+                if self._sessions.get(session.stage) is not session:
+                    return  # a stream that has been replaced
+                self._beats[session.stage] = (message.beat, time.monotonic())
+            # outside the lock: the recorder takes its own
+            self.recorder.beat(session.stage, message.beat)
+            return
         with self._lock:
             if self._sessions.get(session.stage) is not session:
                 return  # a stream that has been replaced
-            if kind == "beat":
-                self._beats[session.stage] = (message.beat, time.monotonic())
-                return
             if kind != "nack":
                 return
             self.nacks.append(message.nack)
