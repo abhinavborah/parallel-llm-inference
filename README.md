@@ -316,6 +316,47 @@ logits equal the single-process reference (tested with small random models).
 - Text is decoded per token, holding back a token that ends inside a character until the
   next one completes it (up to four tokens), so a `Token` can carry empty text.
 
+## Metrics
+
+The gateway always writes one JSON-lines file per run, to `runs/<utc>-gateway.metrics.jsonl`,
+or to the new file named by `--metrics PATH`. One gateway process is one run. A program that
+hosts `Gateway` itself ends a run with `close()` and `recorder.finish()`, then can assign a
+new `recorder`. Prompt text is never logged.
+
+Every timestamp is a `*_ns` integer from one `time.perf_counter_ns` at the gateway, so no
+time from another machine is subtracted. `wall_time` on the first line is a label only.
+
+| `type` | When | Fields |
+|---|---|---|
+| `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `argv` |
+| `hop` | Each message the gateway sends or receives | `t_ns`, `hop`, `msg`, `phase`, `rid`, `attempt`, `step`, `bytes`, `payload_bytes`, `positions`, `accepted` |
+| `request` | Each request's end | `t_ns`, `rid`, `attempt`, `outcome`, `code`, `prompt_tokens`, `max_tokens`, `output_tokens`, `arrived_ns`, `first_token_ns`, `last_token_ns` |
+| `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
+| `run_end` | Run end | `t_ns`, `links`, `links_unreported`, `stage0_stage1_complete`, `write_errors` |
+
+- Hops are `gateway_stage0`, `stage0_stage1` and `stage1_gateway`. `phase` is `replay` for a
+  replayed step, otherwise `prefill` at step 0 and `decode` after it.
+- `bytes` is the protobuf serialized size, without gRPC and HTTP/2 framing. `payload_bytes`
+  is the raw tensor and `positions` the tokens a request message carries.
+- `outcome` is `end of sequence`, `max_tokens`, `cancelled by the client`, `failed` or
+  `rejected`, and `code` is the gRPC status the gateway set. A send time is when the message
+  was queued for its stream, not when it left the laptop.
+- Stage 0 to Stage 1 never passes the gateway, so it has byte totals but no `hop` lines and
+  no latency of its own. Stage 0 counts each stream and returns the counts, with no
+  timestamp, on that stream's gRPC trailing metadata.
+- `stage0_stage1_complete` is false when a stream ended with no valid report, for example
+  because Stage 0 died, or was stopped at the same time as the gateway. Its totals are then
+  a lower bound. For complete totals stop the gateway first, while the stages are up.
+- The gateway runs no model and measures no round-trip time, so the `run` line has no thread
+  count and no `rtt_ms`. The launcher's run record has the thread count, and the network
+  check has the round-trip time.
+- `accepted` is the verdict when a result arrives. A result accepted then can still be
+  dropped when its request takes it from the queue, for example after a new Stage 1
+  registers. Such a drop is counted in `Gateway.discards`, not in this file.
+- A message queued just as its stream ended is counted although it was not sent. A file
+  with no `run_end` is from a run that did not stop cleanly. Send SIGINT, or CTRL_BREAK on
+  Windows, not a forced kill.
+
 ## Heartbeat
 
 A serving worker registers, then keeps one `Control.Heartbeat` stream to the gateway
