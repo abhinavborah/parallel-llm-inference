@@ -268,8 +268,10 @@ logits equal the single-process reference (tested with small random models).
     client that goes away leaves the queue. Each waiting request holds a thread too, so
     the pool is 20 + 8 threads.
   - `credits` (8): steps in flight in the pipeline at once. A request takes a credit
-    before each step and gives it back when the result comes. A running request has at
-    most one step in the pipeline, so credits bind only below the 14 running slots. While
+    before each step and gives it back when the result comes. Waiting requests get a
+    credit in arrival order, and a request giving one back queues behind them for its
+    next step. A running request has at most one step in the pipeline, so credits bind
+    only below the 14 running slots. While
     requests run normally this bounds the steps at each stage; a request that fails (a
     deadline, a refusal, a cancel) gives its credit back while its step may still be at a
     stage, so there the stage inbox is the hard bound.

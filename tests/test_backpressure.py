@@ -6,6 +6,7 @@ request run alone is on one host, fp32, batch 1.
 
 import threading
 import time
+import types
 
 import grpc
 import pytest
@@ -182,6 +183,61 @@ def test_a_request_whose_deadline_passes_waiting_for_a_credit_fails(system):
     assert err.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
     assert "credit" in err.value.details()
     assert run.gateway.in_flight_peak == 1 and run.gateway._in_flight == 0
+
+
+class Aborted(Exception):
+    pass
+
+
+class FakeContext:
+    def __init__(self, on_check=None):
+        self.on_check = on_check  # runs when the waiter checks its client
+
+    def is_active(self):
+        if self.on_check is not None:
+            self.on_check()
+            self.on_check = None
+            return False
+        return True
+
+    def abort(self, code, details):
+        raise Aborted(code)
+
+
+def ask(gw, rid, seconds, ctx=None):
+    req = types.SimpleNamespace(rid=rid, expected_step=0, deadline=time.monotonic() + seconds)
+    return gw._take_credit(req, ctx or FakeContext())
+
+
+def test_credits_go_to_waiting_requests_in_arrival_order(system):
+    """Returned credits go to the oldest waiter, and a request that gives its credit back
+    and asks again for its next step waits behind the requests already waiting."""
+    gw = system(credits=1).gateway
+    assert ask(gw, "a", 5)
+    got = []
+    for waiting, rid in enumerate(("b", "c"), start=1):
+        threading.Thread(target=lambda rid=rid: got.append((rid, ask(gw, rid, 5)))).start()
+        wait_for(lambda n=waiting: len(gw._credit_waiting) == n, f"{rid} to wait")
+    gw._give_credit()
+    wait_for(lambda: got == [("b", True)], "the credit to go to b, the oldest waiter")
+    assert len(gw._credit_waiting) == 1
+    with pytest.raises(Aborted):
+        ask(gw, "a", 0.2)  # c waits before a, and the credit is b's
+    gw._give_credit()
+    wait_for(lambda: got == [("b", True), ("c", True)], "the credit to go to c")
+    assert gw._in_flight == 1 and not gw._credit_waiting
+    gw._give_credit()
+    assert gw._in_flight == 0
+
+
+def test_a_credit_handed_to_a_leaving_request_is_passed_on(system):
+    """A credit handed over just as the waiting request's client goes away is given back,
+    not lost."""
+    gw = system(credits=1).gateway
+    assert ask(gw, "a", 5)
+    assert not ask(gw, "b", 5, FakeContext(on_check=gw._give_credit))
+    assert gw._in_flight == 0 and not gw._credit_waiting
+    assert ask(gw, "c", 0.2)
 
 
 # -------------------------------------------------------------- stage inboxes

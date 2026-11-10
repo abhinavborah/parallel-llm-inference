@@ -67,13 +67,14 @@ Time in the queue counts against the request's deadline, and a request whose dea
 passes there fails with DEADLINE_EXCEEDED; one whose client goes away leaves the queue. A
 waiting request holds a server thread too, so serve() adds max_queued threads to the pool.
 Credits: a request takes one of `credits` before it sends each step and gives it back when
-the step's result has come (or the request ends). Each request has at most one step in the
-pipeline, and that step is at one stage at a time, so at most `credits` steps are at any
-stage. A request that is waiting for a credit when its deadline passes fails with
-DEADLINE_EXCEEDED. queue_peak and in_flight_peak record the deepest the queue has been and
-the most steps in flight at once. A step whose request failed at its deadline can still be
-at a stage after its credit came back; the stage's bounded inbox (pllm.stage_service) is the
-hard bound there.
+the step's result has come (or the request ends). Requests waiting for a credit get one in
+arrival order, and a request giving its credit back waits behind them for its next step.
+Each request has at most one step in the pipeline, and that step is at one stage at a
+time, so at most `credits` steps are at any stage. A request that is waiting for a credit
+when its deadline passes fails with DEADLINE_EXCEEDED. queue_peak and in_flight_peak record
+the deepest the queue has been and the most steps in flight at once. A step whose request
+failed at its deadline can still be at a stage after its credit came back; the stage's
+bounded inbox (pllm.stage_service) is the hard bound there.
 
 Result filter and exactly-once delivery (R4.7, R4.8): a result is accepted only when its
 request is running and its attempt, its step and its epoch all match the request's attempt,
@@ -234,8 +235,8 @@ class Gateway(
         self.credits = credits
         self._in_flight = 0  # steps sent whose result has not come
         self.in_flight_peak = 0
+        self._credit_waiting: collections.deque = collections.deque()  # one Event per waiter
         self._lock = threading.Lock()
-        self._credit_free = threading.Condition(self._lock)
         # Register and opening a heartbeat stream run one at a time, so a stream cannot
         # pass its epoch check just before a newer registration and then become current.
         self._control = threading.Lock()
@@ -553,28 +554,44 @@ class Gateway(
                 self._running -= 1
 
     def _take_credit(self, request: Request, context) -> bool:
-        """Wait for a credit to send the request's next step (R5.2). False if the client
-        went away; a deadline that passes while waiting fails the request."""
-        with self._credit_free:
-            while self.credits is not None and self._in_flight >= self.credits:
-                if not context.is_active():
+        """Take a credit to send the request's next step (R5.2), waiting first in, first out
+        behind the requests already waiting. False if the client went away; a deadline
+        that passes while waiting fails the request."""
+        with self._lock:
+            if self.credits is None or (
+                self._in_flight < self.credits and not self._credit_waiting
+            ):
+                self._in_flight += 1
+                self.in_flight_peak = max(self.in_flight_peak, self._in_flight)
+                return True
+            ticket = threading.Event()  # set when a returned credit is handed to this request
+            self._credit_waiting.append(ticket)
+        while not ticket.wait(POLL_SECONDS):
+            expired = time.monotonic() >= request.deadline
+            gone = not context.is_active()
+            if expired or gone:
+                with self._lock:
+                    handed = ticket.is_set()  # the credit came just now: pass it on
+                    if not handed:
+                        self._credit_waiting.remove(ticket)
+                if handed:
+                    self._give_credit()
+                if gone:
                     return False
-                left = request.deadline - time.monotonic()
-                if left <= 0:
-                    context.abort(
-                        grpc.StatusCode.DEADLINE_EXCEEDED,
-                        f"request {request.rid} passed its deadline waiting for a credit "
-                        f"at step {request.expected_step}",
-                    )
-                self._credit_free.wait(min(left, POLL_SECONDS))
-            self._in_flight += 1
-            self.in_flight_peak = max(self.in_flight_peak, self._in_flight)
+                context.abort(
+                    grpc.StatusCode.DEADLINE_EXCEEDED,
+                    f"request {request.rid} passed its deadline waiting for a credit "
+                    f"at step {request.expected_step}",
+                )
         return True
 
     def _give_credit(self) -> None:
-        with self._credit_free:
-            self._in_flight -= 1
-            self._credit_free.notify_all()  # a waiter that has gone must not swallow it
+        """Give a credit back: to the first waiting request if one waits."""
+        with self._lock:
+            if self._credit_waiting:
+                self._credit_waiting.popleft().set()  # passes on; _in_flight is unchanged
+            else:
+                self._in_flight -= 1
 
     def _generate(self, req, ids: list[int], deadline: float, context):
         link = self._stage0(context)
