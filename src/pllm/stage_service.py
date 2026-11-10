@@ -47,22 +47,52 @@ chain (as in tests) sends; so a stage that has not registered yet accepts any me
 both epochs at 0. A step that fails frees its cache without remembering the attempt
 (free_cache), so a late step of an older attempt can start that request again from
 position 0; the gateway has already failed the request by then. Two streams that carry
-the same request id at once are not guarded against each other. The outbound queue is
-unbounded; bounded queues and backpressure come with the queue story.
+the same request id at once are not guarded against each other.
+
+Bounded queues (R5.2): each stream's inbox (messages read and not yet handled) and outbox
+(messages handled and not yet sent on) hold at most inbox_size messages. A full inbox stops
+the reader taking messages off the stream, so gRPC's flow control slows the previous hop
+down; a full outbox stops the handler, which then lets the inbox fill. On a healthy stream
+nothing is dropped: backpressure travels back to the gateway, whose credits keep the
+pipeline below these bounds in normal running (inbox_size is at least the credits,
+config.flow_limits).
+inbox_peak is the deepest any inbox has been. None leaves both queues unbounded. A stream
+that ends discards what its queues hold, as an unbounded one did; if its route changed
+while the outbox was full, the computed message is not sent and the outbound call is
+cancelled, so its end does not wait for the old channel to be released. Its requests fail
+with UNAVAILABLE as for any route change.
+
+Deadlines (R5.4, decision #32): each StepRequest carries budget_ms, the time left on the
+request's deadline when it was sent. A stage turns it into a deadline on its own monotonic
+clock when the message arrives, so no clock is compared across machines and a stepped wall
+clock changes nothing. A message still waiting when that deadline passes is dropped before
+anything is cached or computed: no Nack, nothing forwarded, counted in expired. This is
+safe because the budget is measured at send, so a stage's deadline falls after the
+gateway's by the time the message spent in transit; by then the gateway has failed the
+request (with DEADLINE_EXCEEDED, on its own clock) and its Free follows. A stage that
+stalls thus skips the steps it had already read that expired meanwhile instead of computing
+them. A message still in transit (including in a suspended stage's socket buffer) gets its
+deadline only when read, so it can still run late; its result is dropped at the gateway and
+the Free makes the stage refuse the request's later steps. The first
+stage forwards the time left on its deadline as the next hop's budget_ms, at least 1. A
+budget of 0 means no deadline (a hand-built message, as in tests). Only the gateway decides
+that a request has failed.
 
 Chain over a single host or two: every address comes from the caller, which reads it from
 the hosts file. Nothing here depends on the operating system (R3.15).
 """
 
 import logging
+import math
 import queue
 import threading
+import time
 from concurrent import futures
 
 import grpc
 import torch
 
-from pllm import wire
+from pllm import metrics, wire
 from pllm.kvstore import Gap, KVStore, Stale
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
 from pllm.worker import StageWorker
@@ -71,6 +101,32 @@ log = logging.getLogger("pllm.stage_service")
 
 _DONE = object()  # ends an outbound stream
 POLL_SECONDS = 0.05  # how often an idle handler checks that the next hop is still up
+MAX_BUDGET_MS = 2**32 - 1  # budget_ms is a uint32
+
+
+def due(budget_ms: int, now: float) -> float | None:
+    """The local monotonic deadline for a message that arrived at now, or None for none."""
+    return now + budget_ms / 1000 if budget_ms else None
+
+
+def budget_ms(deadline: float | None, now: float) -> int:
+    """The budget_ms to send for a deadline on this process's monotonic clock: the time
+    left, rounded up, and at least 1 so that it never reads as no deadline; 0 for none."""
+    if deadline is None:
+        return 0
+    return min(MAX_BUDGET_MS, max(1, math.ceil((deadline - now) * 1000)))
+
+
+def _offer(box: queue.Queue, item, give_up) -> bool:
+    """Put item on a bounded queue, waiting while it is full; False if give_up() turned
+    true first. Waiting in short steps lets a full queue never block a stream for good."""
+    while True:
+        try:
+            box.put(item, timeout=POLL_SECONDS)
+            return True
+        except queue.Full:
+            if give_up():
+                return False
 
 
 def _drain(outbox: queue.Queue):
@@ -97,6 +153,7 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         results_address: str | None = None,
         own_epoch: int = 0,
         next_epoch: int = 0,
+        inbox_size: int | None = None,
     ):
         last = worker.stage.last
         if last and results_address is None:
@@ -121,6 +178,11 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         self.store = KVStore(worker.stage.config, layers, worker.new_cache)
         self.stage_index = 0 if worker.stage.first else 1
         self.nacks: queue.Queue = queue.Queue()  # Nacks waiting for the heartbeat stream
+        self.inbox_size = inbox_size or 0  # 0: unbounded
+        self.inbox_peak = 0  # the deepest any stream's inbox has been
+        self._peak_lock = threading.Lock()
+        self.expired = 0  # messages dropped because their deadline passed before they ran
+        self._expired_lock = threading.Lock()  # streams run on several threads
 
     def close(self) -> None:
         with self._route_lock:
@@ -184,9 +246,13 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
     # ------------------------------------------------------------------ one hop
 
     def Steps(self, request_iterator, context):
-        outbox: queue.Queue = queue.Queue()
-        inbox: queue.Queue = queue.Queue()
+        outbox: queue.Queue = queue.Queue(self.inbox_size)
+        inbox: queue.Queue = queue.Queue(self.inbox_size)
+        ended = threading.Event()  # set when this handler stops taking from the inbox
         moved = False
+        # Per stream, so a reopened stream cannot report the same message twice. Only the
+        # first stage counts: its outbound hop is the one the gateway cannot see.
+        counters = None if self.last else metrics.Counters()
         with self._route_lock:  # the route this stream keeps for its life
             channel, next_epoch = self.channel, self.next_epoch
             self._inboxes.add(inbox)
@@ -198,6 +264,8 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         except ValueError:  # the channel was closed by a route update a moment ago
             with self._route_lock:
                 self._inboxes.discard(inbox)
+            if counters is not None:
+                metrics.send_counters(context, counters)
             context.abort(grpc.StatusCode.UNAVAILABLE, "the next hop moved; send again")
         # A reader thread feeds the inbox, so this loop can notice a failed next hop while
         # the previous hop holds its stream open and waits (it would otherwise block in
@@ -205,12 +273,20 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
 
         def pump():
             try:
-                for request in request_iterator:
-                    inbox.put(request)
+                for request in request_iterator:  # the deadline is set on arrival
+                    item = (request, due(request.budget_ms, time.monotonic()))
+                    if not _offer(inbox, item, ended.is_set):
+                        return
+                    depth = inbox.qsize()
+                    with self._peak_lock:
+                        self.inbox_peak = max(self.inbox_peak, depth)
             except grpc.RpcError:
                 pass  # the previous hop cancelled or dropped; this handler is ending too
             finally:
-                inbox.put(_DONE)
+                _offer(inbox, _DONE, ended.is_set)
+
+        def stuck() -> bool:  # stop waiting on a full outbox: the stream is ending
+            return call.done() or self.channel is not channel
 
         threading.Thread(target=pump, daemon=True).start()
         try:
@@ -224,11 +300,21 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                     continue
                 if request is _DONE:
                     break
-                out = self._handle(request, context, next_epoch)
+                request, deadline = request
+                if deadline is not None and time.monotonic() >= deadline:
+                    self._expire(request)
+                    continue
+                out = self._handle(request, context, next_epoch, deadline)
                 if out is not None:  # None: refused with a Nack, nothing to pass on
-                    outbox.put(out)
+                    if counters is not None:
+                        counters.count(out)
+                    _offer(outbox, out, stuck)
         finally:
-            outbox.put(_DONE)
+            ended.set()
+            if not _offer(outbox, _DONE, stuck):
+                call.cancel()  # the outbound stream must end even with its queue full
+            if counters is not None:  # here so that every way out of the loop reports
+                metrics.send_counters(context, counters)
             with self._route_lock:
                 self._inboxes.discard(inbox)
         if moved:
@@ -244,6 +330,16 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                 f"next hop failed: {err.code().name}: {err.details()}",
             )
         return protocol_pb2.Empty()
+
+    def _expire(self, request: protocol_pb2.StepRequest) -> None:
+        with self._expired_lock:
+            self.expired += 1
+        log.warning(
+            "dropped %r attempt %d step %d: its deadline passed before it ran",
+            request.rid,
+            request.attempt,
+            request.step,
+        )
 
     def _nack(self, request: protocol_pb2.StepRequest, reason: str) -> None:
         self.nacks.put(
@@ -270,7 +366,13 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
             return "BAD_SENDER"
         return None
 
-    def _handle(self, request: protocol_pb2.StepRequest, context, next_epoch: int):
+    def _handle(
+        self,
+        request: protocol_pb2.StepRequest,
+        context,
+        next_epoch: int,
+        deadline: float | None = None,
+    ):
         reason = self._fenced(request)
         if reason is not None:
             log.warning(
@@ -330,8 +432,8 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
             target_epoch=next_epoch,
             sender_epoch=self.own_epoch,
             replay=request.replay,
-            deadline_unix_ms=request.deadline_unix_ms,
             activations=wire.tensor_to_proto(out),
+            budget_ms=budget_ms(deadline, time.monotonic()),
         )
 
     def _inputs(self, request, context) -> torch.Tensor:
@@ -360,6 +462,7 @@ def serve(
     own_epoch: int = 0,
     next_epoch: int = 0,
     max_workers: int = 8,
+    inbox_size: int | None = None,
 ) -> tuple[grpc.Server, StageServicer, int]:
     """Start serving a worker on bind (for example '0.0.0.0:50051'; port 0 picks a free
     one). Returns the running server, its servicer and the port it listens on."""
@@ -369,6 +472,7 @@ def serve(
         results_address=results_address,
         own_epoch=own_epoch,
         next_epoch=next_epoch,
+        inbox_size=inbox_size,
     )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers),

@@ -111,7 +111,7 @@ class TokenIds(_message.Message):
     def __init__(self, ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class StepRequest(_message.Message):
-    __slots__ = ("rid", "attempt", "step", "start_pos", "length", "target_epoch", "sender_epoch", "replay", "deadline_unix_ms", "tokens", "activations")
+    __slots__ = ("rid", "attempt", "step", "start_pos", "length", "target_epoch", "sender_epoch", "replay", "tokens", "activations", "budget_ms")
     RID_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_FIELD_NUMBER: _ClassVar[int]
     STEP_FIELD_NUMBER: _ClassVar[int]
@@ -120,9 +120,9 @@ class StepRequest(_message.Message):
     TARGET_EPOCH_FIELD_NUMBER: _ClassVar[int]
     SENDER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     REPLAY_FIELD_NUMBER: _ClassVar[int]
-    DEADLINE_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
     TOKENS_FIELD_NUMBER: _ClassVar[int]
     ACTIVATIONS_FIELD_NUMBER: _ClassVar[int]
+    BUDGET_MS_FIELD_NUMBER: _ClassVar[int]
     rid: str
     attempt: int
     step: int
@@ -131,10 +131,10 @@ class StepRequest(_message.Message):
     target_epoch: int
     sender_epoch: int
     replay: bool
-    deadline_unix_ms: int
     tokens: TokenIds
     activations: Tensor
-    def __init__(self, rid: _Optional[str] = ..., attempt: _Optional[int] = ..., step: _Optional[int] = ..., start_pos: _Optional[int] = ..., length: _Optional[int] = ..., target_epoch: _Optional[int] = ..., sender_epoch: _Optional[int] = ..., replay: _Optional[bool] = ..., deadline_unix_ms: _Optional[int] = ..., tokens: _Optional[_Union[TokenIds, _Mapping]] = ..., activations: _Optional[_Union[Tensor, _Mapping]] = ...) -> None: ...
+    budget_ms: int
+    def __init__(self, rid: _Optional[str] = ..., attempt: _Optional[int] = ..., step: _Optional[int] = ..., start_pos: _Optional[int] = ..., length: _Optional[int] = ..., target_epoch: _Optional[int] = ..., sender_epoch: _Optional[int] = ..., replay: _Optional[bool] = ..., tokens: _Optional[_Union[TokenIds, _Mapping]] = ..., activations: _Optional[_Union[Tensor, _Mapping]] = ..., budget_ms: _Optional[int] = ...) -> None: ...
 
 class StepResult(_message.Message):
     __slots__ = ("rid", "attempt", "step", "epoch", "token", "top_logit")

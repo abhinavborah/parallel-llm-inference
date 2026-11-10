@@ -117,6 +117,33 @@ def max_message_bytes(hidden_size: int, path: str | Path | None = None) -> int:
     return values[0] * values[1] * hidden_size * 4 + FRAMING_MARGIN
 
 
+@dataclass(frozen=True)
+class FlowLimits:
+    admission_queue: int  # requests waiting for a running slot at the gateway
+    credits: int  # steps in flight in the pipeline at once
+    stage_inbox: int  # messages waiting at a stage
+
+
+def flow_limits(path: str | Path | None = None) -> FlowLimits:
+    """The flow-control bounds from [limits] (R5.1, R5.2). Read from the committed file, like
+    the receive limit, so the gateway and both stages agree. stage_inbox must be at least
+    credits: a stage then never fills its inbox while the gateway keeps to its credits."""
+    path = Path(path) if path is not None else DEFAULT_PATH
+    with open(path, "rb") as f:
+        limits = tomllib.load(f).get("limits", {})
+    values = {}
+    for key, least in (("admission_queue", 0), ("credits", 1), ("stage_inbox", 1)):
+        value = limits.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < least:
+            raise ValueError(
+                f"{path}: [limits] needs a whole number of at least {least} for {key!r}"
+            )
+        values[key] = value
+    if values["stage_inbox"] < values["credits"]:
+        raise ValueError(f"{path}: [limits] stage_inbox must be at least credits")
+    return FlowLimits(**values)
+
+
 def _endpoint(data: dict, role: str, path: Path) -> Endpoint:
     section = data.get(role)
     if not isinstance(section, dict):

@@ -231,6 +231,7 @@ def main(argv: list[str] | None = None) -> None:
             start, end = stage_layers(model_dir, args.model, args.stage)
         StepDelay(args.step_delay)  # rejects a negative value
         hosts = config.load() if args.serve else None
+        limits = config.flow_limits() if args.serve else None
     except (ValueError, OSError) as err:
         parser.error(str(err))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -247,6 +248,7 @@ def main(argv: list[str] | None = None) -> None:
         f"0.0.0.0:{getattr(hosts, f'stage{args.stage}').port}",
         next_address=hosts.stage1.address if args.stage == 0 else None,
         results_address=hosts.gateway.address if args.stage == 1 else None,
+        inbox_size=limits.stage_inbox,
     )
     log.info("serving, rss %.0f MiB; Ctrl-C to stop", rss_mib())
     stop = threading.Event()
