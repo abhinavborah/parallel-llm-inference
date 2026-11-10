@@ -294,3 +294,4 @@ def test_a_nack_queued_for_a_step_already_done_is_dropped(beating):
     request.results.put(protocol_pb2.Nack(stage=1, rid=first.rid, attempt=1, step=0, reason="GAP"))
     assert len([first, *call]) == 3
     assert run.gateway.dropped == before + 1
+    assert run.gateway.discards["stale_nack"] == 1

@@ -265,7 +265,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R5.9 | Micro-batched output is compared with batch-1 tokens and the agreement rate is reported. Batched runs are never used for exact-equality claims. | Should | W5 | B (unconfirmed) | Spec R9; G3 |
 | R5.10 | Tune the KV admission budget from measured KV use. | Could | W6 | A (unconfirmed) | Proposal PG3 |
 | R5.11 | Decision D7: batch prefill as well as decode? Default is decode only. Status: decided 2026-11-07 (#41): decode only; the cost is that a prefill stalls batched decodes, which X8 reports. | Could | W5 | A and B (unconfirmed) | D7 |
-| R5.12 | Decision N4: the step message carries an absolute deadline in unix milliseconds, but the two laptops' wall clocks may differ. Choose either a clock-offset check at start or gateway-only deadline enforcement. Blocks R5.4. | Should | W3 | A and B (unconfirmed) | G4; protocol |
+| R5.12 | Decision N4: the step message carries an absolute deadline in unix milliseconds, but the two laptops' wall clocks may differ. Choose either a clock-offset check at start or gateway-only deadline enforcement. Blocks R5.4. Status: decided 2026-11-07 (#32): gateway-only enforcement; each hop carries the time left as a relative budget (field 9 retired, budget_ms added, #36). | Should | W3 | A and B (unconfirmed) | G4; protocol |
 
 ### Epic E6. Failure recovery and fencing
 
@@ -380,7 +380,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | K8 | The own Llama forward slips past W1. | Fallback GPT-2 (N1); distributed-systems requirements are model independent. |
 | K9 | Gateway failure is not tolerated. | Stated as out of scope; durable log is a stretch (R6.16). |
 | K10 | Apple Silicon mixes performance and efficiency cores, which adds timing noise. | Pinned thread count; at least 5 repeats; report spread. |
-| K11 | Clock skew between laptops affects absolute deadlines. | N4 (R5.12); latencies measured only at the gateway. |
+| K11 | Clock skew between laptops affects absolute deadlines. | N4 (R5.12), decided (#32): only the gateway judges deadlines and hops carry a relative budget; latencies measured only at the gateway. |
 | K12 | Dashboard and pairing work competes with core work for the same two members. | D11 decision (R9.1); stretch only after Must exit criteria pass. |
 
 ### Open decisions and questions
@@ -404,7 +404,7 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 | N1 | Fallback to GPT-2 if the own forward slips. | Not needed 2026-11-01: own forward matches (#13) | R2.11 |
 | N2 | Ordering stream wording: bidirectional (specification mapping) or client-streaming (protocol). | Decided 2026-11-01: client-streaming as in the scope proposal (#19) | R3.16 |
 | N3 | gRPC 4 MiB message limit against long prefills. | Decided 2026-11-03: receive limit from config, no chunking (#20) | R3.17 |
-| N4 | Absolute deadlines and unsynchronised clocks. | Raised in this document | R5.12 |
+| N4 | Absolute deadlines and unsynchronised clocks. | Raised in this document. Decided 2026-11-07 (#32): gateway-only enforcement with a relative budget on each hop | R5.12 |
 | N5 | X2 comparison points, adding the batched single-process upper bound. | Raised in this document. Decided 2026-11-07 (#57): option 3 | R7.19 |
 | N6 | X4 delay hops: expect about 2 x delay or 3 x delay per token. | Raised in this document. Decided 2026-11-07 (#48): the two LAN hops | R7.20 |
 | N7 | X9 framing if an even split also fits Host B. | Raised in this document. Decided 2026-11-07 (#61): SmolLM2-135M for all runs for now | R7.21 |

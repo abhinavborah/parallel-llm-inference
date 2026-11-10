@@ -196,13 +196,8 @@ curl http://<laptop>:50062/status
 The address comes from `[supervisor0]` and `[supervisor1]` in the hosts file, and the
 supervisor listens on that host; without the tables it is the stage's host on port 50061 or
 50062. The examples use 50062, stage 1 on the Mac; for stage 0 on the Windows laptop use
-50061. A fault request from the other laptop needs that port open: on the Windows laptop,
-allow it inbound on the Private profile, the same profile as the worker port, from an
-administrator PowerShell:
-
-```
-New-NetFirewallRule -DisplayName "pllm supervisor 0" -Direction Inbound -Protocol TCP -LocalPort 50061 -Profile Private -Action Allow
-```
+50061. A fault request from the other laptop needs that port reachable; with the Windows
+firewall off, as for now (see "Starting the system"), no rule is needed.
 
 There is no authentication, so keep it on the lab network. `status` reports a worker
 as suspended from the moment a suspend is applied until it is resumed or replaced; a suspend
@@ -247,20 +242,57 @@ logits equal the single-process reference (tested with small random models).
   more than 512 tokens). A prompt whose request message is itself larger than the limit in
   bytes is refused earlier by gRPC with RESOURCE_EXHAUSTED; it does not reach Stage 0 either.
 - The deadline is the client's `timeout_ms`, judged only by the gateway on its own
-  monotonic clock. A request past it fails with DEADLINE_EXCEEDED. Carrying the remaining
-  time on each hop comes with the deadline story.
+  monotonic clock: no clock is compared across machines. A waiting request checks its
+  deadline at least every 0.05 s and fails with DEADLINE_EXCEEDED once it has passed,
+  whatever a stage does, so no request hangs, even with a stage suspended (R5.6). The
+  stated tolerance is 0.5 s after the deadline, asserted on loopback; across laptops, add
+  the one-way delay of the error to the client. Delays between stages do not add, because
+  only the gateway judges the deadline.
+- Each step carries `budget_ms`, the time left on the request's deadline when it was sent
+  (R5.4). A stage turns it into a deadline on its own monotonic clock when the message
+  arrives, and Stage 0 passes on what is left to Stage 1. A step still waiting at a stage
+  when that deadline passes is dropped before it runs, with no Nack, and counted in the
+  stage's `expired`. A stage's deadline falls after the gateway's by the time the message
+  spent in transit, so a step it drops belongs to a request the gateway has already
+  failed. A message held in transit, for example in a suspended stage's socket buffer,
+  gets its deadline only when read and can still run late; the gateway drops its result.
+  A budget of 0 means no deadline.
 - A stage that is not registered, or a stream to Stage 0 that fails (Stage 0 or Stage 1
   down), fails the request with UNAVAILABLE. Recovery and replay come later.
 - The request table (`Gateway.table()`) lists each running request: id, attempt, tokens so
   far, expected step and seconds to its deadline.
+- Result filter and exactly-once delivery (R4.7, R4.8). A result is accepted only when its
+  request is running and its attempt, its step and its epoch match the request's attempt,
+  the step it waits on and the live epoch of Stage 1. Anything else is dropped and counted
+  by reason in `Gateway.discards`: `unknown_request` (a late result after the request
+  ended), `stale_attempt`, `stale_epoch` (an old Stage 1), `duplicate` (a step already
+  delivered), `ahead` (a step not asked for yet) and `stale_nack` (a Nack for no step a
+  running request waits on); `Gateway.dropped` is the total. Only an accepted result
+  reaches the client, so each step of a request is streamed once and in order.
 - When a request ends, for any reason, it leaves the table and a `Free` for it is queued for
   each stage; the stage's heartbeat stream delivers it.
 - Each running request holds one of the gateway's 20 server threads. Six are kept for the
   results stream, registration and the heartbeat streams, so at most 14 requests run at
-  once and a further one is refused with RESOURCE_EXHAUSTED; many in flight is the next
-  story. Requests share one stream to
-  Stage 0, and a step that fails at a stage ends that stream, so the other requests on it
-  fail with UNAVAILABLE too.
+  once and a further one is refused with RESOURCE_EXHAUSTED.
+- Many requests run at once (R4.5). They share one stream to Stage 0, so the stages see
+  their steps interleaved and Stage 0 works on one request while Stage 1 works on another:
+  in `tests/test_concurrency.py` each stage sleeps 0.1 s per step instead of computing,
+  so 4 requests of 5 tokens one after another are 20 steps of 0.2 s, while together the
+  stages overlap and the work fits in about 21 slots of 0.1 s; the test checks that
+  together takes under three quarters of one after another. That shows the stages
+  overlapping, not model throughput, which the benchmarks measure.
+  Each request's own steps stay strictly in order and give the tokens it gives alone; no
+  order between requests is promised, and a shorter request started later can finish
+  first. A cancel, a deadline or a refused step ends only its own request. A stage ends
+  the shared stream when a message is malformed, when a step fails inside it (including
+  running out of memory), or when its next hop fails or moves; then every request on it
+  fails with UNAVAILABLE. A request whose prompt and `max_tokens` together exceed the
+  model's context length (8192 positions for SmolLM2) is refused with INVALID_ARGUMENT.
+  This bounds each request, not Host B's memory: with an even split, one request at the
+  cap holds about 180 MiB of Stage 0 cache for SmolLM2 but about 4.4 GiB for Qwen3-0.6B
+  (40960 positions), more than Host B has. Admission by Host B's KV budget (R5.3) is #34.
+  One long prefill delays the other requests' next steps at that stage. Bounded queues and
+  credits (R5.2) are #33.
 - Text is decoded per token, holding back a token that ends inside a character until the
   next one completes it (up to four tokens), so a `Token` can carry empty text.
 
@@ -357,6 +389,76 @@ logits differ in their low bits there, so across hosts compare the stored tokens
 and report agreement. The summary line also gives the inter-op
 thread count. The stored logit summary is the top logit per step, not the full logits. `--length` is 16, 128 (the default)
 or 512; `--count` limits the run to the first prompts.
+
+## Starting the system
+
+`pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway
+through `pllm.gateway` and each stage through `pllm.supervisor`. With no `--roles`, every
+process starts on this laptop (single-host mode, for tests and X1a):
+
+```
+uv run python -m pllm.launch smollm2-135m
+```
+
+For a run across the laptops, set `PLLM_CONFIG` to your hosts file on both (see "Hosts and
+ports"), then start each laptop's share. Order does not matter, since a stage retries until
+the gateway is up:
+
+```
+# macOS (Stage 1 and the gateway)
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0
+```
+
+Send a prompt once both stages have registered and received each other's route update, a
+moment later. Until then the client gets UNAVAILABLE and can send the prompt again.
+
+```
+uv run python -m pllm.client "The capital of France is" --max-tokens 16 --timeout 30
+```
+
+The launcher refuses a role whose address in the hosts file is not on this laptop, and a model
+with any pinned file missing. By default each stage gets this laptop's physical cores divided by its stages, so on
+one host each stage gets half; `--threads` sets it. Ctrl-C stops everything. If a process
+exits by itself, the launcher stops the rest and exits with code 1 (a worker that dies is
+not such a case: its supervisor restarts it). Closing the terminal also stops everything on
+macOS. Force killing the launcher leaves its processes running.
+
+Before every run, close other programs and use the same power state. The launcher logs the
+available memory and power state at the start, warns on battery, and writes a run record.
+
+### Windows setup
+
+- Use native Python, not WSL2.
+- Keep the charger in and select the best performance power plan or power mode in Settings.
+- The launcher is one more process on this laptop: about 39 MiB, plus 5 MiB for the virtual
+  environment's `python.exe` trampoline (measured on Windows 11, without `uv` itself), a small
+  part of the roughly 2.5 GB this laptop has for the worker.
+- Stop the launcher with Ctrl-C. On Ctrl-Break `uv` itself exits at once with 0xC000013A, so
+  the shell sees that code while the launcher finishes the stop behind it.
+- The Windows firewall is off for now, on the Public profile (agreed 2026-11-09), so the
+  Stage 0 and supervisor ports need no inbound rule.
+  `uv run python -m pllm.netcheck firewall --roles stage0` reports the state. If the firewall
+  is turned back on, allow both ports on the Public profile from an administrator PowerShell:
+
+```
+New-NetFirewallRule -DisplayName "pllm stage 0" -Direction Inbound -Protocol TCP -LocalPort 50051 -Profile Public -Action Allow
+New-NetFirewallRule -DisplayName "pllm supervisor 0" -Direction Inbound -Protocol TCP -LocalPort 50061 -Profile Public -Action Allow
+```
+
+Both ports have no authentication, so use only a network you trust.
+
+### macOS setup
+
+- Keep the charger in.
+- In System Settings, Network, Firewall, allow incoming connections for the Python that `uv`
+  runs, or accept the prompt the first time a process listens.
+
+### If the network fails
+
+Try in order a direct cable, a phone hotspot, then Tailscale. Only the hosts file changes: set
+each host to that network's address for the laptop and `network` to the network's name.
 
 ## Hosts and ports
 
