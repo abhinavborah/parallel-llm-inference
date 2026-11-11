@@ -21,9 +21,11 @@ from test_heartbeat import FAST, Beating, reference
 from test_model import tiny_reference
 
 from pllm import config, control, faults
+from pllm import gateway as gateway_module
 from pllm.control import ExpectedModel, Registry
 from pllm.detection import MAX_EVENTS, Detector
-from pllm.gateway import Gateway, Session, serve
+from pllm.gateway import Gateway, Session, seconds_above, serve
+from pllm.metrics import Recorder
 from pllm.model import ModelConfig
 from pllm.models import sha256_of
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
@@ -218,6 +220,48 @@ def test_every_reported_time_comes_from_the_nanosecond_clock():
 
 def test_the_reporting_clock_is_the_gateway_perf_counter():
     assert Detector().now is time.perf_counter_ns
+
+
+def test_the_gateway_detector_reads_the_recorders_clock_and_takes_its_timeouts():
+    registry = Registry("tiny", ExpectedModel(DIGEST, LAYERS, K))
+    gateway = Gateway(registry, None, (), HIDDEN, 2**20, heartbeat_timeout=3.0, step_timeout=0.5)
+    gateway.recorder = Recorder(clock=lambda: 42)
+    assert gateway.detector.now() == 42
+    assert gateway.detector.heartbeat_timeout_ns == 3 * SECOND
+    assert gateway.detector.step_timeout_ns == SECOND // 2
+
+
+def test_a_sink_gets_each_record_once_after_it_is_logged():
+    got = []
+    detector, _ = fake(sink=got.append)
+    detector.beat(STAGE, EPOCH)
+    detector.declare(STAGE, EPOCH, "stream_break")
+    detector.declare(STAGE, EPOCH, "replaced")  # not the first: no record
+    detector.step_deadline("r", 3)
+    detector.registered(STAGE, EPOCH, EPOCH + 1, None)
+    assert got == detector.events() and len(got) == 3
+
+
+@pytest.mark.parametrize(
+    "flag, value",
+    [
+        ("--heartbeat-timeout", "0.5"),
+        ("--step-timeout", "0"),
+        ("--step-timeout", "nan"),
+        ("--heartbeat-timeout", "inf"),
+    ],
+)
+def test_the_gateway_refuses_a_timeout_that_cannot_work(flag, value, monkeypatch):
+    def accepted():
+        raise AssertionError("the value was accepted")
+
+    monkeypatch.setattr(gateway_module.config, "load", accepted)  # never starts a gateway
+    with pytest.raises(SystemExit):
+        gateway_module.main([sorted(gateway_module.PINNED)[0], flag, value])
+
+
+def test_a_timeout_flag_is_read_in_seconds():
+    assert seconds_above(0.5)("2.5") == 2.5
 
 
 def test_events_are_json_bounded_and_logged_as_one_line(caplog):
@@ -646,3 +690,21 @@ def test_a_worker_whose_epoch_is_declared_dead_ends_with_an_error(tmp_path):
     finally:
         gateway.close()
         server.stop(0).wait()
+
+
+def test_detection_records_are_lines_of_the_metrics_file(plane, tmp_path):
+    path = tmp_path / "run.metrics.jsonl"
+    plane.gateway.recorder = Recorder(path)
+    proc, epoch = plane.child(1)
+    faults.kill(proc.pid)
+    proc.wait(WAIT)
+    plane.detection(path="stream_break", epoch=epoch)
+    plane.register(1)
+    plane.gateway.recorder.finish()
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    written = [row for row in rows if row["type"] in ("detected", "registered")]
+    events = plane.detector.events()
+    assert [e["event"] for e in events] == ["registered", "detected", "registered"]
+    assert written == [
+        {"type": e["event"], **{k: v for k, v in e.items() if k != "event"}} for e in events
+    ]

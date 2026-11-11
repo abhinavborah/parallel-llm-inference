@@ -51,7 +51,8 @@ metrics file, stamped by one clock (pllm.metrics). Deadlines stay on the monoton
 which is never reported.
 
 Failure detection is pllm.detection. A heartbeat stream that breaks, a stage silent past the
-heartbeat timeout and a step past the step timeout are each recorded with gateway timestamps.
+heartbeat timeout and a step past the step timeout are each recorded on the recorder's
+clock, in the log and as a line of the metrics file. Both timeouts are gateway flags.
 The first two declare the stage's epoch dead: requests are refused with UNAVAILABLE until a
 new registration gives the stage a higher epoch, and the neighbour then gets a route update.
 Only the heartbeat stream names a dead stage: Stage 0 also ends its data stream when Stage 1
@@ -133,7 +134,8 @@ import grpc
 
 from pllm import config, metrics, prompts, runrecord, wire
 from pllm.control import Registration, Registry, expected_model
-from pllm.detection import Detector
+from pllm.detection import HEARTBEAT_TIMEOUT_SECONDS, STEP_TIMEOUT_SECONDS, Detector
+from pllm.heartbeat import HEARTBEAT_SECONDS
 from pllm.model import ModelConfig
 from pllm.models import MODELS_DIR, PINNED
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
@@ -252,11 +254,14 @@ class Gateway(
         max_positions: int | None = None,
         max_queued: int = MAX_QUEUED,
         credits: int | None = None,
+        heartbeat_timeout: float = HEARTBEAT_TIMEOUT_SECONDS,
+        step_timeout: float = STEP_TIMEOUT_SECONDS,
     ):
         """max_positions is the model's context length: a request whose prompt and
         max_tokens together exceed it is refused. None leaves it unchecked. max_queued is
         the admission queue's size and credits the steps in flight at once (None: no
-        limit beyond the running slots)."""
+        limit beyond the running slots). The two timeouts, in seconds, go to the
+        failure detector."""
         self.registry = registry
         self.max_positions = max_positions
         self.tokenizer = tokenizer
@@ -286,7 +291,14 @@ class Gateway(
         # pass its epoch check just before a newer registration and then become current.
         self._control = threading.Lock()
         self._link: Link | None = None
-        self.detector = Detector()
+        # Looked up at each call: main sets the recorder after this. A new recorder keeps
+        # the same clock, or the detector would subtract times from two clocks.
+        self.detector = Detector(
+            heartbeat_timeout,
+            step_timeout,
+            clock=lambda: self.recorder.now(),
+            sink=lambda record: self.recorder.event(record),
+        )
         self._stopping = threading.Event()
         self._watcher: threading.Thread | None = None
         self._retired: list[Link] = []  # half-closed, waiting for stage 0's counters
@@ -966,11 +978,40 @@ def run_until_stopped(gateway: Gateway, server: grpc.Server, done: threading.Eve
     gateway.recorder.finish()
 
 
+def seconds_above(low: float):
+    """An argparse type: a finite number of seconds greater than low."""
+
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a number: {text}") from None
+        if not low < value < float("inf"):
+            raise argparse.ArgumentTypeError(f"must be more than {low} seconds")
+        return value
+
+    return parse
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the gateway for one model.")
     parser.add_argument("model", choices=sorted(PINNED))
     parser.add_argument("--split-point", type=int, help="override the committed split point")
     parser.add_argument("--metrics", type=Path, help="metrics file (default: a new one in runs/)")
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=seconds_above(HEARTBEAT_SECONDS),
+        default=HEARTBEAT_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=f"no Beat for this long declares a stage dead (default {HEARTBEAT_TIMEOUT_SECONDS})",
+    )
+    parser.add_argument(
+        "--step-timeout",
+        type=seconds_above(0),
+        default=STEP_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=f"record a step with no result after this long (default {STEP_TIMEOUT_SECONDS})",
+    )
     args = parser.parse_args(argv)
     model_dir = MODELS_DIR / args.model
     try:
@@ -990,6 +1031,8 @@ def main(argv: list[str] | None = None) -> None:
                 "split": expected.split_point,
                 "network": hosts.network,
                 **runrecord.machine(),
+                "heartbeat_timeout_s": args.heartbeat_timeout,
+                "step_timeout_s": args.step_timeout,
                 "argv": sys.argv,
             },
         )
@@ -1005,6 +1048,8 @@ def main(argv: list[str] | None = None) -> None:
         max_positions(model_dir),
         max_queued=limits.admission_queue,
         credits=limits.credits,
+        heartbeat_timeout=args.heartbeat_timeout,
+        step_timeout=args.step_timeout,
     )
     gateway.recorder = recorder
     done = stop_event()

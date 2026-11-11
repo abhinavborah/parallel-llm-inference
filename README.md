@@ -328,10 +328,12 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 
 | `type` | When | Fields |
 |---|---|---|
-| `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `argv` |
+| `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `heartbeat_timeout_s`, `step_timeout_s`, `argv` |
 | `hop` | Each message the gateway sends or receives | `t_ns`, `hop`, `msg`, `phase`, `rid`, `attempt`, `step`, `bytes`, `payload_bytes`, `positions`, `accepted` |
 | `request` | Each request's end | `t_ns`, `rid`, `attempt`, `outcome`, `code`, `prompt_tokens`, `max_tokens`, `output_tokens`, `arrived_ns`, `first_token_ns`, `last_token_ns` |
 | `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
+| `detected` | Each failure detection | as in [Failure detection](#failure-detection) |
+| `registered` | Each stage registration | as in [Failure detection](#failure-detection) |
 | `run_end` | Run end | `t_ns`, `links`, `links_unreported`, `stage0_stage1_complete`, `write_errors` |
 
 - Hops are `gateway_stage0`, `stage0_stage1` and `stage1_gateway`. `phase` is `replay` for a
@@ -396,14 +398,15 @@ Limits:
 ## Failure detection
 
 The gateway watches each stage incarnation by its epoch (`pllm.detection`, read with
-`Gateway.detector.events()`), and logs each record as one JSON line.
+`Gateway.detector.events()`). It logs each record as one JSON line and writes it to the
+metrics file as a line whose `type` is the record's `event`.
 
 | Path | Fires when | Effect |
 |---|---|---|
 | `stream_break` | the heartbeat stream of the latest registration ends | epoch declared dead |
-| `heartbeat_timeout` | no Beat for 2.0 s (four intervals), checked every 0.05 s | epoch declared dead |
+| `heartbeat_timeout` | no Beat for `--heartbeat-timeout` seconds (default 2.0, four intervals), checked every 0.05 s | epoch declared dead |
 | `replaced` | a new registration arrives before either of the above | epoch declared dead |
-| `step_deadline` | a step has no result 10 s after it was sent, once per step | record only |
+| `step_deadline` | a step has no result `--step-timeout` seconds after it was sent (default 10), once per step | record only |
 
 A declared epoch is never revived; the first declaration writes the only record. Requests
 are refused with UNAVAILABLE until the stage registers again. The new registration gets a
@@ -415,8 +418,9 @@ timeout, and declares nothing. A slow stage still beats, so its supervisor would
 the registration a declaration waits for, and the gateway cannot tell which stage holds a
 late step. The request carries on to its own deadline.
 
-Every reported time is an integer from `time.perf_counter_ns` on the gateway, in a field
-ending in `_ns`, so intervals subtract directly. `time` is the wall clock, a label only.
+Every reported time is an integer from the metrics file's clock (`time.perf_counter_ns` on
+the gateway), in a field ending in `_ns`, so intervals subtract directly and match the
+file's other lines. `time` is the wall clock, a label only.
 Detection records:
 
 - `detected`: `path`, `stage`, `epoch`, `declared`, `t_ns`, `time`, `last_beat_ns`,
@@ -425,8 +429,9 @@ Detection records:
 - `registered`: `stage`, `old_epoch`, `new_epoch`, `t_ns`, `time`, `waited_ns` (from the
   declaration), `route_queued_ns` (null if the neighbour had no stream).
 
-The two timeouts are provisional: the beat gaps behind the 2.0 s value were measured on one
-laptop only.
+The two default timeouts are provisional: the beat gaps behind the 2.0 s value were measured
+on one laptop only. A laptop that pauses longer, for example while paging, needs a larger
+`--heartbeat-timeout`. The `run` line of the metrics file records the values in use.
 
 Limits:
 

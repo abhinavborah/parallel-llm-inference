@@ -5,9 +5,10 @@ never inherits the last beat of an old one. An epoch is declared dead once and n
 revived. The clock for an epoch starts at its first Beat, so a registered stage that has
 not beaten yet cannot time out.
 
-Every detection and registration is kept as a flat JSON-ready record (events()) and logged
-as one JSON line. Reported times are integers from time.perf_counter_ns on the gateway, the
-one reporting clock, in fields ending in _ns:
+Every detection and registration is kept as a flat JSON-ready record (events()), logged
+as one JSON line and passed to sink, which the gateway points at its metrics file. Reported
+times are integers from the clock given, the gateway's reporting clock (time.perf_counter_ns
+by default), in fields ending in _ns:
 
 - detected: path (stream_break, heartbeat_timeout, step_deadline or replaced), stage, epoch,
   declared, t_ns, time, last_beat_ns, since_last_beat_ns, rid, step, detail
@@ -23,8 +24,9 @@ waits for. A dead stage is declared by its stream break or heartbeat timeout any
 record names as suspect (stage and epoch) the stage with the oldest beat past half the
 heartbeat timeout, if there is one.
 
-HEARTBEAT_TIMEOUT_SECONDS and STEP_TIMEOUT_SECONDS are provisional: the timeout is measured
-on host A only. Tests set heartbeat_timeout_ns and step_timeout_ns on the instance.
+HEARTBEAT_TIMEOUT_SECONDS and STEP_TIMEOUT_SECONDS are provisional defaults: the beat gaps
+behind them were measured on host A only. The gateway takes both as flags. Tests set
+heartbeat_timeout_ns and step_timeout_ns on the instance.
 """
 
 import collections
@@ -54,11 +56,13 @@ class Detector:
         step_timeout: float = STEP_TIMEOUT_SECONDS,
         clock: Callable[[], int] = time.perf_counter_ns,
         wall: Callable[[], float] = time.time,
+        sink: Callable[[dict], None] | None = None,
     ):
         self.heartbeat_timeout_ns = round(heartbeat_timeout * NS)
         self.step_timeout_ns = round(step_timeout * NS)
         self.now = clock
         self._wall = wall
+        self._sink = sink
         self._lock = threading.Lock()
         self._live: dict[int, tuple[int, int]] = {}  # epoch: stage, last beat
         self._dead: dict[int, int] = {}  # epoch: when it was declared
@@ -160,6 +164,8 @@ class Detector:
         self._events.append(record)
         return record
 
-    @staticmethod
-    def _log(record: dict) -> None:
+    def _log(self, record: dict) -> None:
+        """Called without the lock held, so a sink can take its own."""
         log.warning("%s", json.dumps(record))
+        if self._sink is not None:
+            self._sink(record)
