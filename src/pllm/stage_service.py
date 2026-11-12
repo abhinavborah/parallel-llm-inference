@@ -190,6 +190,10 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         self._peak_lock = threading.Lock()
         self.expired = 0  # messages dropped because their deadline passed before they ran
         self._expired_lock = threading.Lock()  # streams run on several threads
+        self._busy_ns = 0  # time spent on finished steps, on this process's clock (R7.6)
+        self._steps = 0  # steps handled, not counting those refused with a Nack
+        self._working: dict[int, int] = {}  # per stream thread, when its current step began
+        self._busy_lock = threading.Lock()
         self.order = StepOrder(f"stage {self.stage_index}")  # R3.7, on every message
 
     @property
@@ -205,6 +209,18 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
     def cached_requests(self) -> int:
         """The count a Beat reports."""
         return len(self.store)
+
+    @property
+    def busy(self) -> tuple[int, int]:
+        """Nanoseconds spent handling steps since this process started, including the part
+        of any step still running, and the steps handled; a Beat reports both. With the
+        running part the total grows smoothly, so a step longer than a beat does not show
+        up all at once when it ends. Two streams working at once both count, so the total
+        can grow faster than the clock."""
+        now = time.perf_counter_ns()
+        with self._busy_lock:
+            running = sum(now - began for began in self._working.values())
+            return self._busy_ns + running, self._steps
 
     @property
     def inbox_depth(self) -> int:
@@ -318,7 +334,15 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                 if deadline is not None and time.monotonic() >= deadline:
                     self._expire(request)
                     continue
-                out = self._handle(request, context, next_epoch, deadline)
+                me, out = threading.get_ident(), None
+                with self._busy_lock:
+                    self._working[me] = time.perf_counter_ns()
+                try:
+                    out = self._handle(request, context, next_epoch, deadline)
+                finally:
+                    with self._busy_lock:
+                        self._busy_ns += time.perf_counter_ns() - self._working.pop(me)
+                        self._steps += out is not None
                 if out is not None:  # None: refused with a Nack, nothing to pass on
                     if counters is not None:
                         counters.count(out)

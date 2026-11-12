@@ -346,6 +346,7 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 |---|---|---|
 | `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `heartbeat_timeout_s`, `step_timeout_s`, `argv` |
 | `hop` | Each message the gateway sends or receives | `t_ns`, `hop`, `msg`, `phase`, `rid`, `attempt`, `step`, `bytes`, `payload_bytes`, `positions`, `accepted` |
+| `beat` | Each heartbeat of a live epoch (every 0.5 s); one from an epoch declared dead is not logged | `t_ns`, `stage`, `epoch`, `busy_ns`, `steps` |
 | `request` | Each request's end | `t_ns`, `rid`, `attempt`, `outcome`, `code`, `prompt_tokens`, `max_tokens`, `output_tokens`, `arrived_ns`, `first_token_ns`, `last_token_ns` |
 | `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
 | `detected` | Each failure detection | as in [Failure detection](#failure-detection) |
@@ -360,6 +361,12 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 - `outcome` is `end of sequence`, `max_tokens`, `cancelled by the client`, `failed` or
   `rejected`, and `code` is the gRPC status the gateway set. A send time is when the message
   was queued for its stream, not when it left the laptop.
+- `busy_ns` and `steps` in a `beat` are the stage's running totals since that process
+  started: time spent handling steps, including a step still running, measured on the
+  stage's own clock, and the steps handled, not counting those refused with a Nack. They
+  are durations, never compared with a gateway time; `t_ns` is when the beat arrived. A
+  restarted stage has a new `epoch` and counts from zero. Two streams working at once on
+  one stage both count, so `busy_ns` can grow faster than the clock.
 - Stage 0 to Stage 1 never passes the gateway, so it has byte totals but no `hop` lines and
   no latency of its own. Stage 0 counts each stream and returns the counts, with no
   timestamp, on that stream's gRPC trailing metadata.
@@ -376,13 +383,106 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
   with no `run_end` is from a run that did not stop cleanly. Send SIGINT, or CTRL_BREAK on
   Windows, not a forced kill.
 
+## Report
+
+One command builds every table and plot from the metrics files (`pllm.report`). Reported
+numbers come from it, never from the dashboard.
+
+```
+uv run python -m pllm.report                  # every runs/*.metrics.jsonl
+uv run python -m pllm.report LOG_OR_DIR ...   # given files, or those in each folder
+uv run python -m pllm.report --out DIR        # default runs/report
+```
+
+It writes `runs.csv` and `index.md` with one row per run, and a folder per run with
+`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `latency_cdf.png` and, when the
+stages sent beats, `utilisation.png`. The report is built beside the output folder and
+then replaces it whole, so a failed build leaves the old one. The command refuses a folder
+it did not make, a file, and a folder that holds a log; anything added to a folder it made
+is replaced with it. `runs/` is not committed.
+
+Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
+
+- Completed requests ended at end of sequence or at `max_tokens`; only they give latencies
+  and throughput. The others are counted per outcome.
+- TTFT is the first token minus arrival at the gateway, so time in the admission queue
+  counts. TPOT is (last token minus first token) / (output tokens - 1), for requests with
+  at least two tokens. End-to-end is the last token minus arrival.
+- p50, p95 and p99 interpolate linearly between the nearest ranks (numpy's default). Each
+  table gives n: a p99 of fewer than 100 requests is an interpolation.
+- Throughput is the output tokens of completed requests over the window, from the first
+  arrival of any request to the last token of a completed one.
+- Busy time per stage is read off the beat totals at the two ends of the window, by
+  straight-line interpolation between beats, separately per epoch. Since the totals count
+  a step still running, the error at each end is at most the time between the two beats
+  around it (0.5 s when beats are steady). `max_beat_gap_s` in `stages.csv` is the longest
+  stretch of the window with no beat from that stage, for example a late first beat, a
+  heartbeat that reconnected or beats that stopped, and `summary.md` warns when it is over
+  1 s. Utilisation is busy time over the window; two streams working at once on one stage
+  can push it above 1.
+
+Plots for each experiment (X2 to X9) are added here by that experiment.
+
+## Dashboard
+
+A live page for the demo (`pllm.dashboard`, standard library only, so nothing for Host B and
+no new dependency). It is off unless the gateway is started with `--dashboard`, because it can
+kill and freeze workers:
+
+```
+uv run python -m pllm.gateway smollm2-135m --dashboard
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1 --dashboard
+```
+
+Open `http://HOST:PORT/` from a browser. HOST and PORT are the `[dashboard]` table of the
+hosts file (default: the gateway's host, port 50080). HOST must be the address the browser
+types, not `0.0.0.0` (that is refused at start): the server answers only to that name, and to
+`localhost` and `127.0.0.1` when it listens on loopback. The page is one HTML file
+with plain JavaScript and uses no address outside the server.
+
+- Stages: each stage alive, dead or unknown with its epoch, the age of its last Beat, its
+  worker's state and the free memory of its laptop. Alive means the epoch is live and a Beat
+  came within the heartbeat timeout; dead means the failure detector declared the epoch dead.
+- System: requests running and queued, steps in flight, tokens per second (over 5 s),
+  requests rejected (every request refused or failed before it started, such as a full queue,
+  a deadline spent waiting for a slot, or no stage registered), results dropped (all reasons
+  of `Gateway.discards`, listed on hover), duplicate tokens and the gateway laptop's free
+  memory.
+- Send, Send 8 at once and Flood (40 requests, more than the gateway runs and queues): each
+  request goes through the gateway's own `Frontend.Generate` on loopback, so deadlines, the
+  admission queue and refusals are those of any client, and its tokens stream into a card.
+- Kill, Freeze and Unfreeze: sent to the supervisor of that stage's laptop (`[supervisor0]`
+  and `[supervisor1]`), which carries them out. A worker that is killed is respawned.
+
+Free memory comes from each supervisor's `/status`; with no supervisor running the page shows
+"supervisor unreachable" and the fault buttons answer with an error.
+
+Duplicate tokens are counted on the streams the page relays (a token whose step does not go
+above the last of its request); the gateway delivers each step once, so it stays 0. The gateway
+counts tokens sent and requests ended by outcome (`Gateway.state()`).
+
+Safety, as for the supervisor's control port: a POST needs `Content-Type: application/json`,
+a Host the server answers to and no foreign Origin, no response has a CORS header and OPTIONS
+is not answered, so a page on another site cannot press the buttons from a browser. There is no
+authentication beyond that: keep it on the lab network. Open event streams (16), requests
+started from the page (64 at once), each client's backlog and request bodies are bounded. A
+viewer that vanishes without closing its connection keeps its place until a write to it
+fails, and a viewer that reads slowly loses its oldest events, so a card can miss its first
+or last token; reloading the page starts again from the next state.
+
+The tests pin the page, every event it reads and the server's rules, and, when `node` is
+installed, run the page's own script against a stand-in for the DOM, fed a real state event
+(`tests/dashboard_page_check.js`). No test drives a real browser. Reported numbers come from
+the scripts that read the metrics files, never from this page.
+
 ## Heartbeat
 
 A serving worker registers, then keeps one `Control.Heartbeat` stream to the gateway
-(`pllm.heartbeat`). Every 0.5 s it sends a Beat with its stage, epoch, inbox depth and
-cached request count, and it sends each Nack as soon as it is raised, between beats. The
-gateway keeps the latest Beat of each stage with its arrival time on the gateway's own
-clock (`Gateway.beats()`), and the Nacks (`Gateway.nacks`, the last 1024, and
+(`pllm.heartbeat`). Every 0.5 s it sends a Beat with its stage, epoch, inbox depth, cached
+request count and its busy time and step totals, and it sends each Nack as soon as it is
+raised, between beats. The gateway keeps the latest Beat of each stage with its arrival
+time on the gateway's own clock (`Gateway.beats()`), writes each one to the metrics file,
+and keeps the Nacks (`Gateway.nacks`, the last 1024, and
 `nack_count`). It sends back:
 
 - the `Free` messages queued for that stage;

@@ -296,10 +296,10 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 |---|---|---|---|---|---|
 | R7.1 | JSON-lines metrics logger: one line per request and one per hop message, timestamped at the gateway with one clock. | Must | W2 | A (unconfirmed) | G4; Proposal PG6 |
 | R7.2 | Transport counters: serialized bytes per message type per hop, separating prefill from decode. | Must | W2 | A (unconfirmed) | Spec R16; X3 |
-| R7.3 | One plotting script produces every plot and summary table from the run logs. | Must | W3 | A (unconfirmed) | G4; Proposal PG6 |
-| R7.4 | Report TTFT, TPOT and end-to-end time per request at p50, p95 and p99. | Must | W3 | A (unconfirmed) | Spec R14 |
+| R7.3 | One plotting script produces every plot and summary table from the run logs. Built as `pllm.report` (#56): tables and plots per run and a table across runs; each experiment adds its own plots across runs. | Must | W3 | A (unconfirmed) | G4; Proposal PG6 |
+| R7.4 | Report TTFT, TPOT and end-to-end time per request at p50, p95 and p99. Defined as in vLLM's serving benchmark: TTFT from arrival at the gateway, TPOT excluding the first token, linear-interpolation percentiles (#56). | Must | W3 | A (unconfirmed) | Spec R14 |
 | R7.5 | Report system-wide throughput in output tokens per second. | Must | W3 | A (unconfirmed) | Spec R15 |
-| R7.6 | Report stage utilisation (busy time per stage). | Should | W3 | A (unconfirmed) | X2 |
+| R7.6 | Report stage utilisation (busy time per stage). Each Beat carries the stage's running busy and step totals (schema 3), logged by the gateway on arrival (#56). | Should | W3 | A (unconfirmed) | X2 |
 | R7.7 | Transport delay-injection wrapper with 0, 1, 5, 20 and 50 ms per message on the two LAN hops (gateway to Stage 0 and Stage 0 to Stage 1), injected on Host A and pipelined, not blocking; toxiproxy as an optional cross-check. | Must | W5 | A (unconfirmed) | X4; Proposal PG6 |
 | R7.8 | X1a (single host, exact) and X1b (two laptops, agreement rate, first divergence position, maximum logit difference against each host's single-process reference). | Must | W2 | B (unconfirmed) | X1a; X1b; Spec R13 |
 | R7.9 | X2: concurrency 1, 2, 4, 8, 16 against single-process round-robin serving without batching, the primary on Host A only, the reference across the two laptops at concurrency 1, and one Host B single-process run at concurrency 1 that records peak RSS; reports throughput, TTFT, TPOT and stage utilisation. | Must | W3 | A (unconfirmed) | X2; Spec R15 |
@@ -339,10 +339,10 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | ID | Requirement | Priority | Week | Owner | Source |
 |---|---|---|---|---|---|
 | R9.1 | Decision D11: keep the dashboard, discovery and pairing scheduled in W3 to W5 or treat them as stretch behind the minimum scope (pipeline, fencing, replay, tests, experiments). The scope proposal lists them as stretch. Owners are unassigned (about 2 days each). Blocks all of Epic E9. | Must | W3 | A and B (unassigned) | D11; Proposal deliverables |
-| R9.2 | Dashboard: one HTML page with plain JavaScript, served next to the gateway by a small HTTP endpoint, live updates over server-sent events. | Could | W3 | Unassigned | D11 |
-| R9.3 | Input controls: prompt box, send, send 8 at once, flood; live token stream per request. | Could | W3 | Unassigned | D11 |
-| R9.4 | Status and counters: each stage alive or dead, epoch, queue length, free RAM; tokens per second, rejects, stale outputs discarded, duplicate tokens (always 0). | Could | W4 | Unassigned | D11 |
-| R9.5 | Fault controls: kill Stage 0, freeze, unfreeze, calling the supervisor on that laptop. | Could | W4 | Unassigned | D11 |
+| R9.2 | Dashboard: one HTML page with plain JavaScript, served next to the gateway by a small HTTP endpoint, live updates over server-sent events. Built as `pllm.dashboard`, started with `--dashboard` (#68). | Could | W3 | Unassigned | D11 |
+| R9.3 | Input controls: prompt box, send, send 8 at once, flood; live token stream per request. Each request goes through the gateway's Frontend, so refusals and deadlines are real (#68). | Could | W3 | Unassigned | D11 |
+| R9.4 | Status and counters: each stage alive or dead (or unknown, before it registers or when its Beats are late but it is not yet declared dead), epoch, queue length, free RAM; tokens per second, rejects, stale outputs discarded, duplicate tokens (always 0). Free RAM comes from each laptop's supervisor; duplicates are counted on the streams the page relays (#68). | Could | W4 | Unassigned | D11 |
+| R9.5 | Fault controls: kill Stage 0, freeze, unfreeze, calling the supervisor on that laptop. For both stages, through the dashboard server, since the supervisor refuses cross-origin browser calls (#68). | Could | W4 | Unassigned | D11 |
 | R9.6 | Experiments run from scripts; no reported number depends on a browser. | Must | W6 | A and B (unconfirmed) | G4 |
 | R9.7 | mDNS announce on service `_pllm._tcp.local` with node id, OS, free RAM, cores, app version and weights hash; a scan lists the nodes found. | Could | W5 | Unassigned | D11 |
 | R9.8 | Add-by-IP is always available and the demo never depends on discovery working. | Could | W5 | Unassigned | D11; R1.8 |

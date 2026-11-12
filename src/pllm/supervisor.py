@@ -189,6 +189,8 @@ class Supervisor:
             "restarts": self.restarts,
             "ready": self._ready.is_set(),
             "last_respawn_seconds": self.last_respawn_seconds,
+            # this laptop's memory, for the dashboard (R9.4)
+            "free_ram_bytes": psutil.virtual_memory().available,
         }
 
     # ------------------------------------------------------------------ the loop

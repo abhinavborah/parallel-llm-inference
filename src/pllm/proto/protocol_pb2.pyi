@@ -33,16 +33,20 @@ class RegisterResp(_message.Message):
     def __init__(self, epoch: _Optional[int] = ...) -> None: ...
 
 class Beat(_message.Message):
-    __slots__ = ("stage", "epoch", "inbox_depth", "cached_requests")
+    __slots__ = ("stage", "epoch", "inbox_depth", "cached_requests", "busy_ns", "steps")
     STAGE_FIELD_NUMBER: _ClassVar[int]
     EPOCH_FIELD_NUMBER: _ClassVar[int]
     INBOX_DEPTH_FIELD_NUMBER: _ClassVar[int]
     CACHED_REQUESTS_FIELD_NUMBER: _ClassVar[int]
+    BUSY_NS_FIELD_NUMBER: _ClassVar[int]
+    STEPS_FIELD_NUMBER: _ClassVar[int]
     stage: int
     epoch: int
     inbox_depth: int
     cached_requests: int
-    def __init__(self, stage: _Optional[int] = ..., epoch: _Optional[int] = ..., inbox_depth: _Optional[int] = ..., cached_requests: _Optional[int] = ...) -> None: ...
+    busy_ns: int
+    steps: int
+    def __init__(self, stage: _Optional[int] = ..., epoch: _Optional[int] = ..., inbox_depth: _Optional[int] = ..., cached_requests: _Optional[int] = ..., busy_ns: _Optional[int] = ..., steps: _Optional[int] = ...) -> None: ...
 
 class Nack(_message.Message):
     __slots__ = ("stage", "epoch", "rid", "attempt", "step", "reason")
