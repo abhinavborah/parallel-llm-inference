@@ -10,6 +10,7 @@ streamed again. Equality with a fault-free run is on one host, fp32, batch 1.
 import logging
 import subprocess
 import sys
+import threading
 import time
 
 import grpc
@@ -24,6 +25,7 @@ from pllm import faults
 from pllm.control import ExpectedModel
 from pllm.faults import StepDelay
 from pllm.models import sha256_of
+from pllm.stage_service import StageServicer
 
 LAYERS = 4
 K = 2
@@ -191,6 +193,44 @@ def test_a_gap_nack_replays_the_request(beating, tmp_path):
     # the replay runs under a new attempt, so no late result of the old one can be taken
     replayed = [m for m in seen if m[0] == request.rid and m[2:4] == (0, 0)]
     assert replayed and all(m[1] >= 2 for m in replayed)
+
+
+def test_a_replay_refused_before_the_route_update_retries_with_a_pause(
+    beating, tmp_path, monkeypatch
+):
+    """A new Stage 1 that has not yet learned Stage 0's epoch refuses the replay with
+    BAD_SENDER. The request starts again under a newer attempt each time, 0.05 s apart,
+    and finishes unchanged once the route update lands."""
+    hold = 0.5
+    run = beating(delay1=0.05)
+    expected = reference(tmp_path, K, IDS, 8)[0]
+    stream = run.call(max_tokens=8)
+    tokens = take(stream, 2)
+    first = {run.servicer0, run.servicer1}
+    real_route, real_nack = StageServicer.route, StageServicer._nack
+    nacks = []
+
+    def late(self, update):
+        if self not in first and update.next_stage == 0:  # the new stage's upstream epoch
+            threading.Timer(hold, real_route, (self, update)).start()
+            return True
+        return real_route(self, update)
+
+    def counted(self, request, reason):
+        nacks.append(reason)
+        return real_nack(self, request, reason)
+
+    # set before the new stage registers, so its first route update is held back
+    monkeypatch.setattr(StageServicer, "route", late)
+    monkeypatch.setattr(StageServicer, "_nack", counted)
+    replace(run, 1)
+    start_replacement(run, 1)
+    tokens += list(stream)
+    assert [t.token for t in tokens] == expected
+    assert [t.step for t in tokens] == list(range(8))
+    assert "BAD_SENDER" in nacks  # the refused branch was reached
+    # without the pause this is one replay per round trip; with it, about hold / 0.05
+    assert run.gateway.replays <= hold / 0.05 + 5
 
 
 @pytest.mark.parametrize("timeout_ms", [20_000, 800], ids=["long", "short"])

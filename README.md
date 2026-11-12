@@ -273,7 +273,8 @@ logits equal the single-process reference (tested with small random models).
 - A new request finds a stage that is not registered or declared dead: refused with
   UNAVAILABLE. A running request whose stage dies replays instead (see [Replay](#replay)).
   A stream to Stage 0 that fails with no stage declared dead within the heartbeat timeout
-  (an error inside a stage, for example) fails the request with UNAVAILABLE.
+  and one more 0.05 s check (an error inside a stage, for example) fails the request with
+  UNAVAILABLE.
 - The request table (`Gateway.table()`) lists each running request: id, attempt, tokens so
   far, expected step and seconds to its deadline.
 - Result filter and exactly-once delivery (R4.7, R4.8). A result is accepted only when its

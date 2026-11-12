@@ -976,13 +976,15 @@ class Gateway(
             time.sleep(POLL_SECONDS)
 
     def _declared_soon(self, request: Request, attempt: int, context) -> bool:
-        """After a failed stream: wait up to the heartbeat timeout for a declaration to bump
-        the request. Only a dead stage is replayed; a stage that ends the stream for another
+        """After a failed stream: wait up to the heartbeat timeout, and one more watcher pass,
+        for a declaration to bump the request. Only a dead stage is replayed; a stage that
+        ends the stream for another
         reason, such as an error inside it, fails the request as before. With no heartbeat
         stream open nothing could declare a death, so there is no wait."""
         with self._lock:
             watched = bool(self._sessions)
-        until = time.monotonic() + self.detector.heartbeat_timeout_ns / 1e9
+        # one more watcher pass: a stage silent for exactly the timeout is declared on it
+        until = time.monotonic() + self.detector.heartbeat_timeout_ns / 1e9 + POLL_SECONDS
         while watched and time.monotonic() < until:
             with self._lock:
                 if request.attempt != attempt:
@@ -1027,6 +1029,8 @@ class Gateway(
                         request.expected_step,
                     )
                     if current and (result.reason == "GAP" or request.recovering):
+                        if request.recovering:
+                            time.sleep(POLL_SECONDS)  # a refused replay never spins
                         return RECOVER
                     if current:
                         context.abort(
