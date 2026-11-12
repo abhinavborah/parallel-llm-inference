@@ -203,6 +203,14 @@ class Recorder:
                 }
             )
 
+    def event(self, record: dict) -> None:
+        """A failure detection record, written as a line of its own type (detected or
+        registered). Its times must come from this recorder's clock."""
+        with self._lock:
+            line = {"type": record["event"]}
+            line.update((k, v) for k, v in record.items() if k != "event")
+            self._write(line)
+
     def link_ended(self, rows: list[list] | None) -> None:
         """Add one Stage 0 stream's report; None means it gave no valid report."""
         if self._file is None:

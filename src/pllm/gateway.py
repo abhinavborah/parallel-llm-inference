@@ -15,7 +15,10 @@ One gRPC server hosts four services:
   stream opens and each time that stage registers: Stage 0 uses it as its next hop
   (R3.13), Stage 1 as the sender epoch it accepts (R3.11). A stream whose first Beat is
   not from the stage's latest registration is refused with FAILED_PRECONDITION, and so is
-  an open stream once its stage registers again.
+  an open stream once its stage registers again. A stage whose epoch was declared dead,
+  with no replacement yet, gets ABORTED when it is next heard from, by a Beat or a new
+  stream; it exits and its supervisor starts a new one. ABORTED is not sent at the declaration: a
+  suspended stage would read it on resume and exit even if a replacement had registered.
 - Frontend.Generate: a client sends a prompt, max_tokens and a timeout and receives the
   tokens in order. The gateway tokenises the prompt, gives the request an id and attempt
   1, sends the whole prompt as one message at start_pos 0, then drives greedy decode:
@@ -47,7 +50,13 @@ Every request and every message the gateway sends or receives is written to the 
 metrics file, stamped by one clock (pllm.metrics). Deadlines stay on the monotonic clock,
 which is never reported.
 
-Failure detection from missed beats is not here (#38); beats() gives what it needs.
+Failure detection is pllm.detection. A heartbeat stream that breaks, a stage silent past the
+heartbeat timeout and a step past the step timeout are each recorded on the recorder's
+clock, in the log and as a line of the metrics file. Both timeouts are gateway flags.
+The first two declare the stage's epoch dead: requests are refused with UNAVAILABLE until a
+new registration gives the stage a higher epoch, and the neighbour then gets a route update.
+Only the heartbeat stream names a dead stage: Stage 0 also ends its data stream when Stage 1
+dies or a route moves. Requests in flight behave as before; replaying them is #39.
 
 Many requests in flight (R4.5): every request goes to Stage 0 on the one stream, so the
 stages see the requests' steps interleaved in whatever order they arrive, and Stage 0 works
@@ -67,7 +76,7 @@ a model call within a stage. One long prefill at a stage delays every other requ
 step there (head-of-line blocking). Each Generate holds a
 server thread for its life, so serve() caps running requests at max_workers -
 RESERVED_THREADS; without the cap, a full pool leaves no thread for Results.Push and every
-running request stalls until its deadline. Also not here: recovery and replay (#38, #39).
+running request stalls until its deadline. Also not here: replay (#39).
 
 Flow control (R5.1, R5.2). Admission: a request that finds every running slot taken waits
 in a first-in, first-out queue of max_queued places; one that finds the queue full is
@@ -125,6 +134,8 @@ import grpc
 
 from pllm import config, metrics, prompts, runrecord, wire
 from pllm.control import Registration, Registry, expected_model
+from pllm.detection import HEARTBEAT_TIMEOUT_SECONDS, STEP_TIMEOUT_SECONDS, Detector
+from pllm.heartbeat import HEARTBEAT_SECONDS
 from pllm.model import ModelConfig
 from pllm.models import MODELS_DIR, PINNED
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
@@ -161,6 +172,7 @@ class Request:
     arrived_ns: int | None = None  # the three *_ns values are on the recorder's clock
     first_token_ns: int | None = None
     last_token_ns: int | None = None
+    step_due_ns: int | None = None  # detector clock; None once the step's record is written
 
     def row(self) -> dict:
         return {
@@ -219,6 +231,7 @@ class Session:
         self.stage, self.epoch = stage, epoch
         self.outbox: queue.Queue = queue.Queue()  # route updates for this stream
         self.superseded = threading.Event()
+        self.fenced = threading.Event()  # a Beat arrived after this epoch was declared dead
         self.closed = threading.Event()
 
 
@@ -241,11 +254,14 @@ class Gateway(
         max_positions: int | None = None,
         max_queued: int = MAX_QUEUED,
         credits: int | None = None,
+        heartbeat_timeout: float = HEARTBEAT_TIMEOUT_SECONDS,
+        step_timeout: float = STEP_TIMEOUT_SECONDS,
     ):
         """max_positions is the model's context length: a request whose prompt and
         max_tokens together exceed it is refused. None leaves it unchecked. max_queued is
         the admission queue's size and credits the steps in flight at once (None: no
-        limit beyond the running slots)."""
+        limit beyond the running slots). The two timeouts, in seconds, go to the
+        failure detector."""
         self.registry = registry
         self.max_positions = max_positions
         self.tokenizer = tokenizer
@@ -275,6 +291,16 @@ class Gateway(
         # pass its epoch check just before a newer registration and then become current.
         self._control = threading.Lock()
         self._link: Link | None = None
+        # Looked up at each call: main sets the recorder after this. A new recorder keeps
+        # the same clock, or the detector would subtract times from two clocks.
+        self.detector = Detector(
+            heartbeat_timeout,
+            step_timeout,
+            clock=lambda: self.recorder.now(),
+            sink=lambda record: self.recorder.event(record),
+        )
+        self._stopping = threading.Event()
+        self._watcher: threading.Thread | None = None
         self._retired: list[Link] = []  # half-closed, waiting for stage 0's counters
 
     # ------------------------------------------------------------------ table and frees
@@ -334,6 +360,7 @@ class Gateway(
 
     def Register(self, request, context):
         with self._control:
+            previous = self.registry.stages.get(request.stage)
             try:
                 entry = self.registry.register(request)
             except Registration as err:
@@ -345,8 +372,14 @@ class Gateway(
             if old is not None:
                 old.superseded.set()  # before the drain: it stops taking frees
             self.frees_for(entry.stage)  # a new process holds none of those caches
+            if previous is not None:  # a respawn can beat detection
+                self.detector.declare(previous.stage, previous.epoch, "replaced")
+            queued = None
             if other is not None:  # Stage 0 learns its next hop, Stage 1 its upstream
                 other.outbox.put(self._route(entry))
+                queued = self.detector.now()
+            old_epoch = previous.epoch if previous is not None else None
+            self.detector.registered(entry.stage, old_epoch, entry.epoch, queued)
         return protocol_pb2.RegisterResp(epoch=entry.epoch)
 
     @staticmethod
@@ -380,6 +413,9 @@ class Gateway(
             with self._lock:
                 if self._sessions.get(session.stage) is not session:
                     return  # a stream that has been replaced
+                if not self.detector.beat(session.stage, session.epoch):
+                    session.fenced.set()  # the epoch was declared dead: not a live beat
+                    return
                 self._beats[session.stage] = (message.beat, time.monotonic())
             # outside the lock: the recorder takes its own
             self.recorder.beat(session.stage, message.beat)
@@ -432,13 +468,15 @@ class Gateway(
         self._record(session, first)
 
         def read():
+            why = "closed"
             try:
                 for message in request_iterator:
                     self._record(session, message)
-            except grpc.RpcError:
-                pass  # the stage went away
+            except grpc.RpcError:  # the stage went away
+                why = "broken"
             finally:
                 session.closed.set()
+                self._stream_ended(session, why)
 
         threading.Thread(target=read, name=f"heartbeat-{stage}", daemon=True).start()
         log.info("heartbeat open from stage %d epoch %d", stage, epoch)
@@ -446,11 +484,9 @@ class Gateway(
             if route is not None:
                 yield route
             while not session.closed.is_set() and context.is_active():
-                if session.superseded.is_set():
-                    context.abort(
-                        grpc.StatusCode.FAILED_PRECONDITION,
-                        f"stage {stage} registered again after epoch {epoch}",
-                    )
+                refusal = self._refusal(session)
+                if refusal is not None:
+                    context.abort(*refusal)
                 try:
                     yield session.outbox.get_nowait()
                     continue
@@ -470,6 +506,42 @@ class Gateway(
                     del self._sessions[stage]
             log.info("heartbeat closed from stage %d epoch %d", stage, epoch)
 
+    def _refusal(self, session: Session) -> tuple[grpc.StatusCode, str] | None:
+        """Why an open stream must end, or None. Superseded comes first, under the lock
+        Register holds: a stage told ABORTED exits, and its respawn would register a third
+        epoch over the replacement."""
+        with self._control:
+            if session.superseded.is_set():
+                return (
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"stage {session.stage} registered again after epoch {session.epoch}",
+                )
+            if session.fenced.is_set():
+                return (
+                    grpc.StatusCode.ABORTED,
+                    f"stage {session.stage} epoch {session.epoch} was declared dead",
+                )
+        return None
+
+    def _stream_ended(self, session: Session, why: str) -> None:
+        """Declare the stream's epoch dead unless a newer stream or registration replaced it.
+        Not judged by _sessions: on a kill the generator can remove the session first."""
+        entry = self.registry.stages.get(session.stage)
+        current = entry is not None and entry.epoch == session.epoch
+        if current and not session.superseded.is_set():
+            self.detector.declare(session.stage, session.epoch, "stream_break", why)
+
+    def watch(self) -> None:
+        """Start the thread that expires silent stages; close() stops it. It is not a pool
+        thread, so RESERVED_THREADS does not count it."""
+
+        def run():
+            while not self._stopping.wait(POLL_SECONDS):
+                self.detector.expire()
+
+        self._watcher = threading.Thread(target=run, name="failure-detector", daemon=True)
+        self._watcher.start()
+
     # ------------------------------------------------------------------ Stage 0 link
 
     def _stage0(self, context) -> Link:
@@ -477,6 +549,12 @@ class Gateway(
         for stage in STAGES:
             if stage not in stages:
                 context.abort(grpc.StatusCode.UNAVAILABLE, f"stage {stage} is not registered")
+            if self.detector.is_dead(stages[stage].epoch):
+                context.abort(
+                    grpc.StatusCode.UNAVAILABLE,
+                    f"stage {stage} epoch {stages[stage].epoch} is dead; waiting for it to "
+                    "register again",
+                )
         entry = stages[0]
         with self._lock:
             link = self._link
@@ -500,8 +578,11 @@ class Gateway(
     def close(self) -> None:
         """End every stream to Stage 0 and add up its byte counters, waiting at most
         CLOSE_WAIT_SECONDS in all. Results.Push must still be up, so that Stage 1 can finish
-        and Stage 0 can end cleanly. The gateway stays usable, and calling this again is
-        harmless."""
+        and Stage 0 can end cleanly. The gateway stays usable, without its heartbeat watch,
+        and calling this again is harmless."""
+        self._stopping.set()
+        if self._watcher is not None:
+            self._watcher.join()
         with self._lock:
             if self._link is not None:
                 self._link.end()
@@ -716,6 +797,7 @@ class Gateway(
                 if not self._take_credit(request, context):
                     how = "cancelled by the client"
                     return
+                request.step_due_ns = self.detector.now() + self.detector.step_timeout_ns
                 message = protocol_pb2.StepRequest(
                     rid=request.rid,
                     attempt=request.attempt,
@@ -789,6 +871,9 @@ class Gateway(
                 )
             if not context.is_active():
                 return None
+            if request.step_due_ns is not None and self.detector.now() >= request.step_due_ns:
+                request.step_due_ns = None  # one record per step
+                self.detector.step_deadline(request.rid, request.expected_step)
             try:
                 result = request.results.get(timeout=min(left, POLL_SECONDS))
             except queue.Empty:
@@ -844,6 +929,7 @@ def serve(
     if port == 0:
         raise OSError(f"could not listen on {bind}")
     server.start()
+    gateway.watch()
     log.info("gateway listening on port %d", port)
     return server, port
 
@@ -897,11 +983,40 @@ def run_until_stopped(gateway: Gateway, server: grpc.Server, done: threading.Eve
     gateway.recorder.finish()
 
 
+def seconds_above(low: float):
+    """An argparse type: a finite number of seconds greater than low."""
+
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a number: {text}") from None
+        if not low < value < float("inf"):
+            raise argparse.ArgumentTypeError(f"must be more than {low} seconds")
+        return value
+
+    return parse
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the gateway for one model.")
     parser.add_argument("model", choices=sorted(PINNED))
     parser.add_argument("--split-point", type=int, help="override the committed split point")
     parser.add_argument("--metrics", type=Path, help="metrics file (default: a new one in runs/)")
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=seconds_above(HEARTBEAT_SECONDS),
+        default=HEARTBEAT_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=f"no Beat for this long declares a stage dead (default {HEARTBEAT_TIMEOUT_SECONDS})",
+    )
+    parser.add_argument(
+        "--step-timeout",
+        type=seconds_above(0),
+        default=STEP_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=f"record a step with no result after this long (default {STEP_TIMEOUT_SECONDS})",
+    )
     args = parser.parse_args(argv)
     model_dir = MODELS_DIR / args.model
     try:
@@ -921,6 +1036,8 @@ def main(argv: list[str] | None = None) -> None:
                 "split": expected.split_point,
                 "network": hosts.network,
                 **runrecord.machine(),
+                "heartbeat_timeout_s": args.heartbeat_timeout,
+                "step_timeout_s": args.step_timeout,
                 "argv": sys.argv,
             },
         )
@@ -936,6 +1053,8 @@ def main(argv: list[str] | None = None) -> None:
         max_positions(model_dir),
         max_queued=limits.admission_queue,
         credits=limits.credits,
+        heartbeat_timeout=args.heartbeat_timeout,
+        step_timeout=args.step_timeout,
     )
     gateway.recorder = recorder
     done = stop_event()

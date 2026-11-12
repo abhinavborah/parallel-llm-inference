@@ -328,11 +328,13 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 
 | `type` | When | Fields |
 |---|---|---|
-| `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `argv` |
+| `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `heartbeat_timeout_s`, `step_timeout_s`, `argv` |
 | `hop` | Each message the gateway sends or receives | `t_ns`, `hop`, `msg`, `phase`, `rid`, `attempt`, `step`, `bytes`, `payload_bytes`, `positions`, `accepted` |
-| `beat` | Each stage heartbeat (every 0.5 s) | `t_ns`, `stage`, `epoch`, `busy_ns`, `steps` |
+| `beat` | Each heartbeat of a live epoch (every 0.5 s); one from an epoch declared dead is not logged | `t_ns`, `stage`, `epoch`, `busy_ns`, `steps` |
 | `request` | Each request's end | `t_ns`, `rid`, `attempt`, `outcome`, `code`, `prompt_tokens`, `max_tokens`, `output_tokens`, `arrived_ns`, `first_token_ns`, `last_token_ns` |
 | `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
+| `detected` | Each failure detection | as in [Failure detection](#failure-detection) |
+| `registered` | Each stage registration | as in [Failure detection](#failure-detection) |
 | `run_end` | Run end | `t_ns`, `links`, `links_unreported`, `stage0_stage1_complete`, `write_errors` |
 
 - Hops are `gateway_stage0`, `stage0_stage1` and `stage1_gateway`. `phase` is `replay` for a
@@ -429,16 +431,62 @@ and keeps the Nacks (`Gateway.nacks`, the last 1024, and
 If the gateway cannot be reached, the stage tries again every second, and its Nacks wait
 in an unbounded queue. When a stage registers again, the gateway ends the old process's
 stream with FAILED_PRECONDITION and that process stops sending heartbeats but keeps
-serving; frees still queued for the old process are dropped. A restarted gateway would
+serving; frees still queued for the old process are dropped. A process whose epoch was
+declared dead with no replacement yet gets ABORTED at its next Beat or stream, exits with
+code 1, and its supervisor starts a new one (see "Failure detection"). A restarted gateway would
 refuse every stream the same way; only workers are restarted.
 
 Limits:
 
-- Declaring a stage dead from missed beats, and replaying its requests, come with the
-  recovery stories. A request started between a registration and its route update reaching
-  the other stage (a few milliseconds) is refused by fencing and fails at once.
+- A request started between a registration and its route update reaching the other stage
+  (a few milliseconds) is refused by fencing and fails at once.
 - A Nack or a `Free` sent just as the stream breaks can be lost with it. A lost `Free`
   leaves that request's cache on the stage until the process ends.
+
+## Failure detection
+
+The gateway watches each stage incarnation by its epoch (`pllm.detection`, read with
+`Gateway.detector.events()`). It logs each record as one JSON line and writes it to the
+metrics file as a line whose `type` is the record's `event`.
+
+| Path | Fires when | Effect |
+|---|---|---|
+| `stream_break` | the heartbeat stream of the latest registration ends | epoch declared dead |
+| `heartbeat_timeout` | no Beat for `--heartbeat-timeout` seconds (default 2.0, four intervals), checked every 0.05 s | epoch declared dead |
+| `replaced` | a new registration arrives before either of the above | epoch declared dead |
+| `step_deadline` | a step has no result `--step-timeout` seconds after it was sent (default 10), once per step | record only |
+
+A declared epoch is never revived; the first declaration writes the only record. Requests
+are refused with UNAVAILABLE until the stage registers again. The new registration gets a
+higher epoch, and the neighbour gets a route update. Requests already running behave as
+before; replaying them is not done yet.
+
+A step deadline names a suspect, the stage whose last beat is older than half the heartbeat
+timeout, and declares nothing. A slow stage still beats, so its supervisor would never send
+the registration a declaration waits for, and the gateway cannot tell which stage holds a
+late step. The request carries on to its own deadline.
+
+Every reported time is an integer from the metrics file's clock (`time.perf_counter_ns` on
+the gateway), in a field ending in `_ns`, so intervals subtract directly and match the
+file's other lines. `time` is the wall clock, a label only.
+Detection records:
+
+- `detected`: `path`, `stage`, `epoch`, `declared`, `t_ns`, `time`, `last_beat_ns`,
+  `since_last_beat_ns`, `rid`, `step`, `detail` (`stage` and `epoch` are the suspect or null
+  for a step deadline).
+- `registered`: `stage`, `old_epoch`, `new_epoch`, `t_ns`, `time`, `waited_ns` (from the
+  declaration), `route_queued_ns` (null if the neighbour had no stream).
+
+The two default timeouts are provisional: the beat gaps behind the 2.0 s value were measured
+on one laptop only. A laptop that pauses longer, for example while paging, needs a larger
+`--heartbeat-timeout`. The `run` line of the metrics file records the values in use.
+
+Limits:
+
+- A stage that breaks its heartbeat stream is dead to the gateway even if the process is
+  fine, so a network blip now costs a respawn and a weight reload.
+- A worker suspended and never resumed produces no registration, because its supervisor sees
+  a live process. The gateway waits.
 
 ## X1a: the split against the single process
 

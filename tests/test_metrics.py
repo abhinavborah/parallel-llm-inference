@@ -285,6 +285,29 @@ def test_a_clean_run_totals_every_hop_prefill_apart_from_decode(metered):
     assert (end["links"], end["links_unreported"], end["stage0_stage1_complete"]) == (1, 0, True)
 
 
+def test_a_beat_from_an_epoch_declared_dead_is_fenced_and_not_logged(metered):
+    """A beat is logged only while its epoch is live: after the detector declares the epoch
+    dead the stream is fenced and the beat is neither kept nor written, so the report never
+    counts the busy time of a stage the gateway has given up on."""
+    run, path = metered()
+    gateway = run.gateway
+    epoch = run.registry.stages[1].epoch
+    session = gateway_module.Session(1, epoch)
+    gateway._sessions[1] = session
+
+    def beat(busy):
+        return pb.StageMsg(beat=pb.Beat(stage=1, epoch=epoch, busy_ns=busy, steps=1))
+
+    gateway._record(session, beat(100))
+    assert gateway.beats()[1]["epoch"] == epoch and not session.fenced.is_set()
+    assert gateway.detector.declare(1, epoch, "heartbeat_timeout")
+    gateway._record(session, beat(200))
+    assert session.fenced.is_set()
+    end_run(run)
+    logged = of_type(lines(path), "beat")
+    assert [(b["stage"], b["epoch"], b["busy_ns"]) for b in logged] == [(1, epoch, 100)]
+
+
 def test_a_run_with_no_requests_is_complete_and_empty(metered):
     run, path = metered()
     end_run(run)
