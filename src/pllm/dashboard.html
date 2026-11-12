@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pllm dashboard</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f27; --muted: #5b6475; --line: #d9dde5;
+  --accent: #2b59c3; --ok: #1d7a46; --bad: #b3261e; --warn: #8a5a00;
+  --ok-bg: #e3f4ea; --bad-bg: #fbe6e4; --warn-bg: #fff1d6; --idle-bg: #eceef3;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1b2029; --ink: #e8ebf2; --muted: #9aa4b8; --line: #2c3340;
+    --accent: #7ea6ff; --ok: #6ccf97; --bad: #ff8f87; --warn: #f0c36a;
+    --ok-bg: #173324; --bad-bg: #3b1d1b; --warn-bg: #3a2d10; --idle-bg: #262c38;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 13px; margin: 20px 0 8px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); }
+.conn { font-size: 13px; padding: 2px 10px; border-radius: 999px; background: var(--idle-bg); }
+.conn[data-up="true"] { background: var(--ok-bg); color: var(--ok); }
+.conn[data-up="false"] { background: var(--bad-bg); color: var(--bad); }
+.grid { display: grid; gap: 12px; }
+.stages { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.tiles { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.requests { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+.card h3 { margin: 0 0 6px; font-size: 15px; display: flex; justify-content: space-between;
+  align-items: center; gap: 8px; }
+.badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  background: var(--idle-bg); color: var(--muted); }
+.badge[data-state="alive"], .badge[data-state="done"] { background: var(--ok-bg); color: var(--ok); }
+.badge[data-state="dead"], .badge[data-bad="true"] { background: var(--bad-bg); color: var(--bad); }
+.badge[data-state="running"] { background: var(--warn-bg); color: var(--warn); }
+dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0 0 8px; }
+dt { color: var(--muted); }
+dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.tile .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .label { color: var(--muted); font-size: 13px; }
+.tile[data-bad="true"] .value { color: var(--bad); }
+button { font: inherit; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--ink); cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+input[type=text], input[type=number] { font: inherit; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+input[type=text] { flex: 1 1 280px; min-width: 0; }
+input[type=number] { width: 5.5em; }
+label { color: var(--muted); }
+.stream { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; min-height: 2.9em;
+  max-height: 11em; overflow: auto; font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+  font-size: 13px; }
+.stream .dup { color: var(--bad); font-weight: 600; }
+.meta { color: var(--muted); font-size: 12px; }
+#message { min-height: 1.4em; margin: 8px 0 0; color: var(--muted); }
+#message[data-bad="true"] { color: var(--bad); }
+footer { margin-top: 24px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>pllm dashboard</h1>
+  <span id="conn" class="conn" data-up="" role="status">connecting</span>
+</header>
+
+<h2>Stages</h2>
+<div class="grid stages" id="stages"></div>
+
+<h2>System</h2>
+<div class="grid tiles" id="tiles"></div>
+
+<h2>Send</h2>
+<div class="card">
+  <div class="row">
+    <input type="text" id="prompt" value="The capital of France is" maxlength="2000"
+      aria-label="Prompt">
+    <label for="max">tokens</label>
+    <input type="number" id="max" value="16" min="1" max="64">
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button class="primary" data-mode="one">Send</button>
+    <button data-mode="eight">Send 8 at once</button>
+    <button data-mode="flood" title="Starts __FLOOD__ requests, more than the gateway runs and queues">Flood (__FLOOD__)</button>
+  </div>
+  <p id="message" role="status" aria-live="polite"></p>
+</div>
+
+<h2>Requests</h2>
+<div class="grid requests" id="requests"></div>
+
+<footer>A demo aid. Reported numbers come from the scripts that read the metrics files,
+never from this page.</footer>
+</main>
+
+<script>
+"use strict";
+const MAX_CARDS = 24, MAX_CHARS = 1500;
+const $ = (id) => document.getElementById(id);
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function bytes(n) {
+  if (typeof n !== "number") return "n/a";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i < 2 ? n.toFixed(0) : n.toFixed(1)) + " " + units[i];
+}
+
+function say(text, bad) {
+  const node = $("message");
+  node.textContent = text;
+  node.dataset.bad = bad ? "true" : "";
+}
+
+async function post(path, body) {
+  try {
+    const reply = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await reply.json().catch(() => ({}));
+    return { ok: reply.ok, data };
+  } catch (err) {
+    return { ok: false, data: { error: "the dashboard is not reachable" } };
+  }
+}
+
+/* ---------------------------------------------------------------- stages */
+
+const stageNodes = {};
+function buildStage(stage) {
+  const card = el("div", "card");
+  const title = el("h3");
+  title.append(el("span", "", "Stage " + stage));
+  const badge = el("span", "badge", "unknown");
+  title.append(badge);
+  card.append(title);
+  const list = el("dl");
+  const fields = {};
+  for (const [key, label] of [["epoch", "Epoch"], ["addr", "Address"], ["beat", "Last beat"],
+      ["worker", "Worker"], ["ram", "Free RAM"]]) {
+    list.append(el("dt", "", label));
+    fields[key] = el("dd", "", "n/a");
+    list.append(fields[key]);
+  }
+  card.append(list);
+  const row = el("div", "row");
+  for (const [action, label, cls] of [["kill", "Kill", "danger"], ["suspend", "Freeze", ""],
+      ["resume", "Unfreeze", ""]]) {
+    const button = el("button", cls, label);
+    button.setAttribute("aria-label", label + " stage " + stage);
+    button.addEventListener("click", () => fault(stage, action, label));
+    row.append(button);
+  }
+  card.append(row);
+  $("stages").append(card);
+  stageNodes[stage] = { badge, ...fields };
+}
+
+async function fault(stage, action, label) {
+  const { ok, data } = await post("/fault", { stage, action });
+  say(ok ? label + " stage " + stage + ": done" : label + " stage " + stage + " failed: " +
+      (data.error || "unknown error"), !ok);
+}
+
+/* ---------------------------------------------------------------- counters */
+
+const tileNodes = {};
+function tile(key, label) {
+  const node = el("div", "card tile");
+  const value = el("div", "value", "n/a");
+  node.append(value, el("div", "label", label));
+  $("tiles").append(node);
+  tileNodes[key] = { node, value };
+}
+
+function setTile(key, text, bad, title) {
+  const t = tileNodes[key];
+  t.value.textContent = text;
+  t.node.dataset.bad = bad ? "true" : "";
+  t.node.title = title || "";
+}
+
+function render(s) {
+  for (const stage of ["0", "1"]) {
+    const info = s.stages[stage], node = stageNodes[stage], host = s.hosts[stage] || {};
+    node.badge.textContent = info.state;
+    node.badge.dataset.state = info.state;
+    node.epoch.textContent = info.epoch === null ? "n/a" : String(info.epoch);
+    node.addr.textContent = info.addr || "n/a";
+    node.beat.textContent = info.beat_age_s === null ? "n/a" : info.beat_age_s.toFixed(1) + " s ago";
+    node.worker.textContent = host.reachable === false ? "supervisor unreachable"
+      : host.reachable ? host.state + (host.restarts ? ", " + host.restarts + " restarts" : "") : "n/a";
+    node.ram.textContent = bytes(host.free_ram_bytes);
+  }
+  const limit = (n, max) => max === null || max === undefined ? String(n) : n + " / " + max;
+  setTile("running", limit(s.running, s.max_running), false);
+  setTile("queued", limit(s.queued, s.max_queued), false);
+  setTile("flight", limit(s.in_flight, s.credits), false);
+  setTile("rate", s.tokens_per_second.toFixed(1), false);
+  setTile("rejects", String(s.rejects), false);
+  const reasons = Object.entries(s.discards).map(([k, v]) => k + ": " + v).join(", ");
+  setTile("stale", String(s.stale), false, reasons || "none dropped");
+  setTile("dups", String(s.duplicates), s.duplicates > 0);
+  setTile("ram", bytes((s.hosts.gateway || {}).free_ram_bytes), false);
+}
+
+/* ---------------------------------------------------------------- requests */
+
+const cards = new Map();
+function startCard(id, prompt) {
+  const node = el("div", "card");
+  const title = el("h3");
+  title.append(el("span", "", id));
+  const badge = el("span", "badge", "running");
+  badge.dataset.state = "running";
+  title.append(badge);
+  const stream = el("p", "stream");
+  const meta = el("div", "meta", prompt);
+  node.append(title, meta, stream);
+  $("requests").prepend(node);
+  cards.set(id, { node, badge, stream, meta, prompt, count: 0, chars: 0 });
+  while (cards.size > MAX_CARDS) {
+    const [oldest] = cards.keys();
+    cards.get(oldest).node.remove();
+    cards.delete(oldest);
+  }
+}
+
+function addToken(d) {
+  const card = cards.get(d.id);
+  if (!card) return;
+  card.count++;
+  card.meta.textContent = card.prompt + " (" + card.count + " tokens)";
+  if (card.chars > MAX_CHARS) return;
+  card.chars += d.text.length;
+  if (d.duplicate) {
+    const mark = el("span", "dup", d.text || "[dup]");
+    card.stream.append(mark);
+  } else {
+    card.stream.append(document.createTextNode(d.text));
+  }
+  card.stream.scrollTop = card.stream.scrollHeight;
+}
+
+function endCard(d) {
+  const card = cards.get(d.id);
+  if (!card) return;
+  const done = d.outcome === "done";
+  card.badge.textContent = done ? "done" : d.outcome;
+  card.badge.dataset.state = done ? "done" : "failed";
+  card.badge.dataset.bad = done ? "" : "true";
+  if (!done && d.detail) card.meta.textContent = d.detail;
+}
+
+/* ---------------------------------------------------------------- wiring */
+
+for (const stage of [0, 1]) buildStage(stage);
+tile("running", "Running");
+tile("queued", "Queued");
+tile("flight", "Steps in flight");
+tile("rate", "Tokens per second");
+tile("rejects", "Rejected");
+tile("stale", "Stale outputs dropped");
+tile("dups", "Duplicate tokens (always 0)");
+tile("ram", "Gateway laptop free RAM");
+
+for (const button of document.querySelectorAll("button[data-mode]")) {
+  button.addEventListener("click", async () => {
+    const count = Number($("max").value);
+    const { ok, data } = await post("/generate", {
+      prompt: $("prompt").value, max_tokens: count, mode: button.dataset.mode,
+    });
+    if (!ok) say(data.error || "the request was refused", true);
+    else say(data.skipped ? "started " + data.ids.length + ", " + data.skipped + " skipped (too many running)" : "", false);
+  });
+}
+
+const conn = $("conn");
+let retry = null;
+function connect() {
+  const source = new EventSource("/events");
+  source.onopen = () => { conn.textContent = "live"; conn.dataset.up = "true"; };
+  source.onerror = () => {
+    conn.dataset.up = "false";
+    if (source.readyState === 2) {
+      // the browser gave up, for example because the server refused the stream: try again
+      conn.textContent = "disconnected, trying again in 5 s";
+      source.close();
+      clearTimeout(retry);
+      retry = setTimeout(connect, 5000);
+    } else {
+      conn.textContent = "disconnected, retrying";
+    }
+  };
+  source.addEventListener("state", (e) => render(JSON.parse(e.data)));
+  source.addEventListener("start", (e) => { const d = JSON.parse(e.data); startCard(d.id, d.prompt); });
+  source.addEventListener("token", (e) => addToken(JSON.parse(e.data)));
+  source.addEventListener("end", (e) => endCard(JSON.parse(e.data)));
+  source.addEventListener("fault", (e) => {
+    const d = JSON.parse(e.data);
+    say("stage " + d.stage + " " + d.action + (d.ok ? ": done" : " refused: " + (d.error || d.code)), !d.ok);
+  });
+}
+connect();
+</script>
+</body>
+</html>

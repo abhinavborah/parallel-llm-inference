@@ -308,6 +308,7 @@ def test_the_control_port_applies_kill_suspend_and_resume(tmp_path, running):
         port = server.server_address[1]
         pid = sup.pid
         assert call(port, "GET", "/status")[1]["state"] == "running"
+        assert call(port, "GET", "/status")[1]["free_ram_bytes"] > 0  # for the dashboard
         assert call(port, "POST", "/suspend") == (
             200,
             {"ok": True, "action": "suspend", "pid": pid},

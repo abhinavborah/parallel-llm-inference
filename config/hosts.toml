@@ -28,6 +28,13 @@ port = 50061
 host = "127.0.0.1"
 port = 50062
 
+# Where the gateway serves the dashboard when it is started with --dashboard (optional; without
+# this table it listens on the gateway's host at port 50080). The host is the address the browser
+# types, not 0.0.0.0. The page can kill, freeze and unfreeze workers, so keep it on the lab network.
+[dashboard]
+host = "127.0.0.1"
+port = 50080
+
 # Bounds on the largest gRPC message, a prefill of max_batch x max_prompt_tokens positions of
 # hidden-size fp32 values (decision #20). Every server and channel sets its receive limit from
 # these, and the gateway rejects a prompt above max_prompt_tokens. Prefill is not batched

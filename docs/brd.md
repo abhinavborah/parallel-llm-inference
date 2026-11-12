@@ -339,10 +339,10 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | ID | Requirement | Priority | Week | Owner | Source |
 |---|---|---|---|---|---|
 | R9.1 | Decision D11: keep the dashboard, discovery and pairing scheduled in W3 to W5 or treat them as stretch behind the minimum scope (pipeline, fencing, replay, tests, experiments). The scope proposal lists them as stretch. Owners are unassigned (about 2 days each). Blocks all of Epic E9. | Must | W3 | A and B (unassigned) | D11; Proposal deliverables |
-| R9.2 | Dashboard: one HTML page with plain JavaScript, served next to the gateway by a small HTTP endpoint, live updates over server-sent events. | Could | W3 | Unassigned | D11 |
-| R9.3 | Input controls: prompt box, send, send 8 at once, flood; live token stream per request. | Could | W3 | Unassigned | D11 |
-| R9.4 | Status and counters: each stage alive or dead, epoch, queue length, free RAM; tokens per second, rejects, stale outputs discarded, duplicate tokens (always 0). | Could | W4 | Unassigned | D11 |
-| R9.5 | Fault controls: kill Stage 0, freeze, unfreeze, calling the supervisor on that laptop. | Could | W4 | Unassigned | D11 |
+| R9.2 | Dashboard: one HTML page with plain JavaScript, served next to the gateway by a small HTTP endpoint, live updates over server-sent events. Built as `pllm.dashboard`, started with `--dashboard` (#68). | Could | W3 | Unassigned | D11 |
+| R9.3 | Input controls: prompt box, send, send 8 at once, flood; live token stream per request. Each request goes through the gateway's Frontend, so refusals and deadlines are real (#68). | Could | W3 | Unassigned | D11 |
+| R9.4 | Status and counters: each stage alive or dead (or unknown, before it registers or when its Beats are late but it is not yet declared dead), epoch, queue length, free RAM; tokens per second, rejects, stale outputs discarded, duplicate tokens (always 0). Free RAM comes from each laptop's supervisor; duplicates are counted on the streams the page relays (#68). | Could | W4 | Unassigned | D11 |
+| R9.5 | Fault controls: kill Stage 0, freeze, unfreeze, calling the supervisor on that laptop. For both stages, through the dashboard server, since the supervisor refuses cross-origin browser calls (#68). | Could | W4 | Unassigned | D11 |
 | R9.6 | Experiments run from scripts; no reported number depends on a browser. | Must | W6 | A and B (unconfirmed) | G4 |
 | R9.7 | mDNS announce on service `_pllm._tcp.local` with node id, OS, free RAM, cores, app version and weights hash; a scan lists the nodes found. | Could | W5 | Unassigned | D11 |
 | R9.8 | Add-by-IP is always available and the demo never depends on discovery working. | Could | W5 | Unassigned | D11; R1.8 |

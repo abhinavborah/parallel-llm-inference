@@ -66,3 +66,25 @@ def test_invalid_files_are_rejected(tmp_path, old, new, message):
     assert old in VALID
     with pytest.raises(ValueError, match=message):
         config.load(write(tmp_path, VALID.replace(old, new)))
+
+
+def test_the_dashboard_listens_on_the_gateways_host_unless_the_file_says_otherwise(tmp_path):
+    assert config.dashboard_endpoint(write(tmp_path, VALID)) == config.Endpoint(
+        "10.0.0.1", config.DASHBOARD_PORT
+    )
+    table = VALID + '\n[dashboard]\nhost = "10.0.0.3"\nport = 8080\n'
+    assert config.dashboard_endpoint(write(tmp_path, table)).address == "10.0.0.3:8080"
+
+
+@pytest.mark.parametrize(
+    "table",
+    ['host = ""\nport = 8080', 'host = "10.0.0.3"\nport = 0', 'host = "10.0.0.3"\nport = true'],
+)
+def test_a_bad_dashboard_table_is_rejected(tmp_path, table):
+    with pytest.raises(ValueError, match="dashboard"):
+        config.dashboard_endpoint(write(tmp_path, VALID + "\n[dashboard]\n" + table + "\n"))
+
+
+def test_the_committed_file_puts_the_dashboard_on_loopback():
+    endpoint = config.dashboard_endpoint(config.DEFAULT_PATH)
+    assert endpoint == config.Endpoint("127.0.0.1", config.DASHBOARD_PORT)

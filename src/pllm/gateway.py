@@ -273,6 +273,8 @@ class Gateway(
         self.frees = {stage: queue.Queue() for stage in STAGES}
         self.dropped = 0  # results and Nacks dropped, all reasons together
         self.discards: collections.Counter = collections.Counter()  # dropped, by reason
+        self.outcomes: collections.Counter = collections.Counter()  # requests ended, by outcome
+        self.tokens_out = 0  # tokens streamed to clients, all requests together
         self.nacks: collections.deque = collections.deque(maxlen=MAX_NACKS)
         self.nack_count = 0
         self._beats: dict[int, tuple[protocol_pb2.Beat, float]] = {}
@@ -323,6 +325,7 @@ class Gateway(
     def _end(self, request: Request, how: str, code=None) -> None:
         with self._lock:
             self.requests.pop(request.rid, None)
+            self.outcomes[how] += 1
         for stage in STAGES:
             self.frees[stage].put(protocol_pb2.Free(rid=request.rid, attempt=request.attempt))
         self.recorder.request(
@@ -343,6 +346,8 @@ class Gateway(
         self, req, context, arrived: int, prompt_tokens: int | None, how: str = "rejected"
     ) -> None:
         """The line of a request that ended before it entered the table."""
+        with self._lock:
+            self.outcomes[how] += 1
         self.recorder.request(
             how,
             context.code(),
@@ -406,6 +411,48 @@ class Gateway(
                 }
                 for stage, (b, at) in self._beats.items()
             }
+
+    def state(self) -> dict:
+        """A snapshot for the dashboard (R9.4): per stage its state, epoch and the age of its
+        last Beat; the flow-control counters; and the totals of requests ended by outcome,
+        results dropped by reason, and tokens streamed. A stage is "alive" while its epoch
+        is live and its last Beat is within the heartbeat timeout, "dead" once the failure
+        detector has declared its epoch dead, and "unknown" before it registers or beats."""
+        timeout_s = self.detector.heartbeat_timeout_ns / 1e9
+        registered = list(self.registry.stages.items())
+        now = time.monotonic()
+        with self._lock:
+            beats = dict(self._beats)
+            counters = {
+                "running": self._running,
+                "max_running": self.max_running,
+                "queued": len(self._waiting),
+                "max_queued": self.max_queued,
+                "in_flight": self._in_flight,
+                "credits": self.credits,
+                "tokens_out": self.tokens_out,
+                "outcomes": dict(self.outcomes),
+                "discards": dict(self.discards),
+            }
+        stages = {}
+        for stage, entry in registered:
+            beat = beats.get(stage)
+            if beat is not None and beat[0].epoch != entry.epoch:
+                beat = None  # a Beat of an earlier incarnation of this stage
+            age = None if beat is None else round(now - beat[1], 3)
+            if self.detector.is_dead(entry.epoch):
+                state = "dead"
+            elif age is not None and age <= timeout_s:
+                state = "alive"
+            else:
+                state = "unknown"
+            stages[stage] = {"state": state, "epoch": entry.epoch, "addr": entry.addr,
+                             "beat_age_s": age}  # fmt: skip
+        for stage in STAGES:
+            stages.setdefault(
+                stage, {"state": "unknown", "epoch": None, "addr": None, "beat_age_s": None}
+            )
+        return {**counters, "stages": {str(s): stages[s] for s in STAGES}}
 
     def _record(self, session: Session, message: protocol_pb2.StageMsg) -> None:
         kind = message.WhichOneof("msg")
@@ -823,6 +870,7 @@ class Gateway(
                 with self._lock:
                     request.tokens.append(chosen)
                     request.expected_step += 1
+                    self.tokens_out += 1
                 if chosen in self.eos_ids:
                     how = "end of sequence"
                 elif len(request.tokens) >= req.max_tokens:
@@ -970,13 +1018,18 @@ def stop_event() -> threading.Event:
     return done
 
 
-def run_until_stopped(gateway: Gateway, server: grpc.Server, done: threading.Event) -> None:
-    """Serve until done is set, then end the run: first the streams to Stage 0, while
+def run_until_stopped(
+    gateway: Gateway, server: grpc.Server, done: threading.Event, dashboard=None
+) -> None:
+    """Serve until done is set, then end the run: first the dashboard, if there is one, so
+    it starts no more requests, then the streams to Stage 0, while
     Results.Push is still up, then the server. The second close() takes a stream opened by a
     request that arrived during the first. The last lines of the file come after every
     request has written its own."""
     while not done.wait(0.5):  # a timeout, so a signal handler can run while this waits
         pass
+    if dashboard is not None:
+        dashboard.close()
     gateway.close()
     server.stop(grace=1).wait()
     gateway.close()
@@ -1003,6 +1056,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("model", choices=sorted(PINNED))
     parser.add_argument("--split-point", type=int, help="override the committed split point")
     parser.add_argument("--metrics", type=Path, help="metrics file (default: a new one in runs/)")
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="also serve the live dashboard (it can kill and freeze workers; see pllm.dashboard)",
+    )
     parser.add_argument(
         "--heartbeat-timeout",
         type=seconds_above(HEARTBEAT_SECONDS),
@@ -1057,9 +1115,20 @@ def main(argv: list[str] | None = None) -> None:
         step_timeout=args.step_timeout,
     )
     gateway.recorder = recorder
+    page = None
+    if args.dashboard:
+        from pllm import dashboard  # only when asked for: a plain gateway does not load it
+
+        try:
+            page = dashboard.from_config(gateway)
+        except (OSError, ValueError) as err:
+            recorder.finish()
+            parser.error(f"cannot start the dashboard: {err}")
     done = stop_event()
     server, _ = serve(gateway, f"0.0.0.0:{hosts.gateway.port}")
-    run_until_stopped(gateway, server, done)
+    if page is not None:
+        page.start()
+    run_until_stopped(gateway, server, done, page)
 
 
 if __name__ == "__main__":
