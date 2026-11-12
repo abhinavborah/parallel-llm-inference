@@ -56,6 +56,22 @@ def load(path: str | Path | None = None) -> HostConfig:
 
 
 SUPERVISOR_BASE_PORT = 50061  # stage 0 uses this, stage 1 the next port
+DASHBOARD_PORT = 50080
+
+
+def dashboard_endpoint(path: str | Path | None = None) -> Endpoint:
+    """Where the dashboard listens (R9.2).
+
+    A [dashboard] table sets it. Without one it listens on the gateway's host at port
+    50080, so a hosts file written before the dashboard existed keeps working.
+    """
+    path = Path(path) if path is not None else config_path()
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    if "dashboard" in data:
+        return _endpoint(data, "dashboard", path)
+    gateway = _endpoint(data, "gateway", path)
+    return Endpoint(gateway.host, DASHBOARD_PORT)
 
 
 def supervisor_endpoint(stage: int, path: str | Path | None = None) -> Endpoint:
