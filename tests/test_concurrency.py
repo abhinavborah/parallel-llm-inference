@@ -131,6 +131,8 @@ def test_eight_requests_together_each_produce_what_they_produce_alone(system, tm
         assert len({t.rid for t in out}) == 1
     assert len({out[0].rid for out in outs}) == len(JOBS)  # no two requests share an id
     assert not run.gateway.requests  # all left the table
+    # every step reached each stage in order for its request (R3.7)
+    assert run.servicer0.order_violations == run.servicer1.order_violations == 0
 
 
 # -------------------------------------------------------------- interleaved, each in order
