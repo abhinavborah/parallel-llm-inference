@@ -294,6 +294,7 @@ interval = float(sys.argv[7])
 
 class Stand:
     stage_index, own_epoch, inbox_depth, cached_requests = stage, 0, 0, 0
+    busy = (0, 0)
     nacks = queue.Queue()
 
     def free(self, message):
@@ -660,6 +661,7 @@ def test_a_worker_whose_epoch_is_declared_dead_ends_with_an_error(tmp_path):
 
     class Stand:
         stage_index, own_epoch, inbox_depth, cached_requests = 1, 0, 0, 0
+        busy = (0, 0)
         nacks = queue.Queue()
 
     raised = []

@@ -409,15 +409,20 @@ class Gateway(
 
     def _record(self, session: Session, message: protocol_pb2.StageMsg) -> None:
         kind = message.WhichOneof("msg")
+        if kind == "beat":
+            with self._lock:
+                if self._sessions.get(session.stage) is not session:
+                    return  # a stream that has been replaced
+                if not self.detector.beat(session.stage, session.epoch):
+                    session.fenced.set()  # the epoch was declared dead: not a live beat
+                    return
+                self._beats[session.stage] = (message.beat, time.monotonic())
+            # outside the lock: the recorder takes its own
+            self.recorder.beat(session.stage, message.beat)
+            return
         with self._lock:
             if self._sessions.get(session.stage) is not session:
                 return  # a stream that has been replaced
-            if kind == "beat":
-                if self.detector.beat(session.stage, session.epoch):
-                    self._beats[session.stage] = (message.beat, time.monotonic())
-                else:
-                    session.fenced.set()
-                return
             if kind != "nack":
                 return
             self.nacks.append(message.nack)

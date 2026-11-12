@@ -343,6 +343,7 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 |---|---|---|
 | `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `heartbeat_timeout_s`, `step_timeout_s`, `argv` |
 | `hop` | Each message the gateway sends or receives | `t_ns`, `hop`, `msg`, `phase`, `rid`, `attempt`, `step`, `bytes`, `payload_bytes`, `positions`, `accepted` |
+| `beat` | Each heartbeat of a live epoch (every 0.5 s); one from an epoch declared dead is not logged | `t_ns`, `stage`, `epoch`, `busy_ns`, `steps` |
 | `request` | Each request's end | `t_ns`, `rid`, `attempt`, `outcome`, `code`, `prompt_tokens`, `max_tokens`, `output_tokens`, `arrived_ns`, `first_token_ns`, `last_token_ns` |
 | `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
 | `detected` | Each failure detection | as in [Failure detection](#failure-detection) |
@@ -356,6 +357,12 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 - `outcome` is `end of sequence`, `max_tokens`, `cancelled by the client`, `failed` or
   `rejected`, and `code` is the gRPC status the gateway set. A send time is when the message
   was queued for its stream, not when it left the laptop.
+- `busy_ns` and `steps` in a `beat` are the stage's running totals since that process
+  started: time spent handling steps, including a step still running, measured on the
+  stage's own clock, and the steps handled, not counting those refused with a Nack. They
+  are durations, never compared with a gateway time; `t_ns` is when the beat arrived. A
+  restarted stage has a new `epoch` and counts from zero. Two streams working at once on
+  one stage both count, so `busy_ns` can grow faster than the clock.
 - Stage 0 to Stage 1 never passes the gateway, so it has byte totals but no `hop` lines and
   no latency of its own. Stage 0 counts each stream and returns the counts, with no
   timestamp, on that stream's gRPC trailing metadata.
@@ -372,13 +379,54 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
   with no `run_end` is from a run that did not stop cleanly. Send SIGINT, or CTRL_BREAK on
   Windows, not a forced kill.
 
+## Report
+
+One command builds every table and plot from the metrics files (`pllm.report`). Reported
+numbers come from it, never from the dashboard.
+
+```
+uv run python -m pllm.report                  # every runs/*.metrics.jsonl
+uv run python -m pllm.report LOG_OR_DIR ...   # given files, or those in each folder
+uv run python -m pllm.report --out DIR        # default runs/report
+```
+
+It writes `runs.csv` and `index.md` with one row per run, and a folder per run with
+`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `latency_cdf.png` and, when the
+stages sent beats, `utilisation.png`. The report is built beside the output folder and
+then replaces it whole, so a failed build leaves the old one. The command refuses a folder
+it did not make, a file, and a folder that holds a log; anything added to a folder it made
+is replaced with it. `runs/` is not committed.
+
+Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
+
+- Completed requests ended at end of sequence or at `max_tokens`; only they give latencies
+  and throughput. The others are counted per outcome.
+- TTFT is the first token minus arrival at the gateway, so time in the admission queue
+  counts. TPOT is (last token minus first token) / (output tokens - 1), for requests with
+  at least two tokens. End-to-end is the last token minus arrival.
+- p50, p95 and p99 interpolate linearly between the nearest ranks (numpy's default). Each
+  table gives n: a p99 of fewer than 100 requests is an interpolation.
+- Throughput is the output tokens of completed requests over the window, from the first
+  arrival of any request to the last token of a completed one.
+- Busy time per stage is read off the beat totals at the two ends of the window, by
+  straight-line interpolation between beats, separately per epoch. Since the totals count
+  a step still running, the error at each end is at most the time between the two beats
+  around it (0.5 s when beats are steady). `max_beat_gap_s` in `stages.csv` is the longest
+  stretch of the window with no beat from that stage, for example a late first beat, a
+  heartbeat that reconnected or beats that stopped, and `summary.md` warns when it is over
+  1 s. Utilisation is busy time over the window; two streams working at once on one stage
+  can push it above 1.
+
+Plots for each experiment (X2 to X9) are added here by that experiment.
+
 ## Heartbeat
 
 A serving worker registers, then keeps one `Control.Heartbeat` stream to the gateway
-(`pllm.heartbeat`). Every 0.5 s it sends a Beat with its stage, epoch, inbox depth and
-cached request count, and it sends each Nack as soon as it is raised, between beats. The
-gateway keeps the latest Beat of each stage with its arrival time on the gateway's own
-clock (`Gateway.beats()`), and the Nacks (`Gateway.nacks`, the last 1024, and
+(`pllm.heartbeat`). Every 0.5 s it sends a Beat with its stage, epoch, inbox depth, cached
+request count and its busy time and step totals, and it sends each Nack as soon as it is
+raised, between beats. The gateway keeps the latest Beat of each stage with its arrival
+time on the gateway's own clock (`Gateway.beats()`), writes each one to the metrics file,
+and keeps the Nacks (`Gateway.nacks`, the last 1024, and
 `nack_count`). It sends back:
 
 - the `Free` messages queued for that stage;

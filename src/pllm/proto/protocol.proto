@@ -46,6 +46,12 @@ message Beat {
   uint64 epoch = 2;
   int32 inbox_depth = 3;
   int32 cached_requests = 4;
+  // Running totals since this stage incarnation started: time spent handling steps,
+  // including a step still running, in nanoseconds on the stage's own clock, and the steps
+  // handled, not counting those refused with a Nack. Durations only, so the gateway never
+  // compares a stage's clock with its own.
+  uint64 busy_ns = 5;
+  uint64 steps = 6;
 }
 
 // Reasons: WRONG_EPOCH, STALE_ATTEMPT, GAP, BAD_SENDER.
