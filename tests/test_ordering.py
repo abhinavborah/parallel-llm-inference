@@ -3,12 +3,14 @@
 import logging
 import random
 
+import grpc
 import pytest
 from test_chain import LAYERS, Chain
+from test_gateway import WAIT, System
 from test_model import tiny_reference
 
 from pllm.ordering import StepOrder
-from pllm.proto import protocol_pb2
+from pllm.proto import protocol_pb2, protocol_pb2_grpc
 
 
 def oracle(messages) -> list[bool]:
@@ -159,3 +161,37 @@ def test_random_interleavings_through_both_stages_leave_no_violation_uncounted(c
         assert chain.servicer0.order_violations == total0, seed
         assert chain.servicer1.order_violations == total1, seed
     assert total0 > 0 and total1 > 0  # the disturbances did reach both stages
+
+
+def test_a_repeated_step_that_expires_while_it_waits_is_dropped_and_still_counted(tmp_path):
+    """The check comes before the deadline rule. Stage 0 is slow with the first step, so
+    the repeat waits behind it and its short deadline passes: it is dropped, never
+    forwarded, and still counted as out of order."""
+    tiny_reference(tmp_path, layers=LAYERS)
+    run = System(tmp_path, 2, delay0=0.4)
+    try:
+        epoch0 = run.registry.stages[0].epoch
+
+        def step(rid, budget_ms):
+            return protocol_pb2.StepRequest(
+                rid=rid,
+                attempt=1,
+                step=0,
+                start_pos=0,
+                length=2,
+                target_epoch=epoch0,
+                sender_epoch=0,
+                tokens=protocol_pb2.TokenIds(ids=[5, 9]),
+                budget_ms=budget_ms,
+            )
+
+        with grpc.insecure_channel(f"127.0.0.1:{run.ports[0]}") as channel:
+            protocol_pb2_grpc.StageStub(channel).Steps(
+                iter([step("r", 0), step("r", 100), step("other", 0)]), timeout=WAIT
+            )
+        assert run.servicer0.expired == 1  # the repeat was dropped by its deadline
+        assert run.servicer0.order_violations == 1  # and still counted
+        assert run.servicer1.order_violations == 0  # Stage 1 never saw the repeat
+        assert run.servicer0.store.attempt("other") is not None  # the stream went on
+    finally:
+        run.close()
