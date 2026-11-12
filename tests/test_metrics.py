@@ -394,7 +394,7 @@ def test_a_nack_writes_one_failed_line(metered):
     stream = run.call(max_tokens=20)
     first = next(stream)
     run.gateway.requests[first.rid].results.put(
-        pb.Nack(stage=1, rid=first.rid, attempt=1, step=1, reason="GAP")
+        pb.Nack(stage=1, rid=first.rid, attempt=1, step=1, reason="STALE_ATTEMPT")
     )
     code, _ = code_of(stream)
     assert code == grpc.StatusCode.UNAVAILABLE
