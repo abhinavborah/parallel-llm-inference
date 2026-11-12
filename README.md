@@ -94,8 +94,8 @@ refused one is not cached or forwarded; its Nack goes to the gateway on the hear
    A newer attempt is adopted (a replay starts at position 0, which truncates).
 
 The gateway fails a running request at once with UNAVAILABLE when a Nack names the step it
-is waiting on (same attempt and step), giving the stage and the reason; replaying it instead comes with the recovery
-stories. A stage takes requests only once both route updates have arrived, a few
+is waiting on (same attempt and step), giving the stage and the reason. A GAP Nack is the
+exception: the request replays (see [Replay](#replay)). A stage takes requests only once both route updates have arrived, a few
 milliseconds after the second stage registers: a request sent before that is refused with
 `WRONG_EPOCH` (or `BAD_SENDER`) and fails at once. When the route update then arrives,
 Stage 0 ends the stream that carried the stale epoch, so the request can be sent again.
@@ -270,8 +270,10 @@ logits equal the single-process reference (tested with small random models).
   failed. A message held in transit, for example in a suspended stage's socket buffer,
   gets its deadline only when read and can still run late; the gateway drops its result.
   A budget of 0 means no deadline.
-- A stage that is not registered, or a stream to Stage 0 that fails (Stage 0 or Stage 1
-  down), fails the request with UNAVAILABLE. Recovery and replay come later.
+- A new request finds a stage that is not registered or declared dead: refused with
+  UNAVAILABLE. A running request whose stage dies replays instead (see [Replay](#replay)).
+  A stream to Stage 0 that fails with no stage declared dead within the heartbeat timeout
+  (an error inside a stage, for example) fails the request with UNAVAILABLE.
 - The request table (`Gateway.table()`) lists each running request: id, attempt, tokens so
   far, expected step and seconds to its deadline.
 - Result filter and exactly-once delivery (R4.7, R4.8). A result is accepted only when its
@@ -347,6 +349,7 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 | `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
 | `detected` | Each failure detection | as in [Failure detection](#failure-detection) |
 | `registered` | Each stage registration | as in [Failure detection](#failure-detection) |
+| `divergence` | A replayed token differs from the one sent | `t_ns`, `rid`, `attempt`, `step`, `token`, `history_token` |
 | `run_end` | Run end | `t_ns`, `links`, `links_unreported`, `stage0_stage1_complete`, `write_errors` |
 
 - Hops are `gateway_stage0`, `stage0_stage1` and `stage1_gateway`. `phase` is `replay` for a
@@ -408,6 +411,31 @@ Limits:
 - A Nack or a `Free` sent just as the stream breaks can be lost with it. A lost `Free`
   leaves that request's cache on the stage until the process ends.
 
+## Replay
+
+A declared death bumps the attempt of every request in the gateway's table at once,
+including a request that is waiting for a credit with KV on both stages (R6.5). Each
+request then gives back its credit, waits until every stage is registered and live, and
+runs again from step 0 under its new attempt (R6.6):
+
+- step 0: the prompt, `start_pos` 0, length P;
+- step k, for each token already sent: that step's input token, `start_pos` P+k-1, length 1;
+- every one of them with `replay` set, through both stages. Then normal decoding goes on.
+
+These are the original messages, so the KV each stage rebuilds is bitwise equal to the
+first run on one host (prefill of P+m tokens need not be: `tests/test_kv_replay.py`). A
+stage adopts the newer attempt and truncates at position 0. Each replayed result is
+compared with the token the client was sent and is not sent again (R6.7). A mismatch is
+logged, counted in `Gateway.divergences` and written as a `divergence` line; the request
+goes on from the history the client has.
+
+- A GAP Nack (a stage with no cache at the step's position) replays the request too.
+- While a request replays, a failed stream or a refused step (a new stage before its route
+  update) starts it again under a newer attempt, after 0.05 s. A replay never reuses an
+  attempt, so a late result of an older one is always dropped.
+- A request waits for the new stage at most until its own deadline, then fails with
+  DEADLINE_EXCEEDED. `Gateway.replays` counts replays started.
+
 ## Failure detection
 
 The gateway watches each stage incarnation by its epoch (`pllm.detection`, read with
@@ -423,8 +451,8 @@ metrics file as a line whose `type` is the record's `event`.
 
 A declared epoch is never revived; the first declaration writes the only record. Requests
 are refused with UNAVAILABLE until the stage registers again. The new registration gets a
-higher epoch, and the neighbour gets a route update. Requests already running behave as
-before; replaying them is not done yet.
+higher epoch, and the neighbour gets a route update. Requests already running replay once it
+has (see [Replay](#replay)).
 
 A step deadline names a suspect, the stage whose last beat is older than half the heartbeat
 timeout, and declares nothing. A slow stage still beats, so its supervisor would never send

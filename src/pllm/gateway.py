@@ -8,8 +8,9 @@ One gRPC server hosts four services:
   clock, and the Nacks the stages report (R3.12). A Nack for the step a running request is
   waiting on (same attempt and step) fails that request at once with UNAVAILABLE, naming
   the stage and the reason; a Nack for another step, such as one a resumed old stage sent
-  late, leaves it running. Failing at once replaces waiting for the deadline; replaying
-  instead comes with the recovery stories (#38, #39). A Nack for a request that has ended
+  late, leaves it running. Failing at once replaces waiting for the deadline. A GAP Nack
+  replays the request instead (protocol rule 4), as does any Nack for a request that is
+  already replaying (a new stage before its route update). A Nack for a request that has ended
   needs nothing (a late step of a freed attempt). It sends back the Free messages queued
   for that stage, and a route update naming the other stage's address and epoch when the
   stream opens and each time that stage registers: Stage 0 uses it as its next hop
@@ -56,7 +57,21 @@ clock, in the log and as a line of the metrics file. Both timeouts are gateway f
 The first two declare the stage's epoch dead: requests are refused with UNAVAILABLE until a
 new registration gives the stage a higher epoch, and the neighbour then gets a route update.
 Only the heartbeat stream names a dead stage: Stage 0 also ends its data stream when Stage 1
-dies or a route moves. Requests in flight behave as before; replaying them is #39.
+dies or a route moves.
+
+Replay (R6.5 to R6.7). A declared death bumps the attempt of every request in the table at
+once, idle ones waiting for a credit included: every request has KV state on both stages.
+A request that sees its attempt bumped gives back its credit, waits until every stage is
+up (at most until its deadline), and runs again from step 0 under the new attempt. Each
+step's input comes from the history, so the replay resends the original messages: the
+prompt at start_pos 0, then one token per message, with the replay flag, through both
+stages. Results of steps below len(tokens) are compared with the history and not streamed
+again; a mismatch is a divergence, logged and counted. The result filter is unchanged,
+since each replayed step is asked for in turn. A stream that fails with no declaration
+within the heartbeat timeout fails the request as before (an error inside a stage is not a
+death). While a request replays, a failed stream or a refused step starts it again under a
+newer attempt: a replay never reuses an attempt, so a late result of an older one is
+dropped as stale_attempt.
 
 Many requests in flight (R4.5): every request goes to Stage 0 on the one stream, so the
 stages see the requests' steps interleaved in whatever order they arrive, and Stage 0 works
@@ -65,18 +80,18 @@ its own result, so its steps stay strictly in order; nothing orders one request 
 another. A request that ends early (cancel, deadline, a refused step) ends only itself. A
 stage ends the shared stream when a message is malformed, when a step fails inside the stage
 (including running out of memory), or when its next hop fails or a route update moves it;
-every request on the stream then fails with UNAVAILABLE, and recovering them is the recovery
-stories. A request whose prompt and max_tokens exceed the model's context length is refused
-at admission, so no valid request grows a cache past the model's context. That bounds each
-request, not Host B's memory: with an even split, one request at the cap holds about 180 MiB
-of Stage 0 cache for SmolLM2 (8192 positions) but about 4.4 GiB for Qwen3-0.6B (40960
-positions), more than Host B has. Admission by Host B's KV budget (R5.3) is #34. Equality under
-concurrency rests on each stage handling its stream one step at a time: requests never share
-a model call within a stage. One long prefill at a stage delays every other request's next
-step there (head-of-line blocking). Each Generate holds a
-server thread for its life, so serve() caps running requests at max_workers -
+every request on the stream then fails with UNAVAILABLE unless a stage is declared dead
+within the heartbeat timeout, when it replays. A request whose prompt and max_tokens exceed
+the model's context length is refused at admission, so no valid request grows a cache past
+the model's context. That bounds each request, not Host B's memory: with an even split, one
+request at the cap holds about 180 MiB of Stage 0 cache for SmolLM2 (8192 positions) but
+about 4.4 GiB for Qwen3-0.6B (40960 positions), more than Host B has. Admission by Host B's
+KV budget (R5.3) is #34. Equality under concurrency rests on each stage handling its stream
+one step at a time: requests never share a model call within a stage. One long prefill at a
+stage delays every other request's next step there (head-of-line blocking). Each Generate
+holds a server thread for its life, so serve() caps running requests at max_workers -
 RESERVED_THREADS; without the cap, a full pool leaves no thread for Results.Push and every
-running request stalls until its deadline. Also not here: replay (#39).
+running request stalls until its deadline.
 
 Flow control (R5.1, R5.2). Admission: a request that finds every running slot taken waits
 in a first-in, first-out queue of max_queued places; one that finds the queue full is
@@ -110,9 +125,8 @@ and counted by reason in discards:
 Only an accepted result moves the request on and reaches the client, so each (request,
 step) is streamed once and in order. A result is checked when it arrives and again when the
 request takes it, since a result can be queued just before the step it was for completes or
-before a new last stage registers. A replay (#39) must compare the results of steps below
-len(tokens) with the stored history and not stream them again; the filter itself stays as
-it is, since each replayed step is asked for in turn under the new attempt.
+before a new last stage registers. A replay compares the results of steps below
+len(tokens) with the stored history and does not stream them again.
 """
 
 import argparse
@@ -155,6 +169,7 @@ STAGES = (0, 1)
 RESERVED_THREADS = 2 + 2 * len(STAGES)
 MAX_RUNNING = 14  # Generate calls at once with the default pool
 MAX_QUEUED = 8  # requests waiting for a running slot; [limits] admission_queue sets it
+RECOVER = object()  # what _wait returns when a request must replay
 
 
 @dataclass
@@ -173,6 +188,7 @@ class Request:
     first_token_ns: int | None = None
     last_token_ns: int | None = None
     step_due_ns: int | None = None  # detector clock; None once the step's record is written
+    recovering: bool = False  # from a replay's start until its first new token
 
     def row(self) -> dict:
         return {
@@ -297,8 +313,10 @@ class Gateway(
             heartbeat_timeout,
             step_timeout,
             clock=lambda: self.recorder.now(),
-            sink=lambda record: self.recorder.event(record),
+            sink=self._on_detection,
         )
+        self.replays = 0  # replays started, all requests together
+        self.divergences = 0  # replayed tokens that differed from the stored history
         self._stopping = threading.Event()
         self._watcher: threading.Thread | None = None
         self._retired: list[Link] = []  # half-closed, waiting for stage 0's counters
@@ -338,6 +356,23 @@ class Gateway(
             last_token_ns=request.last_token_ns,
         )
         log.info("request %s ended (%s) after %d tokens", request.rid, how, len(request.tokens))
+
+    def _on_detection(self, record: dict) -> None:
+        """Write the record, and on a declared death bump the attempt of every request in
+        the table (R6.5). Every request has, or is about to have, KV state on both stages,
+        idle ones waiting for a credit included, so the dead stage's are all of them."""
+        self.recorder.event(record)
+        if record["event"] == "detected" and record["declared"]:
+            with self._lock:
+                for request in self.requests.values():
+                    request.attempt += 1
+                bumped = len(self.requests)
+            log.warning(
+                "stage %s epoch %s declared dead: %d requests to replay",
+                record["stage"],
+                record["epoch"],
+                bumped,
+            )
 
     def _rejected(
         self, req, context, arrived: int, prompt_tokens: int | None, how: str = "rejected"
@@ -539,18 +574,28 @@ class Gateway(
 
     # ------------------------------------------------------------------ Stage 0 link
 
-    def _stage0(self, context) -> Link:
+    def _down(self) -> str | None:
+        """Why the pipeline cannot take a step now, or None if every stage is up."""
         stages = self.registry.stages
         for stage in STAGES:
             if stage not in stages:
-                context.abort(grpc.StatusCode.UNAVAILABLE, f"stage {stage} is not registered")
+                return f"stage {stage} is not registered"
             if self.detector.is_dead(stages[stage].epoch):
-                context.abort(
-                    grpc.StatusCode.UNAVAILABLE,
+                return (
                     f"stage {stage} epoch {stages[stage].epoch} is dead; waiting for it to "
-                    "register again",
+                    "register again"
                 )
-        entry = stages[0]
+        return None
+
+    def _stage0(self, context) -> Link:
+        why = self._down()
+        if why is not None:
+            context.abort(grpc.StatusCode.UNAVAILABLE, why)
+        return self._open_link()
+
+    def _open_link(self) -> Link:
+        """The open stream to the registered Stage 0, opening a new one if needed."""
+        entry = self.registry.stages[0]
         with self._lock:
             link = self._link
             moved = link is not None and (link.addr, link.epoch) != (entry.addr, entry.epoch)
@@ -785,22 +830,32 @@ class Gateway(
             self.requests[request.rid] = request
         how = "failed"
         try:
-            send, start = ids, 0
             unsent: list[int] = []  # tokens whose text is not complete yet
+            attempt = request.attempt  # the attempt the request is running under
             while True:
-                step = request.expected_step
                 if not self._take_credit(request, context):
                     how = "cancelled by the client"
                     return
+                # A request bumped while idle still sends this step under its old attempt;
+                # _wait sees the bump before waiting. A surviving stage may run the step,
+                # which is harmless: the replay truncates its cache at 0.
+                step = request.expected_step
                 request.step_due_ns = self.detector.now() + self.detector.step_timeout_ns
+                with self._lock:
+                    replay = step < len(request.tokens)
+                    # Each step's input comes from the history, so a replay resends the
+                    # original messages: the prompt at 0, then one token each (R6.6).
+                    send = ids if step == 0 else [request.tokens[step - 1]]
+                start = 0 if step == 0 else len(ids) + step - 1
                 message = protocol_pb2.StepRequest(
                     rid=request.rid,
-                    attempt=request.attempt,
+                    attempt=attempt,
                     step=step,
                     start_pos=start,
                     length=len(send),
                     target_epoch=link.epoch,
                     sender_epoch=0,
+                    replay=replay,
                     tokens=protocol_pb2.TokenIds(ids=send),
                     budget_ms=budget_ms(request.deadline, time.monotonic()),
                 )
@@ -808,16 +863,29 @@ class Gateway(
                 self.recorder.hop(metrics.GATEWAY_STAGE0, message)
                 link.outbox.put(message)
                 try:
-                    result = self._wait(request, link, context)
+                    result = self._wait(request, link, context, attempt)
                 finally:
                     self._give_credit()  # the result came, or the request is ending
+                if result is RECOVER:
+                    link = self._recover(request, attempt, context)
+                    if link is None:
+                        how = "cancelled by the client"
+                        return
+                    attempt = request.attempt
+                    continue
                 if result is None:
                     how = "cancelled by the client"
                     return
                 chosen = result.token
+                if replay:  # the client has this token already: compare, never resend
+                    self._check_replayed(request, step, chosen)
+                    with self._lock:
+                        request.expected_step += 1
+                    continue
                 with self._lock:
                     request.tokens.append(chosen)
                     request.expected_step += 1
+                    request.recovering = False
                 if chosen in self.eos_ids:
                     how = "end of sequence"
                 elif len(request.tokens) >= req.max_tokens:
@@ -838,8 +906,6 @@ class Gateway(
                 )
                 if how != "failed":
                     return
-                start += len(send)
-                send = [chosen]
         except GeneratorExit:  # the client left while a token was on its way to it
             if how == "failed":
                 how = "cancelled by the client"
@@ -855,8 +921,84 @@ class Gateway(
             return None
         return text
 
-    def _wait(self, request: Request, link: Link, context):
-        """The result for the request's expected step, or None if the client went away."""
+    def _check_replayed(self, request: Request, step: int, token: int) -> None:
+        """Compare a replayed step's token with the one the client was sent (R6.7)."""
+        sent = request.tokens[step]
+        if token == sent:
+            return
+        with self._lock:
+            self.divergences += 1
+        log.warning(
+            "divergence: request %s attempt %d step %d replayed token %d, history has %d",
+            request.rid,
+            request.attempt,
+            step,
+            token,
+            sent,
+        )
+        self.recorder.event(
+            {
+                "event": "divergence",
+                "t_ns": self.recorder.now(),
+                "rid": request.rid,
+                "attempt": request.attempt,
+                "step": step,
+                "token": token,
+                "history_token": sent,
+            }
+        )
+
+    def _recover(self, request: Request, attempt: int, context) -> Link | None:
+        """Start the request again from step 0 under a new attempt, once every stage is up.
+        Returns the link to send on, or None if the client went away. It waits at most until
+        the request's deadline (R5.6); a recovery cap is #44."""
+        with self._lock:
+            if request.attempt == attempt:  # a failure that no declaration bumped
+                request.attempt += 1
+            request.expected_step = 0
+            request.recovering = True
+            self.replays += 1
+            tokens = len(request.tokens)
+        log.warning(
+            "request %s replays %d tokens as attempt %d", request.rid, tokens, request.attempt
+        )
+        while True:
+            if time.monotonic() >= request.deadline:
+                context.abort(
+                    grpc.StatusCode.DEADLINE_EXCEEDED,
+                    f"request {request.rid} passed its deadline waiting to replay: "
+                    f"{self._down() or 'the pipeline did not take its replay'}",
+                )
+            if not context.is_active():
+                return None
+            if self._down() is None:
+                return self._open_link()
+            time.sleep(POLL_SECONDS)
+
+    def _declared_soon(self, request: Request, attempt: int, context) -> bool:
+        """After a failed stream: wait up to the heartbeat timeout for a declaration to bump
+        the request. Only a dead stage is replayed; a stage that ends the stream for another
+        reason, such as an error inside it, fails the request as before. With no heartbeat
+        stream open nothing could declare a death, so there is no wait."""
+        with self._lock:
+            watched = bool(self._sessions)
+        until = time.monotonic() + self.detector.heartbeat_timeout_ns / 1e9
+        while watched and time.monotonic() < until:
+            with self._lock:
+                if request.attempt != attempt:
+                    return True
+            if time.monotonic() >= request.deadline or not context.is_active():
+                return False
+            time.sleep(POLL_SECONDS)
+        with self._lock:
+            return request.attempt != attempt
+
+    def _wait(self, request: Request, link: Link, context, attempt: int):
+        """The result for the request's expected step; None if the client went away; or
+        RECOVER when the step will never come and the request must replay: its attempt was
+        bumped by a declared death, a stage refused the step with GAP (protocol rule 4), or,
+        while it is already recovering, the stream or a stage refused it (a new stage that
+        has not had its route update yet)."""
         while True:
             left = request.deadline - time.monotonic()
             if left <= 0:
@@ -866,6 +1008,9 @@ class Gateway(
                 )
             if not context.is_active():
                 return None
+            with self._lock:
+                if request.attempt != attempt:
+                    return RECOVER
             if request.step_due_ns is not None and self.detector.now() >= request.step_due_ns:
                 request.step_due_ns = None  # one record per step
                 self.detector.step_deadline(request.rid, request.expected_step)
@@ -881,6 +1026,8 @@ class Gateway(
                         request.attempt,
                         request.expected_step,
                     )
+                    if current and (result.reason == "GAP" or request.recovering):
+                        return RECOVER
                     if current:
                         context.abort(
                             grpc.StatusCode.UNAVAILABLE,
@@ -897,6 +1044,11 @@ class Gateway(
                     self._discard(reason)
             why = link.failure()
             if why is not None:
+                if request.recovering or self._declared_soon(request, attempt, context):
+                    time.sleep(POLL_SECONDS)  # a retry never spins
+                    return RECOVER
+                if time.monotonic() >= request.deadline or not context.is_active():
+                    continue  # the checks above end it as a deadline or a cancel
                 context.abort(grpc.StatusCode.UNAVAILABLE, f"stage 0 stream failed: {why}")
 
 
