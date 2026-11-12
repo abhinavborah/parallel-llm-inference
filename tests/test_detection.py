@@ -16,6 +16,7 @@ import time
 
 import grpc
 import pytest
+from test_deadlines import TOLERANCE
 from test_gateway import DIGEST, HIDDEN, IDS, PROMPT, WAIT, Words, code_of, wait_for
 from test_heartbeat import FAST, Beating, reference
 from test_model import tiny_reference
@@ -470,6 +471,25 @@ def test_a_slow_step_is_recorded_without_declaring_the_stage_and_the_request_com
     assert all(r["stage"] is None and r["declared"] is False for r in records)
     assert all(r["rid"] == tokens[0].rid for r in records)
     assert detected(run.gateway.detector, declared=True) == []
+
+
+def test_a_step_past_its_timeout_on_a_live_stage_fails_the_request_at_its_deadline(beating):
+    """R5.5: the step timeout records the step, and the request still fails at its own
+    deadline, not earlier at the step timeout and not later. The other outcome, a stage
+    that stops and is declared, is the test below."""
+    run = beating(delay1=0.5)
+    detector = run.gateway.detector
+    detector.step_timeout_ns = round(0.2 * SECOND)
+    began = time.monotonic()
+    with pytest.raises(grpc.RpcError) as err:
+        run.tokens(max_tokens=200, timeout_ms=800)
+    elapsed = time.monotonic() - began
+    assert err.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert 0.8 - 0.05 <= elapsed < 0.8 + TOLERANCE
+    records = detected(detector, path="step_deadline")
+    assert records and all(r["stage"] is None and r["declared"] is False for r in records)
+    assert detected(detector, declared=True) == []  # the stage still beats, so it lives
+    assert not run.gateway.requests
 
 
 def test_a_step_held_by_a_suspended_stage_names_it_then_its_timeout_declares_it(plane):
