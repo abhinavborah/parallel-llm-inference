@@ -124,6 +124,19 @@ heads x head dim x 4` bytes: for SmolLM2-135M 23,040 bytes, so a 528-position re
 11.6 MiB on each stage and 8 such requests 93 MiB (steady state; while a step
 appends, a layer's cache is briefly about twice its size).
 
+Step ordering (R3.7). Each stage checks every message it takes from a stream, before the
+deadline, fencing and cache rules: the step must be above the highest step it has seen for
+the same request and attempt. One that is not (a step sent twice, or one overtaken by a
+later step) is counted in the servicer's `order_violations` and logged as a warning, and is
+then handled as usual, so a resend at a lower `start_pos` still truncates and appends.
+Skipped steps are in order, and a new attempt starts afresh, so a replay under a bumped
+attempt is not counted. The stage keeps the highest step for the last 4096 (request,
+attempt) pairs (about 0.6 MiB at most); a Free does not clear it, so a late step is still
+checked. The hop out of Stage 1 is checked by the gateway's result filter (`duplicate` and
+`ahead` in `Gateway.discards`). `tests/test_ordering.py` feeds seeded random interleavings,
+with steps swapped, sent twice and restarted under a new attempt, through both stages and
+checks each stage's count against a separate count of what that stage received.
+
 Activations travel as raw little-endian fp32 bytes with a dtype name and a shape
 (`pllm.wire`), never as JSON, and are bitwise equal on arrival. The receive limit of every
 server and channel comes from `[limits]` in the committed `config/hosts.toml`:

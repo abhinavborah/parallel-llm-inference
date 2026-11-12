@@ -78,6 +78,12 @@ stage forwards the time left on its deadline as the next hop's budget_ms, at lea
 budget of 0 means no deadline (a hand-built message, as in tests). Only the gateway decides
 that a request has failed.
 
+Step ordering (R3.7, pllm.ordering): every message is checked when it is taken from the
+inbox, before the deadline, fencing and cache rules. A step at or below the highest step
+already seen for its (rid, attempt) is counted in order_violations and logged; nothing else
+changes for it. Each stage checks what it receives, so both hops into the stages are
+checked; the gateway checks the hop out of the last stage with its result filter.
+
 Chain over a single host or two: every address comes from the caller, which reads it from
 the hosts file. Nothing here depends on the operating system (R3.15).
 """
@@ -94,6 +100,7 @@ import torch
 
 from pllm import metrics, wire
 from pllm.kvstore import Gap, KVStore, Stale
+from pllm.ordering import StepOrder
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
 from pllm.worker import StageWorker
 
@@ -187,6 +194,12 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         self._steps = 0  # steps handled, not counting those refused with a Nack
         self._working: dict[int, int] = {}  # per stream thread, when its current step began
         self._busy_lock = threading.Lock()
+        self.order = StepOrder(f"stage {self.stage_index}")  # R3.7, on every message
+
+    @property
+    def order_violations(self) -> int:
+        """Messages whose step did not go up for their (rid, attempt) (R3.7)."""
+        return self.order.violations
 
     def close(self) -> None:
         with self._route_lock:
@@ -317,6 +330,7 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                 if request is _DONE:
                     break
                 request, deadline = request
+                self.order.check(request.rid, request.attempt, request.step)
                 if deadline is not None and time.monotonic() >= deadline:
                     self._expire(request)
                     continue
