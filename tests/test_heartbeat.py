@@ -42,6 +42,8 @@ class Beating(System):
         self.threads: list[threading.Thread] = []
         self.hearts: dict[int, Heartbeat] = {}
         self.extra = []  # servers started by a test
+        detector = self.gateway.detector  # a long interval must not read as a silent stage
+        detector.heartbeat_timeout_ns = max(detector.heartbeat_timeout_ns, round(4e9 * interval))
         for stage in order:
             self.join(stage, self.servicer1 if stage == 1 else self.servicer0)
         if set(order) == {0, 1}:
