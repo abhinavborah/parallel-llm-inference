@@ -419,6 +419,58 @@ Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
 
 Plots for each experiment (X2 to X9) are added here by that experiment.
 
+## Dashboard
+
+A live page for the demo (`pllm.dashboard`, standard library only, so nothing for Host B and
+no new dependency). It is off unless the gateway is started with `--dashboard`, because it can
+kill and freeze workers:
+
+```
+uv run python -m pllm.gateway smollm2-135m --dashboard
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1 --dashboard
+```
+
+Open `http://HOST:PORT/` from a browser. HOST and PORT are the `[dashboard]` table of the
+hosts file (default: the gateway's host, port 50080). HOST must be the address the browser
+types, not `0.0.0.0` (that is refused at start): the server answers only to that name, and to
+`localhost` and `127.0.0.1` when it listens on loopback. The page is one HTML file
+with plain JavaScript and uses no address outside the server.
+
+- Stages: each stage alive, dead or unknown with its epoch, the age of its last Beat, its
+  worker's state and the free memory of its laptop. Alive means the epoch is live and a Beat
+  came within the heartbeat timeout; dead means the failure detector declared the epoch dead.
+- System: requests running and queued, steps in flight, tokens per second (over 5 s),
+  requests rejected (every request refused or failed before it started, such as a full queue,
+  a deadline spent waiting for a slot, or no stage registered), results dropped (all reasons
+  of `Gateway.discards`, listed on hover), duplicate tokens and the gateway laptop's free
+  memory.
+- Send, Send 8 at once and Flood (40 requests, more than the gateway runs and queues): each
+  request goes through the gateway's own `Frontend.Generate` on loopback, so deadlines, the
+  admission queue and refusals are those of any client, and its tokens stream into a card.
+- Kill, Freeze and Unfreeze: sent to the supervisor of that stage's laptop (`[supervisor0]`
+  and `[supervisor1]`), which carries them out. A worker that is killed is respawned.
+
+Free memory comes from each supervisor's `/status`; with no supervisor running the page shows
+"supervisor unreachable" and the fault buttons answer with an error.
+
+Duplicate tokens are counted on the streams the page relays (a token whose step does not go
+above the last of its request); the gateway delivers each step once, so it stays 0. The gateway
+counts tokens sent and requests ended by outcome (`Gateway.state()`).
+
+Safety, as for the supervisor's control port: a POST needs `Content-Type: application/json`,
+a Host the server answers to and no foreign Origin, no response has a CORS header and OPTIONS
+is not answered, so a page on another site cannot press the buttons from a browser. There is no
+authentication beyond that: keep it on the lab network. Open event streams (16), requests
+started from the page (64 at once), each client's backlog and request bodies are bounded. A
+viewer that vanishes without closing its connection keeps its place until a write to it
+fails, and a viewer that reads slowly loses its oldest events, so a card can miss its first
+or last token; reloading the page starts again from the next state.
+
+The tests pin the page, every event it reads and the server's rules, and, when `node` is
+installed, run the page's own script against a stand-in for the DOM, fed a real state event
+(`tests/dashboard_page_check.js`). No test drives a real browser. Reported numbers come from
+the scripts that read the metrics files, never from this page.
+
 ## Heartbeat
 
 A serving worker registers, then keeps one `Control.Heartbeat` stream to the gateway

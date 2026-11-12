@@ -27,6 +27,20 @@ def test_commands_start_the_gateway_first_through_the_same_entry_points():
     assert launch.commands("smollm2-135m", ["stage1"], 3) == {"stage1": all_roles["stage1"]}
 
 
+def test_the_dashboard_flag_goes_to_the_gateway_only():
+    plain = launch.commands("smollm2-135m", ["gateway", "stage0"], 3)
+    shown = launch.commands("smollm2-135m", ["gateway", "stage0"], 3, dashboard=True)
+    assert "--dashboard" not in plain["gateway"]
+    assert shown["gateway"] == [*plain["gateway"], "--dashboard"]
+    assert shown["stage0"] == plain["stage0"]
+
+
+def test_main_refuses_the_dashboard_on_a_laptop_without_the_gateway(capsys):
+    with pytest.raises(SystemExit):
+        launch.main(["smollm2-135m", "--roles", "stage1", "--dashboard"])
+    assert "--dashboard needs the gateway" in capsys.readouterr().err
+
+
 def hosts_with_stage0_on(host):
     local = config.Endpoint("127.0.0.1", 50050)
     other = config.Endpoint(host, 50051)

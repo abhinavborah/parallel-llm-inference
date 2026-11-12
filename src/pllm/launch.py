@@ -40,8 +40,11 @@ def default_threads(roles: Iterable[str], cores: int | None = None) -> int:
     return max(1, cores // max(1, stages))
 
 
-def commands(model: str, roles: Iterable[str], threads: int) -> dict[str, list[str]]:
-    """The command of each role in start order: the stages register with the gateway."""
+def commands(
+    model: str, roles: Iterable[str], threads: int, dashboard: bool = False
+) -> dict[str, list[str]]:
+    """The command of each role in start order: the stages register with the gateway. With
+    dashboard, the gateway also serves the live page."""
     wanted = set(roles)
     out = {}
     for role in config.ROLES:
@@ -49,6 +52,8 @@ def commands(model: str, roles: Iterable[str], threads: int) -> dict[str, list[s
             continue
         if role == "gateway":
             out[role] = [sys.executable, "-m", "pllm.gateway", model]
+            if dashboard:
+                out[role].append("--dashboard")
         else:
             stage = role.removeprefix("stage")
             out[role] = [
@@ -133,9 +138,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="what runs on this laptop (default: everything, single-host mode)",
     )
     parser.add_argument("--threads", type=int, help="torch threads per stage")
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="the gateway also serves the live dashboard (it can kill and freeze workers)",
+    )
     args = parser.parse_args(argv)
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
+    if args.dashboard and "gateway" not in args.roles:
+        parser.error("--dashboard needs the gateway role on this laptop")
     try:
         hosts = config.load()
         split = config.split_point(args.model)
@@ -178,7 +190,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if power is not None and not power["plugged_in"]:
             log.warning("on battery: use the same power state for every run")
-        code = run(commands(args.model, args.roles, threads), done)
+        code = run(commands(args.model, args.roles, threads, args.dashboard), done)
         if code:
             raise SystemExit(code)
 
