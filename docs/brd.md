@@ -248,7 +248,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R4.6 | A request ends on end-of-sequence or max_tokens, after which the gateway frees its state on both stages. | Must | W2 | A (unconfirmed) | Spec R6 |
 | R4.7 | Result filter: accept a result only when attempt equals the current attempt, step equals the expected step and epoch equals the live epoch of the last stage; otherwise drop it and count it by reason. | Must | W4 | A (unconfirmed) | Spec R12; Proposal PG4 |
 | R4.8 | Exactly-once delivery: tokens are streamed to the client once, in order, deduplicated on (rid, step). Test with an injected duplicate and an injected late result. | Must | W4 | A (unconfirmed) | Spec R12; X6 |
-| R4.9 | Cross-test: the result-filter and replay tests for the gateway are written by Member B, not the implementer. | Must | W4 | B (unconfirmed) | Contribution rule; G2 |
+| R4.9 | Cross-test: the replay tests for the gateway are written by Member B and the result filter tests by Member A, neither by the implementer (agreed split, #31). | Must | W4 | A and B (unconfirmed) | Contribution rule; G2 |
 
 ### Epic E5. Flow control and micro-batching
 
