@@ -671,16 +671,18 @@ Both ports have no authentication, so use only a network you trust.
 - In System Settings, Network, Firewall, allow incoming connections for the Python that `uv`
   runs, or accept the prompt the first time a process listens.
 
-### If the network fails
+### Network
 
-Try in order a direct cable, a phone hotspot, then Tailscale. Only the hosts file changes: set
-each host to that network's address for the laptop and `network` to the network's name.
+Both laptops join one phone hotspot; Ethernet and a direct cable are not used. Hotspot
+addresses can change each session, so only the hosts file changes: set each host to that
+session's address for the laptop and `network` to the network's name.
 
 ## Hosts and ports
 
 Every process reads its addresses from `config/hosts.toml`. The committed file runs all
-processes on one laptop. For a LAN run, copy it to `config/hosts.local.toml` (ignored by git),
-set each host to that laptop's IP, and set `PLLM_CONFIG` to the copy:
+processes on one laptop. For a two-laptop run on the hotspot, copy it to
+`config/hosts.local.toml` (ignored by git), set each host to that laptop's IP, and set
+`PLLM_CONFIG` to the copy:
 
 ```
 # macOS
@@ -731,8 +733,8 @@ allowed on Public. If the firewall is turned on again, the check reads the inbou
 for the profile in use, which needs an administrator shell (without one it gives no
 verdict), and prints a rule to add for that profile and the interpreter. With several
 network adapters, pass `--interface <this laptop's IP>` to the multicast commands.
-If the direct network fails, try in order a direct cable, a phone hotspot, then Tailscale, and
-change only the hosts file. Every probe, listen and firewall run writes a run record.
+On a new hotspot session, check the addresses again and change only the hosts file. Every
+probe, listen and firewall run writes a run record.
 
 ## Development
 
