@@ -97,6 +97,7 @@ class Stages:
         servicer.close()
         wait_for(lambda: run.gateway.detector.is_dead(old), "the death to be declared")
         new, _ = start_replacement(run, stage)
+        new.worker.delay = servicer.worker.delay  # keep requests in flight for the next kill
         self.current[stage] = (run.extra[-1][0], new, run.stops[-1])
         run.wait_routes(servicer0=self.current[0][1], servicer1=self.current[1][1])
 
