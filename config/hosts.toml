@@ -30,7 +30,7 @@ port = 50062
 
 # Where the gateway serves the dashboard when it is started with --dashboard (optional; without
 # this table it listens on the gateway's host at port 50080). The host is the address the browser
-# types, not 0.0.0.0. The page can kill, freeze and unfreeze workers, so keep it on the lab network.
+# types, not 0.0.0.0. The page can kill, freeze and unfreeze workers and has no authentication: use a trusted network.
 [dashboard]
 host = "127.0.0.1"
 port = 50080
