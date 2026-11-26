@@ -243,6 +243,8 @@ class Link:
     the wire (R7.7, decision #48: the gateway to Stage 0 hop of X4). The release time is
     stamped at send and waited for on gRPC's own sending thread, so the delay is pipelined
     and the message order is kept. budget_ms is not reduced: the delay counts as transit.
+    A message whose release is faults.DROP is lost (R6.11): it never goes on the wire, and
+    the messages behind it are not held up.
     """
 
     def __init__(self, addr: str, epoch: int, options, delayed: bool = False):
@@ -257,7 +259,10 @@ class Link:
     def send(self, message, hold: faults.HopDelay | None = None) -> None:
         if self.delayed:
             now = time.monotonic()
-            message = (hold, now, now if hold is None else hold.release(message, now), message)
+            release = now if hold is None else hold.release(message, now)
+            if release == faults.DROP:
+                return
+            message = (hold, now, release, message)
         self.outbox.put(message)
 
     def _released(self):

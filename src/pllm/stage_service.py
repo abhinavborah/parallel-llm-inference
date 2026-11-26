@@ -91,7 +91,8 @@ deadline is set from that release, so the delay counts as transit (#32). The han
 for the release before the usual checks, and lets the message go if the stream is cancelled
 meanwhile. Messages in delay wait in the bounded inbox, so backpressure still holds; a
 Beat's inbox depth counts them, except the one the handler is holding. Each stream is first
-in, first out, as on one TCP stream: a message waits for the ones ahead of it.
+in, first out, as on one TCP stream: a message waits for the ones ahead of it. A message
+whose release is faults.DROP is lost (R6.11): it never enters the inbox.
 
 Chain over a single host or two: every address comes from the caller, which reads it from
 the hosts file. Nothing here depends on the operating system (R3.15).
@@ -108,7 +109,7 @@ import grpc
 import torch
 
 from pllm import metrics, wire
-from pllm.faults import HopDelay, sleep_until
+from pllm.faults import DROP, HopDelay, sleep_until
 from pllm.kvstore import Gap, KVStore, Stale
 from pllm.ordering import StepOrder
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
@@ -316,6 +317,8 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                 for request in request_iterator:  # the deadline is set on arrival
                     now, hold = time.monotonic(), self.hop_delay
                     release = None if hold is None else hold.release(request, now)
+                    if release == DROP:  # lost on the hop: never queued, never seen
+                        continue
                     arrived = now if release is None else release
                     item = (request, due(request.budget_ms, arrived), hold, now, release)
                     if not _offer(inbox, item, ended.is_set):
