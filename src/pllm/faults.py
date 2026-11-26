@@ -1,4 +1,4 @@
-"""Fault injection for stage workers: kill, suspend, resume and a per-step sleep.
+"""Fault injection: kill, suspend, resume, a per-step sleep and a per-message hop delay.
 
 Process control goes through psutil so the same calls work on macOS and Windows.
 Each supervisor applies these to the worker it owns.
@@ -83,3 +83,34 @@ class StepDelay:
     def __call__(self) -> None:
         if self.seconds > 0:
             time.sleep(self.seconds)
+
+
+@dataclass(frozen=True)
+class HopDelay:
+    """Delay added to each message of one hop (R7.7, decision #48). Zero adds none.
+
+    Pipelined, not blocking like StepDelay: each message is released seconds after it
+    entered the hop, so messages that enter together leave together and the stream's
+    throughput is not capped at one message per delay. release() is asked once per
+    message, so a later fault can choose per message (a longer delay, or a drop).
+    """
+
+    seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.seconds < float("inf"):
+            raise ValueError(f"hop delay must be finite and non-negative, got {self.seconds}")
+
+    def release(self, message, now: float) -> float:
+        """When a message that entered the hop at now (monotonic seconds) may leave it."""
+        return now + self.seconds
+
+
+def sleep_until(release: float, give_up=None, poll: float = 0.05) -> bool:
+    """Sleep until the monotonic time release; False if give_up() turned true first.
+    The wait is cut into poll steps so a stream that ends is noticed while it waits."""
+    while (left := release - time.monotonic()) > 0:
+        if give_up is not None and give_up():
+            return False
+        time.sleep(min(left, poll))
+    return True

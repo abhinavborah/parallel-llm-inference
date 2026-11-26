@@ -147,7 +147,7 @@ from pathlib import Path
 
 import grpc
 
-from pllm import config, metrics, prompts, runrecord, wire
+from pllm import config, faults, metrics, prompts, runrecord, wire
 from pllm.control import Registration, Registry, expected_model
 from pllm.detection import HEARTBEAT_TIMEOUT_SECONDS, STEP_TIMEOUT_SECONDS, Detector
 from pllm.heartbeat import HEARTBEAT_SECONDS
@@ -206,14 +206,36 @@ class Request:
 
 
 class Link:
-    """The gateway's client stream to one Stage 0 incarnation."""
+    """The gateway's client stream to one Stage 0 incarnation.
 
-    def __init__(self, addr: str, epoch: int, options):
+    With delayed, each message sent is held for the gateway's hop delay before it goes on
+    the wire (R7.7, decision #48: the gateway to Stage 0 hop of X4). The release time is
+    stamped at send and waited for on gRPC's own sending thread, so the delay is pipelined
+    and the message order is kept. budget_ms is not reduced: the delay counts as transit.
+    """
+
+    def __init__(self, addr: str, epoch: int, options, delayed: bool = False):
         self.addr, self.epoch = addr, epoch
         self.channel = grpc.insecure_channel(addr, options=options)
         self.outbox: queue.Queue = queue.Queue()
         self.ended = False
-        self.call = protocol_pb2_grpc.StageStub(self.channel).Steps.future(_drain(self.outbox))
+        self.delayed = delayed
+        messages = self._released() if delayed else _drain(self.outbox)
+        self.call = protocol_pb2_grpc.StageStub(self.channel).Steps.future(messages)
+
+    def send(self, message, hold: faults.HopDelay | None = None) -> None:
+        if self.delayed:
+            now = time.monotonic()
+            message = (now if hold is None else hold.release(message, now), message)
+        self.outbox.put(message)
+
+    def _released(self):
+        """The outbox in order, each message once its release time has come."""
+        while (item := self.outbox.get()) is not _DONE:
+            release, message = item
+            if not faults.sleep_until(release, self.call.done):
+                return
+            yield message
 
     def failure(self) -> str | None:
         """Why the stream ended, or None while it is open. An ended link fails its requests
@@ -264,6 +286,7 @@ class Gateway(
     """tokenizer needs encode(text) -> ids and decode(ids) -> text; eos_ids end a request."""
 
     recorder = metrics.Recorder()  # writes nothing; main sets a real one, like max_running
+    hop_delay: faults.HopDelay | None = None  # None: off; main sets it for X4 (pllm.faults)
 
     def __init__(
         self,
@@ -662,7 +685,8 @@ class Gateway(
                 if link is not None:
                     link.end()
                     self._retired.append(link)
-                link = self._link = Link(entry.addr, entry.epoch, self.options)
+                link = Link(entry.addr, entry.epoch, self.options, self.hop_delay is not None)
+                self._link = link
             done = {old: old.call.done() for old in self._retired}
             self._retired = [old for old, ended in done.items() if not ended]
         self._collect([old for old, ended in done.items() if ended])  # never waits
@@ -920,7 +944,7 @@ class Gateway(
                 )
                 # Before the put, so that a fast result cannot appear to precede its send.
                 self.recorder.hop(metrics.GATEWAY_STAGE0, message)
-                link.outbox.put(message)
+                link.send(message, self.hop_delay)
                 try:
                     result = self._wait(request, link, context, attempt)
                 finally:
