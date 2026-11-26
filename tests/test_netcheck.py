@@ -235,7 +235,27 @@ def test_a_rule_line_names_its_program():
 def test_the_firewall_check_covers_the_role_ports_and_both_udp_ports():
     wanted = netcheck.wanted_ports(["stage0", "gateway"])
     assert wanted[-2:] == [("UDP", 50059), ("UDP", 5353)]
-    assert len([p for p in wanted if p[0] == "TCP"]) == 2
+    assert len([p for p in wanted if p[0] == "TCP"]) == 3  # gateway, stage 0, its supervisor
+
+
+def test_the_firewall_check_covers_each_stage_supervisor_port(tmp_path, monkeypatch):
+    hosts = tmp_path / "hosts.toml"
+    hosts.write_text(
+        'network = "test-lan"\n'
+        '[gateway]\nhost = "10.0.0.1"\nport = 50050\n'
+        '[stage0]\nhost = "10.0.0.2"\nport = 50051\n'
+        '[stage1]\nhost = "10.0.0.1"\nport = 50052\n'
+        '[supervisor1]\nhost = "10.0.0.1"\nport = 7000\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PLLM_CONFIG", str(hosts))
+
+    def tcp(roles):
+        return [port for proto, port in netcheck.wanted_ports(roles) if proto == "TCP"]
+
+    assert tcp(["stage0"]) == [50051, 50061]
+    assert tcp(["stage1", "gateway"]) == [50052, 50050, 7000]  # a supervisor table applies
+    assert tcp(["gateway"]) == [50050]
 
 
 def test_probe_rejects_a_count_below_one(capsys):
@@ -344,3 +364,31 @@ def test_a_stop_ends_the_short_probe_with_the_error_recorded(echo_server):
     assert "error" in result["roles"]["stage0"]
     # The round trip comes from the role that answered only.
     assert result["rtt_ms"] == result["roles"]["gateway"]["median_ms"]
+
+
+def test_a_port_that_stays_down_does_not_hold_back_the_next_one():
+    with socket.socket() as closed, socket.socket() as open_:
+        closed.bind(("127.0.0.1", 0))
+        open_.bind(("127.0.0.1", 0))
+        open_.listen()
+        endpoints = {
+            "stage0": _endpoint(closed.getsockname()[1]),
+            "gateway": _endpoint(open_.getsockname()[1]),
+        }
+        stop = threading.Event()
+        results = []
+        thread = threading.Thread(
+            target=lambda: results.append(
+                netcheck.short_probe(endpoints, stop, timeout=0.2, poll=0.1)
+            )
+        )
+        thread.start()
+        time.sleep(1.0)
+        open_.close()  # timed only if it was tried while stage 0 was still down
+        stop.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    (result,) = results
+    assert "error" in result["roles"]["stage0"]
+    assert result["roles"]["gateway"]["count"] == 5
+    assert list(result["roles"]) == ["stage0", "gateway"]

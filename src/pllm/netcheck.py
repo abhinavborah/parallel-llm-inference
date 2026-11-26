@@ -127,13 +127,15 @@ def short_probe(
 ) -> dict:
     """Time `count` TCP connects to each endpoint, a round trip each (SYN and SYN-ACK).
 
-    For the other laptop's ports, which run gRPC rather than the echo server. A port that
-    does not answer yet is tried again every `poll` seconds until it does or `stop` is set.
-    rtt_ms is the median of every timed connect, or None if no port answered.
+    For the other laptop's ports, which run gRPC rather than the echo server. Each poll tries
+    every port that has not answered yet, so one port that stays down does not hold back the
+    others; they are tried again every `poll` seconds until they answer or `stop` is set, and
+    a port still down then is recorded with its last error. rtt_ms is the median of every
+    timed connect, or None if no port answered.
     """
-    roles, timed = {}, []
-    for role, endpoint in endpoints.items():
-        while True:
+    roles, timed, errors, pending = {}, [], {}, dict(endpoints)
+    while pending:
+        for role, endpoint in list(pending.items()):
             try:
                 connects = []
                 for _ in range(count):
@@ -141,14 +143,19 @@ def short_probe(
                     socket.create_connection((endpoint.host, endpoint.port), timeout).close()
                     connects.append((time.perf_counter() - start) * 1000)
             except OSError as err:  # refused or timed out: not up yet, or not reachable
-                if stop.wait(poll):
-                    roles[role] = {"address": endpoint.address, "error": str(err)}
-                    break
+                errors[role] = str(err)
                 continue
             roles[role] = {"address": endpoint.address, "count": count, **summary(connects)}
             timed += connects
+            del pending[role]
+        if pending and stop.wait(poll):
+            for role, endpoint in pending.items():
+                roles[role] = {"address": endpoint.address, "error": errors[role]}
             break
-    return {"roles": roles, "rtt_ms": statistics.median(timed) if timed else None}
+    return {
+        "roles": {role: roles[role] for role in endpoints},
+        "rtt_ms": statistics.median(timed) if timed else None,
+    }
 
 
 def multicast_sender(interface: str = "0.0.0.0") -> socket.socket:
@@ -351,8 +358,10 @@ def describe_rule(rule: dict) -> str:
 
 
 def wanted_ports(roles: list[str]) -> list[tuple[str, int]]:
-    """The role ports, this check's multicast port and the discovery port."""
+    """Role ports, each stage's supervisor port, the multicast check port and the discovery port."""
     tcp = [("TCP", e.port) for e in _endpoints(roles).values()]
+    stages = [int(role.removeprefix("stage")) for role in roles if role.startswith("stage")]
+    tcp += [("TCP", config.supervisor_endpoint(stage).port) for stage in stages]
     return tcp + [("UDP", MCAST_PORT), ("UDP", MDNS_PORT)]
 
 
