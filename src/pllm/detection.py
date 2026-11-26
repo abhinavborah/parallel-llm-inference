@@ -12,11 +12,12 @@ by default), in fields ending in _ns:
 
 - detected: path (stream_break, heartbeat_timeout, step_deadline or replaced), stage, epoch,
   declared, t_ns, time, last_beat_ns, since_last_beat_ns, rid, step, detail
-- registered: stage, old_epoch, new_epoch, t_ns, time, waited_ns, route_queued_ns
+- registered: stage, old_epoch, new_epoch, t_ns, time, waited_ns, route_queued_ns, load_ns
 
 time is the wall clock, a label only: it is never subtracted. waited_ns runs from the
 declaration of old_epoch to the new registration. route_queued_ns is when the route update
-was queued for the neighbour, and None if the neighbour had no stream.
+was queued for the neighbour, and None if the neighbour had no stream. load_ns is the weight
+load time the new stage reported, a duration on its own clock, or None (pllm.control).
 
 A step deadline declares nothing. The gateway cannot tell which stage holds a late step, and
 a slow stage keeps beating, so its supervisor would never send the Register a declaration
@@ -119,7 +120,12 @@ class Detector:
         self._log(record)
 
     def registered(
-        self, stage: int, old_epoch: int | None, new_epoch: int, route_queued_ns: int | None
+        self,
+        stage: int,
+        old_epoch: int | None,
+        new_epoch: int,
+        route_queued_ns: int | None,
+        load_ns: int | None = None,
     ) -> None:
         """Record a registration, after any declaration of the epoch it replaces."""
         with self._lock:
@@ -134,6 +140,7 @@ class Detector:
                 "time": self._wall(),
                 "waited_ns": None if declared is None else now - declared,
                 "route_queued_ns": route_queued_ns,
+                "load_ns": load_ns,
             }
             self._events.append(record)
         self._log(record)

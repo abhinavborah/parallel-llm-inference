@@ -35,6 +35,8 @@ from pllm.supervisor import (
 )
 from pllm.worker import exit_when_parent_gone, register_with_gateway
 
+pytestmark = pytest.mark.fault
+
 WAIT = 30.0
 
 LISTENER = """

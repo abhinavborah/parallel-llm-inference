@@ -9,6 +9,8 @@ import pytest
 
 from pllm import faults
 
+pytestmark = pytest.mark.fault
+
 # Child that appends one byte to a file every 10 ms, so progress is visible from outside.
 TICKER = """
 import sys, time
