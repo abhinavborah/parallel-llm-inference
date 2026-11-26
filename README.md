@@ -489,6 +489,8 @@ Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
 
 Plots for each experiment (X2 to X9) are added here by that experiment.
 
+The final report, with the evidence table for every requirement, is [docs/report.md](docs/report.md).
+
 ## Dashboard
 
 A live page for the demo (`pllm.dashboard`, standard library only, so nothing for Host B and
