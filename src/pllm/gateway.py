@@ -148,7 +148,7 @@ from pathlib import Path
 import grpc
 
 from pllm import config, metrics, prompts, runrecord, wire
-from pllm.control import Registration, Registry, expected_model
+from pllm.control import Registration, Registry, expected_model, load_ns_of
 from pllm.detection import HEARTBEAT_TIMEOUT_SECONDS, STEP_TIMEOUT_SECONDS, Detector
 from pllm.heartbeat import HEARTBEAT_SECONDS
 from pllm.model import ModelConfig
@@ -426,7 +426,8 @@ class Gateway(
                 other.outbox.put(self._route(entry))
                 queued = self.detector.now()
             old_epoch = previous.epoch if previous is not None else None
-            self.detector.registered(entry.stage, old_epoch, entry.epoch, queued)
+            load = load_ns_of(context.invocation_metadata())
+            self.detector.registered(entry.stage, old_epoch, entry.epoch, queued, load)
         return protocol_pb2.RegisterResp(epoch=entry.epoch)
 
     @staticmethod

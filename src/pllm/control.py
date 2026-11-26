@@ -11,6 +11,11 @@ The counter lives only in the gateway process; only workers are restarted.
 
 pllm.gateway serves Control with this Registry and adds the heartbeat stream;
 ControlService serves Register alone, for tests and tools.
+
+A worker may also send how long it took to load its weights, in nanoseconds on its own
+clock, as the Register call's metadata LOAD_KEY (R6.12). It is optional and outside the
+schema, so an older worker or gateway ignores it; load_ns_of takes a plain non-negative
+integer only, so a stage cannot put anything else into the gateway's log.
 """
 
 import threading
@@ -24,6 +29,16 @@ from pllm.models import MODELS_DIR, PINNED
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
 
 STAGES = (0, 1)
+LOAD_KEY = "pllm-load-ns"
+
+
+def load_ns_of(metadata) -> int | None:
+    """The weight load time a stage sent with Register, or None if it sent none or a bad one."""
+    for key, value in metadata or ():
+        if key == LOAD_KEY:
+            text = value.decode() if isinstance(value, bytes) else value
+            return int(text) if text.isascii() and text.isdigit() else None
+    return None
 
 
 @dataclass(frozen=True)
@@ -128,12 +143,13 @@ def register(
     weights_sha256: str,
     addr: str,
     timeout: float = 10.0,
+    load_ns: int | None = None,
 ) -> int:
     """Register a stage with the gateway on channel and return its epoch.
 
     weights_sha256 is the hex digest of the model.safetensors the stage loaded, as
-    computed by models.sha256_of, not the pinned value. Raises grpc.RpcError with
-    INVALID_ARGUMENT if the gateway rejects it.
+    computed by models.sha256_of, not the pinned value. load_ns, if given, is sent as
+    LOAD_KEY metadata. Raises grpc.RpcError with INVALID_ARGUMENT if the gateway rejects it.
     """
     stub = protocol_pb2_grpc.ControlStub(channel)
     req = protocol_pb2.RegisterReq(
@@ -144,4 +160,5 @@ def register(
         weights_sha256=bytes.fromhex(weights_sha256),
         addr=addr,
     )
-    return stub.Register(req, timeout=timeout).epoch
+    metadata = None if load_ns is None else ((LOAD_KEY, str(load_ns)),)
+    return stub.Register(req, timeout=timeout, metadata=metadata).epoch

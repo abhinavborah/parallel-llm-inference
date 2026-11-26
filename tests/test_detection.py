@@ -196,6 +196,7 @@ def test_a_registration_reports_the_wait_since_the_declaration():
         "time": 1234.5,
         "waited_ns": 3 * SECOND,
         "route_queued_ns": clock.ns,
+        "load_ns": None,
     }
 
 

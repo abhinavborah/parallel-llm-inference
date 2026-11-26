@@ -226,6 +226,12 @@ range that does not match the split point, and otherwise returns a new epoch.
 Epochs come from one counter in the gateway, so a stage that registers again always gets
 a higher epoch. `pllm.control.register` is the stage side.
 
+Protocol note: a stage may also send its weight load time with Register, as gRPC metadata
+`pllm-load-ns`, an integer of nanoseconds on the stage's own clock. The field is optional,
+outside the protobuf schema and backward compatible: a gateway that does not know it ignores
+it, and a missing or malformed value is logged as null. The gateway uses it only as a
+duration, to split recovery time (see [Recovery time](#recovery-time)).
+
 ## Gateway
 
 `pllm.gateway` serves `Control.Register`, `Control.Heartbeat`, `Frontend.Generate` and
@@ -574,7 +580,8 @@ Detection records:
   `since_last_beat_ns`, `rid`, `step`, `detail` (`stage` and `epoch` are the suspect or null
   for a step deadline).
 - `registered`: `stage`, `old_epoch`, `new_epoch`, `t_ns`, `time`, `waited_ns` (from the
-  declaration), `route_queued_ns` (null if the neighbour had no stream).
+  declaration), `route_queued_ns` (null if the neighbour had no stream), `load_ns` (the
+  weight load time the new stage reported, or null).
 
 The two default timeouts are provisional: the beat gaps behind the 2.0 s value were measured
 on one laptop only. A laptop that pauses longer, for example while paging, needs a larger

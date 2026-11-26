@@ -132,6 +132,12 @@ REGISTER_RETRY_SECONDS = 1.0
 RETRY_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
 
 
+def _load_ns(servicer) -> int | None:
+    """The weight load time of the servicer's worker, for the gateway's recovery log."""
+    seconds = getattr(getattr(servicer, "worker", None), "load_seconds", None)
+    return None if seconds is None else round(seconds * 1e9)
+
+
 def register_with_gateway(
     gateway: str,
     stage: int,
@@ -159,7 +165,9 @@ def register_with_gateway(
     with grpc.insecure_channel(gateway, options=options) as channel:
         while not stop.is_set():
             try:
-                epoch = register(channel, stage, layers, model, weights, addr)
+                epoch = register(
+                    channel, stage, layers, model, weights, addr, load_ns=_load_ns(servicer)
+                )
             except grpc.RpcError as err:
                 if err.code() not in RETRY_CODES:
                     raise  # a rejection or a protocol error will not fix itself
