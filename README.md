@@ -583,6 +583,40 @@ too. If both stages die during one replay, the line names the later death. A req
 fails at a death before replaying, such as at `MAX_DEATHS`, still gets a line, with
 `recovered` false.
 
+## Fault suite
+
+Every failure-handling claim of Epic E6 has a test that injects the fault (R6.13). The tests
+carry the pytest mark `fault`, so one command runs them all on either laptop:
+
+```
+uv run python -m pllm.models smollm2-135m   # once, for the real-weights test
+uv run pytest -m fault -rs
+```
+
+`-rs` lists every skipped test with its reason, so no test skips unseen. Only
+`test_a_real_worker_killed_by_the_fault_injector_is_back_and_registered` can skip: it needs
+the downloaded SmolLM2-135M weights and 1.5 GiB of free memory. On Host B (0.7 GiB budget)
+that skip is expected: the respawn claim is still tested there with stand-in worker scripts
+and with real stage processes of a small random model, and the real-weights respawn runs on
+Host A. Every other fault test uses stand-in scripts or that small model, so the suite needs
+no downloaded weights. The suite uses only 127.0.0.1.
+
+| Claim | Fault injected | Tests |
+|---|---|---|
+| R6.1 kill, suspend and resume, per-step sleep | kill and suspend of real process trees; a step delay | `test_faults.py`; `test_supervisor.py::test_kill_suspend_and_resume_are_applied_through_the_fault_injector`, `::test_the_control_port_applies_kill_suspend_and_resume` |
+| R6.2 the supervisor respawns, respawn time logged | kill of the worker; a worker that exits or crashes | `test_supervisor.py::test_a_worker_killed_by_the_fault_injector_is_respawned`, `::test_the_respawn_time_is_logged`, `::test_a_crash_loop_backs_off_and_never_gives_up`, `::test_a_killed_worker_comes_back_and_registers_again` |
+| R6.3 detection by stream break, heartbeat timeout, step deadline | kill, suspend, a slow step | `test_detection.py::test_a_killed_stage_is_detected_by_its_stream_break`, `::test_a_suspended_stage_is_detected_by_its_heartbeat_timeout`, `::test_a_slow_step_is_recorded_without_declaring_the_stage_and_the_request_completes`, `::test_a_step_held_by_a_suspended_stage_names_it_then_its_timeout_declares_it` |
+| R6.4 dead epoch, new registration, route update | a stopped or resumed stage | `test_detection.py::test_a_dead_epoch_waits_for_a_new_registration_and_a_route_update`, `::test_a_stage_resumed_with_no_replacement_is_told_and_exits`, `::test_a_resumed_stage_is_replaced_by_its_supervisor_with_no_manual_step` |
+| R6.5 idle requests holding KV are bumped | a stopped stage while one request waits for a credit | `test_replay.py::test_an_idle_request_holding_kv_is_bumped_at_the_declaration_and_both_finish` |
+| R6.6 chunked replay through both stages | a stopped stage; a GAP Nack | `test_replay.py::test_the_replay_resends_the_original_messages_with_the_replay_flag`, `::test_a_gap_nack_replays_the_request` |
+| R6.7 replay verified, output equals a fault-free run | kill of a real stage process (each stage); a forced mismatch | `test_replay.py::test_a_killed_stage_process_is_replaced_and_the_request_finishes_unchanged`, `::test_a_replayed_token_that_differs_from_the_history_is_logged_and_not_sent` |
+| R6.8 late outputs of a resumed stage rejected | suspend past the timeout, resume after the replacement (each stage) | `test_stale_after_suspend.py::test_a_resumed_old_stage_has_every_late_output_rejected` |
+| R6.9 attempts, MAX_DEATHS, growing pause, deadline | repeated stage deaths; a refused replay; no replacement | `test_fail_cleanly.py::test_each_declared_death_raises_every_attempt_by_exactly_one`, `::test_a_request_that_lives_through_max_deaths_fails_with_unavailable`, `::test_a_refused_replay_waits_longer_each_time`; `test_replay.py::test_with_no_replacement_the_request_fails_at_its_deadline` |
+| R6.10 a slow worker fails cleanly at the deadline, bounds hold | a step delay on each stage; a suspended worker | `test_fail_cleanly.py::test_a_worker_slower_than_the_step_timeout_fails_requests_at_their_deadline_within_bounds`; `test_deadlines.py::test_with_a_suspended_worker_every_request_ends_by_its_deadline` |
+| R6.11 a delayed or lost hop | none yet | open: #50, on the hop wrapper of #49 |
+| R6.12 recovery time in four parts | kill of a real stage process (each stage); a stopped stage; suspend and resume | `test_recovery.py`; `test_stale_after_suspend.py` (stale outputs counted) |
+| R6.14 both stages at once | none yet | open: #52 |
+
 ## Failure detection
 
 The gateway watches each stage incarnation by its epoch (`pllm.detection`, read with

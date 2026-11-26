@@ -20,6 +20,8 @@ from pllm.gateway import recovery_parts
 from pllm.models import sha256_of
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
 
+pytestmark = pytest.mark.fault
+
 
 @pytest.fixture
 def plane(tmp_path):

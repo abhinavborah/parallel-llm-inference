@@ -29,6 +29,8 @@ from pllm import faults, metrics, report
 from pllm.control import ExpectedModel
 from pllm.models import sha256_of
 
+pytestmark = pytest.mark.fault
+
 LAYERS = 4
 K = 2
 BEAT = 0.05
