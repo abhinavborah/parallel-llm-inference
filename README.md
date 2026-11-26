@@ -543,10 +543,15 @@ goes on from the history the client has.
 
 - A GAP Nack (a stage with no cache at the step's position) replays the request too.
 - While a request replays, a failed stream or a refused step (a new stage before its route
-  update) starts it again under a newer attempt, after 0.05 s. A replay never reuses an
-  attempt, so a late result of an older one is always dropped.
+  update) starts it again under a newer attempt, after a pause: 0.05 s, doubled at each
+  refusal up to 1 s, times a random 1 to 1.5, never past the deadline. A new token or a new
+  death starts the pause at 0.05 s again. A replay never reuses an attempt, so a late
+  result of an older one is always dropped.
 - A request waits for the new stage at most until its own deadline, then fails with
   DEADLINE_EXCEEDED. `Gateway.replays` counts replays started.
+- A request that lives through 3 stage deaths (`MAX_DEATHS`) fails with UNAVAILABLE at the
+  third, instead of replaying again: a request that kills every new stage, for example by
+  running a worker out of memory, must not keep the others replaying until its deadline.
 
 ## Failure detection
 
@@ -616,6 +621,48 @@ logits differ in their low bits there, so across hosts compare the stored tokens
 and report agreement. The summary line also gives the inter-op
 thread count. The stored logit summary is the top logit per step, not the full logits. `--length` is 16, 128 (the default)
 or 512; `--count` limits the run to the first prompts.
+
+## X2: throughput against concurrency
+
+`pllm.x2` serves the same requests at concurrency 1, 2, 4, 8 and 16, either through the
+pipeline or in one process round-robin without batching. Both modes run a closed loop: c
+requests are outstanding, and a finished one is replaced by the next at once. Each cell has
+`--requests` requests (default 32, at least twice the concurrency) over the prompt set's
+passages of `--length` tokens (default 128), with `--new-tokens` (default 64), after one
+untimed warm-up request. Cells run repeat by repeat (`--repeats`, default 5).
+
+Pipeline mode is a client of a running system. Start it with `pllm.launch`, then pass the
+gateway's metrics file (the newest `runs/*.metrics.jsonl`):
+
+```
+uv run python -m pllm.launch smollm2-135m
+uv run python -m pllm.x2 pipeline smollm2-135m --metrics runs/<gateway>.metrics.jsonl
+```
+
+Single mode loads the whole model in its own process, serves at most 14 requests at a time
+like the gateway (the rest wait in arrival order), and writes its own metrics file:
+
+```
+uv run python -m pllm.x2 single smollm2-135m
+```
+
+`--threads` sets its torch threads (default: the physical cores). The run record keeps the
+process's lifetime peak RSS after load and at the end, its RSS just after load, and the
+largest RSS sampled while serving, so a load peak and the settled size are told apart.
+`--budget-mib` names the budget they are read against; the record states it and makes no
+claim about a breach.
+
+Throughput, TTFT, TPOT and stage utilisation are computed by `pllm.report` from the metrics
+file, so they use the gateway's clock and the definitions given there. In pipeline mode the
+runner also counts ordering violations: steps that do not rise per request and attempt on the
+gateway's two hops, and client streams whose steps are not 0 to n - 1. The stages' own
+ordering counters are not exported, so they are not part of this count.
+
+Output: one JSON line per cell, one line per mode and concurrency with n, mean, stdev, min
+and max over the repeats, and a summary, in a `.jsonl` file next to the run record in
+`runs/` (named in the record as `results_file`) and on stdout. Each cell line also has a
+sha256 of every prompt's tokens, so on one host the two modes can be compared. The exit
+code is 0 only with zero ordering violations and no failed request.
 
 ## X7: overload with bounds on and off
 
@@ -710,8 +757,9 @@ available memory and power state at the start, warns on battery, and writes a ru
 - Use native Python, not WSL2.
 - Keep the charger in and select the best performance power plan or power mode in Settings.
 - The launcher is one more process on this laptop: about 39 MiB, plus 5 MiB for the virtual
-  environment's `python.exe` trampoline (measured on Windows 11, without `uv` itself), a small
-  part of the roughly 2.5 GB this laptop has for the worker.
+  environment's `python.exe` trampoline (measured on Windows 11, without `uv` itself). It is
+  not part of the worker's 0.7 GiB budget (requirement R1.7) but comes out of the headroom
+  kept above it.
 - Stop the launcher with Ctrl-C. On Ctrl-Break `uv` itself exits at once with 0xC000013A, so
   the shell sees that code while the launcher finishes the stop behind it.
 - The Windows firewall is off for now, on the Public profile (agreed 2026-11-09), so the
