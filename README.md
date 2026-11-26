@@ -548,6 +548,32 @@ goes on from the history the client has.
   third, instead of replaying again: a request that kills every new stage, for example by
   running a worker out of memory, must not keep the others replaying until its deadline.
 
+## Recovery time
+
+Each replay is one recovery (R6.12). When it ends, at the request's first new token or when
+the request ends while still replaying, the gateway writes one `recovery` line to the
+metrics file. All times are on the gateway's clock except the weight load, which the new
+stage reports as a duration (see [Stage registration](#stage-registration)).
+
+| Field | Meaning |
+|---|---|
+| `rid`, `attempt`, `recovered`, `outcome` | the request, the attempt that recovered, false (with the outcome) if it ended first |
+| `stage`, `old_epoch`, `new_epoch`, `path` | the death that bumped the request; null for a replay with no death (a GAP Nack) |
+| `detection_ns` | declaration minus the dead epoch's last beat: an upper bound on fault to detection, since the gateway cannot see the fault itself |
+| `respawn_ns` | declaration to the new registration, minus the weight load: noticing the exit, starting the process, hashing the weights, registering |
+| `weight_load_ns` | the new stage's own load time; null if it sent none (an older worker, or a stage started inside a test) |
+| `overlap` | true when the restart ran while detection was still pending (always for `replaced`); `respawn_ns` is then 0 and the parts add up to more than the restart |
+| `replay_prefill_ns` | the replayed prompt's send to its result |
+| `recomputed_tokens`, `divergences` | replayed steps compared with the history, and those that differed |
+| `total_ns` | the dead epoch's last beat to the first new token; null if not recovered |
+
+The four parts do not add up to `total_ns`: the rest is recomputing the tokens sent before
+and any pause before a refused replay. Stale outputs discarded are counted by the report from
+the metrics file (see [Report](#report)), so the late results of a resumed old stage count
+too. If both stages die during one replay, the line names the later death. A request that
+fails at a death before replaying, such as at `MAX_DEATHS`, still gets a line, with
+`recovered` false.
+
 ## Failure detection
 
 The gateway watches each stage incarnation by its epoch (`pllm.detection`, read with
