@@ -653,6 +653,51 @@ and max over the repeats, and a summary, in a `.jsonl` file next to the run reco
 sha256 of every prompt's tokens, so on one host the two modes can be compared. The exit
 code is 0 only with zero ordering violations and no failed request.
 
+## X1b: agreement across the laptops
+
+`pllm.x1b` sends each prompt of an X1a run through the two-laptop pipeline once, one request
+at a time, and compares the tokens with each host's single-process reference (the X1a run
+records). Across hosts the result is agreement, never exact equality.
+
+First run X1a on each laptop with the same length and token count. Host B's record comes from
+issue #17's run; copy its `runs/<utc>-x1a.json` into `runs/` on Host A. Then start the system
+(see "Starting the system": Stage 0 on Host B, the gateway and Stage 1 on Host A) and run, on
+Host A:
+
+```
+uv run python -m pllm.x1b smollm2-135m --metrics runs/<gateway>.metrics.jsonl --reference runs/<host A>-x1a.json runs/<host B>-x1a.json
+```
+
+Each record is checked before any request is sent: an x1a record with status ok, its
+reference checksum recomputed over its settings, the prompt set and its entries, the same
+model, revision, length and token count in every record, and each stored prompt equal to the
+prompt set's. The length, token count and prompts come from the records. `--metrics` is the
+running gateway's file; it is read to refuse a gateway serving another model and for the
+split point, and the first request waits until both stages beat in it (up to `--wait`
+seconds, default 120), since a request sent earlier is refused. `--rtt-ms` puts a round-trip
+time from `pllm.netcheck` into the run record.
+
+Per prompt and reference:
+
+- `first_divergence`: the first step whose token differs, `null` if none.
+- `agreed_tokens`: the steps before it (all if none), out of `compared_tokens`, the tokens
+  streamed.
+- `max_logit_diff`: the largest difference of the chosen token's logit over the steps up to
+  and including the first divergence. The wire and the X1a record carry only that logit, so
+  this is not the full-vocabulary difference of X1a.
+
+The gateway stops at end of sequence and the reference does not. A stop on the token the
+reference also chose agrees; a stop on another token diverges there. Per reference, the
+summary gives sequence agreement (the percent of prompts whose tokens all agree), token
+agreement (agreed over compared tokens), the smallest and median first divergence, and the
+largest logit difference.
+
+Output: one JSON line per prompt and reference, then one summary per reference, in a `.jsonl`
+file next to the run record in `runs/` (named in the record as `results_file`) and on stdout.
+The record keeps the command (`argv`), each reference's file, host and checksum, and the
+pipeline's tokens and top logits per prompt, so a later comparison needs no rerun. The exit
+code is 0 when every request completed; agreement is reported, not asserted.
+
 ## Starting the system
 
 `pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway
