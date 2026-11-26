@@ -349,6 +349,11 @@ def analyse(rows: list[dict], run: report.Run, settings: dict, offered: int, mem
         (len(run.requests) != offered, "not every offered request has its line"),
         (not overloaded, "the load was not above capacity"),
         (queue_ok is False, "the admission queue went over its bound"),
+        (
+            bound is None and result["rejected"] > 0,
+            "requests were refused with the admission bound off: another limit, such as "
+            "KV admission, was in force",
+        ),
         (credits_ok is not True, "the steps in flight are not shown to be within the credits"),
         (inbox_ok is False, "a stage inbox went over its bound"),
         (memory["within_budget"] is False, "Stage 0's worker went over the memory budget"),

@@ -1024,6 +1024,13 @@ sample from the other one fails, and the run does not pass. Delete the table to 
 The settings are the bound on and off, `--admission-queue 8` and `--admission-queue off`,
 both with `--credits 8`, then the bound on with `--credits` 1, 2 and 4.
 
+Start the bound-off setting with `--no-kv-admission` as well. KV admission (R5.3) also
+reserves for waiting requests, so with it on the queue is still bounded: at the committed
+budget, 72 requests of 128 prompt and 32 new tokens. Only running requests hold a cache on
+Stage 0, at most the running slots, so turning it off does not let waiting requests use
+Host B memory. A bound-off run with any refusal does not pass. At 22 requests of that size
+(8 waiting and 14 running), KV admission does not bind in the bound-on settings.
+
 With the first setting running, measure the capacity once and choose a rate well above it.
 Use that rate for every setting:
 

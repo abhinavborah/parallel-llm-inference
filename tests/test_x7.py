@@ -341,6 +341,18 @@ def test_a_run_passes_only_with_every_line_overload_held_bounds_and_memory_not_o
     assert unqueued["overloaded"] is False and unqueued["passed"] is False
 
 
+def test_a_refusal_with_the_admission_bound_off_does_not_pass():
+    off = {**SETTINGS, "admission_queue": None}
+    clean = analysed([*(request(i) for i in range(10)), depth()], settings=off)
+    assert clean["passed"] is True and clean["rejected"] == 0
+    rows = [request(i, "OK" if i < 7 else "RESOURCE_EXHAUSTED") for i in range(10)]
+    refused = analysed([*rows, depth()], settings=off)
+    assert refused["rejected"] == 3 and refused["passed"] is False
+    [why] = refused["failures"]
+    assert "admission bound off" in why
+    assert analysed([*rows, depth()])["passed"] is True  # with the bound on, refusals count
+
+
 def test_refused_and_failed_requests_are_counted_beside_the_latencies():
     rows = [request(i) for i in range(6)]
     rows += [request(6, "RESOURCE_EXHAUSTED"), request(7, "RESOURCE_EXHAUSTED")]
