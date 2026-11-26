@@ -408,3 +408,76 @@ def test_the_report_of_a_real_run_gives_its_requests_and_stage_busy_time(tmp_pat
     assert stage0["busy_s"] == pytest.approx(busy0 / 1e9, abs=2 * stage0["max_beat_gap_s"])
     assert 0 < stage0["utilisation"] <= 1.05
     assert report.main([str(path), "--out", str(tmp_path / "out")]) == 0
+
+
+# -------------------------------------------------------------- recoveries
+
+
+def recovery(t, rid, attempt, recovered=True, **parts):
+    line = dict(type="recovery", t_ns=t, rid=rid, attempt=attempt, recovered=recovered)
+    line.update(stage=1, old_epoch=3, new_epoch=4, path="stream_break", overlap=False)
+    line.update(detection_ns=None, respawn_ns=None, weight_load_ns=None)
+    line.update(replay_prefill_ns=None, total_ns=None, recomputed_tokens=5, divergences=0)
+    line.update(parts)
+    return line
+
+
+def dropped(t, rid, attempt, accepted=False, hop="stage1_gateway"):
+    return dict(type="hop", t_ns=t, hop=hop, msg="StepResult", rid=rid, attempt=attempt,
+                step=0, accepted=accepted)  # fmt: skip
+
+
+def test_each_recovery_is_a_row_with_its_parts_in_ms_and_its_stale_outputs(tmp_path):
+    """Request a recovers twice (attempt 2, then 4). Each dropped result of a counts once,
+    in the recovery whose attempts it falls between, even one that arrived after the line
+    (a resumed old stage). Accepted results, other requests, the current attempt and the
+    stage 0 hop are not stale outputs of a."""
+    path = write(
+        tmp_path / "r.metrics.jsonl",
+        [
+            dropped(1, "a", 1),
+            recovery(
+                2,
+                "a",
+                2,
+                detection_ns=200 * MS,
+                respawn_ns=300 * MS,
+                weight_load_ns=1500 * MS,
+                replay_prefill_ns=40 * MS,
+                total_ns=2500 * MS,
+            ),
+            dropped(3, "a", 2),
+            dropped(4, "a", 3),
+            dropped(5, "a", 1),  # late: after the first recovery's line
+            dropped(6, "a", 4),  # the attempt that recovered: a duplicate, not stale
+            dropped(6, "a", 3, accepted=True),
+            dropped(6, "b", 1),
+            dropped(6, "a", 1, hop="gateway_stage0"),
+            recovery(7, "a", 4, recovered=False),
+        ],  # fmt: skip
+    )
+    run = report.load(path)
+    rows = [
+        dict(zip(report.RECOVERY_HEADER, row, strict=True)) for row in report.recovery_rows(run)
+    ]
+    assert [(r["attempt"], r["stale_discarded"]) for r in rows] == [(2, 2), (4, 2)]
+    first = rows[0]
+    assert (first["detection_ms"], first["respawn_ms"], first["weight_load_ms"]) == (200, 300, 1500)
+    assert (first["replay_prefill_ms"], first["total_ms"]) == (40, 2500)
+    assert rows[1]["recovered"] is False and rows[1]["total_ms"] is None
+    s = report.summary(run)
+    assert (s["recoveries"], s["recovered"]) == (2, 1)
+    out = tmp_path / "out"
+    assert report.main([str(path), "--out", str(out)]) == 0
+    csv_rows = read_csv(out / "r" / "recovery.csv")
+    assert [r["stale_discarded"] for r in csv_rows] == ["2", "2"]
+    assert csv_rows[1]["total_ms"] == ""
+    assert "## Recoveries (1 of 2 recovered)" in (out / "r" / "summary.md").read_text()
+
+
+def test_a_run_with_no_recovery_has_an_empty_table(tmp_path):
+    path = write(tmp_path / "r.metrics.jsonl", [request("a", 0, MS, 2 * MS, 2)])
+    out = tmp_path / "out"
+    assert report.main([str(path), "--out", str(out)]) == 0
+    assert read_csv(out / "r" / "recovery.csv") == []
+    assert "None." in (out / "r" / "summary.md").read_text()

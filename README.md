@@ -227,6 +227,12 @@ range that does not match the split point, and otherwise returns a new epoch.
 Epochs come from one counter in the gateway, so a stage that registers again always gets
 a higher epoch. `pllm.control.register` is the stage side.
 
+Protocol note: a stage may also send its weight load time with Register, as gRPC metadata
+`pllm-load-ns`, an integer of nanoseconds on the stage's own clock. The field is optional,
+outside the protobuf schema and backward compatible: a gateway that does not know it ignores
+it, and a missing or malformed value is logged as null. The gateway uses it only as a
+duration, to split recovery time (see [Recovery time](#recovery-time)).
+
 ## Gateway
 
 `pllm.gateway` serves `Control.Register`, `Control.Heartbeat`, `Frontend.Generate` and
@@ -424,7 +430,7 @@ uv run python -m pllm.report --out DIR        # default runs/report
 ```
 
 It writes `runs.csv` and `index.md` with one row per run, and a folder per run with
-`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `latency_cdf.png` and, when the
+`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `recovery.csv`, `latency_cdf.png` and, when the
 stages sent beats, `utilisation.png`. The report is built beside the output folder and
 then replaces it whole, so a failed build leaves the old one. The command refuses a folder
 it did not make, a file, and a folder that holds a log; anything added to a folder it made
@@ -449,6 +455,15 @@ Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
   heartbeat that reconnected or beats that stopped, and `summary.md` warns when it is over
   1 s. Utilisation is busy time over the window; two streams working at once on one stage
   can push it above 1.
+- Recoveries: one row per `recovery` line (see [Recovery time](#recovery-time)), times in
+  ms. `stale_discarded` is counted here only: the request's results the gateway dropped
+  (`hop` lines with `accepted` false) at an attempt from the previous recovery's attempt of
+  that request (1 for the first) up to, not including, this recovery's, over the whole run.
+  So a late result of a resumed old stage counts even when it arrives after the recovery
+  line, and a request that recovers twice counts each result once. Nacks have no `hop` line
+  and are not counted (the gateway's `stale_nack` count has them), nor is a result accepted
+  on arrival and dropped only when its request took it, after a bump (`Gateway.discards`
+  has it).
 
 Plots for each experiment (X2 to X9) are added here by that experiment.
 
@@ -572,6 +587,66 @@ goes on from the history the client has.
   third, instead of replaying again: a request that kills every new stage, for example by
   running a worker out of memory, must not keep the others replaying until its deadline.
 
+## Recovery time
+
+Each replay is one recovery (R6.12). When it ends, at the request's first new token or when
+the request ends while still replaying, the gateway writes one `recovery` line to the
+metrics file. All times are on the gateway's clock except the weight load, which the new
+stage reports as a duration (see [Stage registration](#stage-registration)).
+
+| Field | Meaning |
+|---|---|
+| `rid`, `attempt`, `recovered`, `outcome` | the request, the attempt that recovered, false (with the outcome) if it ended first |
+| `stage`, `old_epoch`, `new_epoch`, `path` | the death that bumped the request; null for a replay with no death (a GAP Nack) |
+| `detection_ns` | declaration minus the dead epoch's last beat: an upper bound on fault to detection, since the gateway cannot see the fault itself |
+| `respawn_ns` | declaration to the new registration, minus the weight load: noticing the exit, starting the process, hashing the weights, registering |
+| `weight_load_ns` | the new stage's own load time; null if it sent none (an older worker, or a stage started inside a test) |
+| `overlap` | true when the restart ran while detection was still pending (always for `replaced`); `respawn_ns` is then 0 and the parts add up to more than the restart |
+| `replay_prefill_ns` | the replayed prompt's send to its result |
+| `recomputed_tokens`, `divergences` | replayed steps compared with the history, and those that differed |
+| `total_ns` | the dead epoch's last beat to the first new token; null if not recovered |
+
+The four parts do not add up to `total_ns`: the rest is recomputing the tokens sent before
+and any pause before a refused replay. Stale outputs discarded are counted by the report from
+the metrics file (see [Report](#report)), so the late results of a resumed old stage count
+too. If both stages die during one replay, the line names the later death. A request that
+fails at a death before replaying, such as at `MAX_DEATHS`, still gets a line, with
+`recovered` false.
+
+## Fault suite
+
+Every failure-handling claim of Epic E6 has a test that injects the fault (R6.13). The tests
+carry the pytest mark `fault`, so one command runs them all on either laptop:
+
+```
+uv run python -m pllm.models smollm2-135m   # once, for the real-weights test
+uv run pytest -m fault -rs
+```
+
+`-rs` lists every skipped test with its reason, so no test skips unseen. Only
+`test_a_real_worker_killed_by_the_fault_injector_is_back_and_registered` can skip: it needs
+the downloaded SmolLM2-135M weights and 1.5 GiB of free memory. On Host B (0.7 GiB budget)
+that skip is expected: the respawn claim is still tested there with stand-in worker scripts
+and with real stage processes of a small random model, and the real-weights respawn runs on
+Host A. Every other fault test uses stand-in scripts or that small model, so the suite needs
+no downloaded weights. The suite uses only 127.0.0.1.
+
+| Claim | Fault injected | Tests |
+|---|---|---|
+| R6.1 kill, suspend and resume, per-step sleep | kill and suspend of real process trees; a step delay | `test_faults.py`; `test_supervisor.py::test_kill_suspend_and_resume_are_applied_through_the_fault_injector`, `::test_the_control_port_applies_kill_suspend_and_resume` |
+| R6.2 the supervisor respawns, respawn time logged | kill of the worker; a worker that exits or crashes | `test_supervisor.py::test_a_worker_killed_by_the_fault_injector_is_respawned`, `::test_the_respawn_time_is_logged`, `::test_a_crash_loop_backs_off_and_never_gives_up`, `::test_a_killed_worker_comes_back_and_registers_again` |
+| R6.3 detection by stream break, heartbeat timeout, step deadline | kill, suspend, a slow step | `test_detection.py::test_a_killed_stage_is_detected_by_its_stream_break`, `::test_a_suspended_stage_is_detected_by_its_heartbeat_timeout`, `::test_a_slow_step_is_recorded_without_declaring_the_stage_and_the_request_completes`, `::test_a_step_held_by_a_suspended_stage_names_it_then_its_timeout_declares_it`; `test_detection_cross.py` |
+| R6.4 dead epoch, new registration, route update | a stopped or resumed stage | `test_detection.py::test_a_dead_epoch_waits_for_a_new_registration_and_a_route_update`, `::test_a_stage_resumed_with_no_replacement_is_told_and_exits`, `::test_a_resumed_stage_is_replaced_by_its_supervisor_with_no_manual_step`; `test_detection_cross.py` |
+| R6.5 idle requests holding KV are bumped | a stopped stage while one request waits for a credit | `test_replay.py::test_an_idle_request_holding_kv_is_bumped_at_the_declaration_and_both_finish`; `test_replay_cross.py` |
+| R6.6 chunked replay through both stages | a stopped stage; a GAP Nack | `test_replay.py::test_the_replay_resends_the_original_messages_with_the_replay_flag`, `::test_a_gap_nack_replays_the_request`; `test_replay_cross.py` |
+| R6.7 replay verified, output equals a fault-free run | kill of a real stage process (each stage); a forced mismatch | `test_replay.py::test_a_killed_stage_process_is_replaced_and_the_request_finishes_unchanged`, `::test_a_replayed_token_that_differs_from_the_history_is_logged_and_not_sent`; `test_replay_cross.py` |
+| R6.8 late outputs of a resumed stage rejected | suspend past the timeout, resume after the replacement (each stage) | `test_stale_after_suspend.py::test_a_resumed_old_stage_has_every_late_output_rejected` |
+| R6.9 attempts, MAX_DEATHS, growing pause, deadline | repeated stage deaths; a refused replay; no replacement | `test_fail_cleanly.py::test_each_declared_death_raises_every_attempt_by_exactly_one`, `::test_a_request_that_lives_through_max_deaths_fails_with_unavailable`, `::test_a_refused_replay_waits_longer_each_time`; `test_replay.py::test_with_no_replacement_the_request_fails_at_its_deadline`; `test_replay_cross.py` |
+| R6.10 a slow worker fails cleanly at the deadline, bounds hold | a step delay on each stage; a suspended worker | `test_fail_cleanly.py::test_a_worker_slower_than_the_step_timeout_fails_requests_at_their_deadline_within_bounds`; `test_deadlines.py::test_with_a_suspended_worker_every_request_ends_by_its_deadline` |
+| R6.11 a delayed or lost hop | none yet | open: #50, on the hop wrapper of #49 |
+| R6.12 recovery time in four parts | kill of a real stage process (each stage); a stopped stage; suspend and resume | `test_recovery.py`; `test_stale_after_suspend.py` (stale outputs counted) |
+| R6.14 both stages at once | none yet | open: #52 |
+
 ## Failure detection
 
 The gateway watches each stage incarnation by its epoch (`pllm.detection`, read with
@@ -604,11 +679,25 @@ Detection records:
   `since_last_beat_ns`, `rid`, `step`, `detail` (`stage` and `epoch` are the suspect or null
   for a step deadline).
 - `registered`: `stage`, `old_epoch`, `new_epoch`, `t_ns`, `time`, `waited_ns` (from the
-  declaration), `route_queued_ns` (null if the neighbour had no stream).
+  declaration), `route_queued_ns` (null if the neighbour had no stream), `load_ns` (the
+  weight load time the new stage reported, or null).
 
 The two default timeouts are provisional: the beat gaps behind the 2.0 s value were measured
 on one laptop only. A laptop that pauses longer, for example while paging, needs a larger
 `--heartbeat-timeout`. The `run` line of the metrics file records the values in use.
+
+Every gRPC server and every channel between the processes (registration, heartbeat, the
+gateway's stream to Stage 0 and the stream between the stages) sets keepalive
+(`pllm.wire.channel_options`): each end pings after 2 s with no traffic and closes the
+connection when the ack is 8 s late. The client's and the dashboard's channels to the
+gateway do not, so run them on the gateway's laptop. A link that goes silent without a TCP
+reset, such as a Wi-Fi stall or a laptop that left the network, breaks every keepalive
+stream on it within 10 s instead of when the operating system gives up. The
+stage's heartbeat then opens a new stream, and the gateway's stream to Stage 0 and the
+stream between the stages fail instead of hanging. A stall shorter than 8 s breaks
+nothing. The gateway refuses a `--heartbeat-timeout` of 8 s or more: a longer stall would
+break the heartbeat stream first and declare the stage at once, so the tuned timeout would
+never be the one that decides.
 
 Limits:
 
@@ -616,6 +705,44 @@ Limits:
   fine, so a network blip now costs a respawn and a weight reload.
 - A worker suspended and never resumed produces no registration, because its supervisor sees
   a live process. The gateway waits.
+- A worker suspended for more than about 8 s has its connections closed by keepalive, since a
+  stopped process cannot answer a ping. Outputs it held for a closed stream can then be lost
+  rather than delivered late, so a stale-output run (X6) keeps each suspension under 8 s.
+
+## Beat gaps
+
+`pllm.beatgaps` reads a gateway metrics file and prints, for each stage, the gaps between
+consecutive beats of one incarnation on the gateway's clock: count, median, p99 and maximum,
+for the idle part of the run, the loaded part (inside the request window) and both. It then
+prints the heartbeat timeout the run used, the stages the gateway declared dead, a verdict
+(pass when nothing was declared and the longest gap is below the timeout; exit code 0 only
+then) and a suggested timeout: the longest gap times `--margin` (default 1.5), rounded up to
+0.5 s. The suggestion is only a suggestion; the chosen value and its margin are stated with
+the measured numbers. Each call writes a run record.
+
+The measurement on two laptops, with no fault injected: 10 minutes idle, then about 10
+minutes of load.
+
+```
+# macOS (gateway and Stage 1)
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0
+# macOS, after 10 minutes idle; stop it with Ctrl-C after 10 more minutes
+uv run python -m pllm.x2 pipeline smollm2-135m --concurrency 4 --repeats 1 --requests 1000 --metrics runs/<gateway>.metrics.jsonl
+# macOS, after stopping the load, with both launchers still running
+uv run python -m pllm.beatgaps runs/<gateway>.metrics.jsonl
+```
+
+Run the recorder before stopping either launcher. Stopping one ends that stage's heartbeat
+stream, the gateway declares the stage dead, and the recorder counts that declaration, so a
+later call on the same file reports fail. The metrics file is written a line at a time, so
+reading it while the gateway runs is safe; the run record of that call holds the measurement.
+The recorder needs only the completed requests to place the load window, so stopping the
+load early is fine. Then stop both launchers, start the gateway again with the chosen value,
+for example `--heartbeat-timeout 3.0` on the macOS launcher, repeat the run in the same
+order, and check that the verdict is pass. The value must stay below the 8 s keepalive
+timeout.
 
 ## X1a: the split against the single process
 
@@ -683,6 +810,174 @@ and max over the repeats, and a summary, in a `.jsonl` file next to the run reco
 sha256 of every prompt's tokens, so on one host the two modes can be compared. The exit
 code is 0 only with zero ordering violations and no failed request.
 
+## X1b: agreement across the laptops
+
+`pllm.x1b` sends each prompt of an X1a run through the two-laptop pipeline once, one request
+at a time, and compares the tokens with each host's single-process reference (the X1a run
+records). Across hosts the result is agreement, never exact equality.
+
+First run X1a on each laptop with the same length and token count. Host B's record comes from
+issue #17's run; copy its `runs/<utc>-x1a.json` into `runs/` on Host A. Then start the system
+(see "Starting the system": Stage 0 on Host B, the gateway and Stage 1 on Host A) and run, on
+Host A:
+
+```
+uv run python -m pllm.x1b smollm2-135m --metrics runs/<gateway>.metrics.jsonl --reference runs/<host A>-x1a.json runs/<host B>-x1a.json
+```
+
+Each record is checked before any request is sent: an x1a record with status ok, its
+reference checksum recomputed over its settings, the prompt set and its entries, the same
+model, revision, length and token count in every record, and each stored prompt equal to the
+prompt set's. The records must come from two different hosts; `--trial` allows records from
+one host for a trial run, and the run record then has `trial: true`. The length, token count
+and prompts come from the records. `--metrics` is the running gateway's file; it is read to
+refuse a gateway serving another model or revision and for the split point, and the first request waits until both stages beat in it (up to `--wait`
+seconds, default 120), since a request sent earlier is refused. `--rtt-ms` puts a round-trip
+time from `pllm.netcheck` into the run record.
+
+Per prompt and reference:
+
+- `first_divergence`: the first step whose token differs, `null` if none.
+- `agreed_tokens`: the steps before it (all if none), out of `compared_tokens`, the tokens
+  streamed.
+- `max_logit_diff`: the largest difference of the chosen token's logit over the steps up to
+  and including the first divergence. The wire and the X1a record carry only that logit, so
+  this is not the full-vocabulary difference of X1a.
+
+The gateway stops at end of sequence and the reference does not. A stop on the token the
+reference also chose agrees; a stop on another token diverges there. Per reference, the
+summary gives sequence agreement (the percent of prompts whose tokens all agree), token
+agreement (agreed over compared tokens), the smallest and median first divergence, and the
+largest logit difference.
+
+Output: one JSON line per prompt and reference, then one summary per reference, in a `.jsonl`
+file next to the run record in `runs/` (named in the record as `results_file`) and on stdout.
+The record keeps the command (`argv`), each reference's file, host and checksum, and the
+pipeline's tokens and top logits per prompt, so a later comparison needs no rerun. The exit
+code is 0 when every request completed; agreement is reported, not asserted.
+
+## X3: bytes per hop
+
+`pllm.x3` measures the serialized bytes per message on each hop for one prompt length. It
+sends `--count` prompts (default 5) of `--length` tokens (16, 128 or 512) one at a time with
+`--new-tokens` (default 128; decoding stops earlier at end of sequence), then waits for the
+gateway to stop and reads its metrics file.
+
+Stage 0 to Stage 1 never passes the gateway: Stage 0 returns its byte counts when its stream
+ends, and the gateway writes the totals for the whole run when it stops. So one gateway run
+gives one length, and its file must hold this run's requests only. A restarted gateway is not
+rejoined by the stages, so start both laptops again for each length. Run the gateway in its
+own terminal and stop it first, while the stages are up: the launcher stops Stage 1 before the
+gateway when both run under one launcher, which can lose Stage 0's counts.
+
+For each length (16, 128, 512), on a freshly started system:
+
+```
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0
+# macOS terminal 1 (gateway)
+uv run python -m pllm.launch smollm2-135m --roles gateway
+# macOS terminal 2 (Stage 1)
+uv run python -m pllm.launch smollm2-135m --roles stage1
+# macOS terminal 3
+uv run python -m pllm.x3 smollm2-135m --length 16 --metrics runs/<gateway>.metrics.jsonl
+```
+
+X3 sends its first request once both stages beat in the gateway's file, since a request sent
+earlier is refused and its line would fail the run. When X3 prints "stop the gateway now",
+press Ctrl-C in terminal 1. X3 waits up to `--wait` seconds (default 600, also the limit for
+the stages) for the file's `run_end` line, writes its results, and exits. Then stop
+Stage 1 and Stage 0. `--rtt-ms` puts a round-trip time from `pllm.netcheck` into the run record.
+
+Per hop and phase it gives messages, bytes, payload bytes, positions, bytes per position and
+bytes per message, and the overhead per message (bytes minus payload over messages): the mean,
+and for the gateway's two hops, which have one line per message, also the largest. Bytes are
+the protobuf serialized size; gRPC's 5 bytes per message and HTTP/2 framing are not included.
+
+Only Stage 0 to Stage 1 carries activations: the gateway sends token ids to Stage 0 and gets
+one token and its logit per step from Stage 1. So the check is on that hop, per phase:
+
+- payload bytes equal positions x hidden size x 4 B exactly (hidden size from the model's
+  `config.json`, 576 for smollm2-135m);
+- the mean overhead per message is at most 128 B (45 to 49 B measured on loopback with the
+  test model; only the shape and position fields grow with the length, by a few bytes);
+- its positions equal those the gateway sent to Stage 0, so no step was lost or added.
+
+X3 refuses a metrics file that is for another model or already has requests, an end or an
+unreadable line. The run fails, with the reasons in the summary, when the file has no
+`run_end` in time, Stage 0's totals are incomplete, a line is unreadable, a request in the
+file is not this run's, a request failed, or a request decoded fewer than `--new-tokens`
+tokens (it stopped at end of sequence). Output: one JSON line per hop and phase, then a
+summary with the measured overhead, each request's decoded token count and the check, in a `.jsonl` file next to the run record
+in `runs/` (named in the record as `results_file`) and on stdout. The record keeps the
+command (`argv`), the settings, the hidden size and each request's output tokens. The exit
+code is 0 only when the check passes.
+
+## X4: latency against injected hop delay
+
+X4 adds a delay d to every message of the two hops that cross the LAN: gateway to Stage 0
+(held at the gateway's send) and Stage 0 to Stage 1 (held at Stage 1's receive). Both are on
+Host A, so one machine and one clock inject it. The Stage 1 to gateway hop stays on Host A
+and is not delayed. The delay is pipelined: each message is released d after it entered the
+hop, so messages that enter together leave together. It counts as transit: no budget is
+reduced by it, and Stage 1 sets a step's deadline from its release.
+
+Expectation, stated before any result: about 2 x d is added per token (2, 10, 40 and 100 ms
+for d = 1, 5, 20 and 50 ms) at concurrency 1, so the slope of per-token latency (TPOT)
+against d is 2.0 there. At concurrency 4, queueing at small d hides part of the delay, so a
+lower slope is expected; it is reported, not checked. The runner writes this as the first
+line of its output. Throughput is about
+min(c / T, 1 / slowest stage time) with T = compute + base + 2 x d per token, so X4 runs at
+concurrency 1 and 4.
+
+The delay is set while the system runs, so Host B starts once. `--hop-delay-control` makes
+the gateway and Stage 1 read d in ms from `runs/hop_delay_ms` every 0.2 s; each writes the
+value it applied to `runs/hop_delay_ms.gateway` or `runs/hop_delay_ms.stage1`, and the
+gateway writes a `hop_delay` line to its metrics file for each change. Without the flag
+nothing reads the file, and the launcher removes it at start, so it starts at 0 ms.
+
+Two laptops, Host B first:
+
+```
+uv run python -m pllm.launch smollm2-135m --roles stage0
+```
+
+Host A:
+
+```
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1 --hop-delay-control
+uv run python -m pllm.x4 smollm2-135m --metrics runs/<gateway>.metrics.jsonl
+```
+
+On one host, `uv run python -m pllm.launch smollm2-135m --hop-delay-control` and the same
+`pllm.x4` command. The flag needs both the gateway and Stage 1 on the laptop.
+
+Before each cell the runner writes d and waits for both acks, so each cell's delay is
+confirmed. Defaults: delays 0, 1, 5, 20 and 50 ms (`--delays`), concurrency 1 and 4, 5
+repeats, 16 requests per cell, 32 new tokens, prompts of 128 tokens. Delays are interleaved
+inside each repeat in an order rotated per repeat, so slow drift of the network spreads over
+every delay. Each cell is an X2 pipeline cell with its `delay_ms`. Then one aggregate per
+delay and concurrency (throughput, TPOT and TTFT mean and p50, each with n, mean, stdev, min
+and max over the repeats), one fit per concurrency (least-squares slope of the per-cell TPOT
+mean against d with a 95% confidence interval, whether it holds 2.0, and whether that
+concurrency is the checked one) and the X2 summary.
+
+A sleep can wake late, so a message can be held longer than d. The gateway and Stage 1 each
+note every message's real hold on their own clock and append it to
+`runs/hop_delay_ms.gateway.held.jsonl` or `runs/hop_delay_ms.stage1.held.jsonl`. Each cell
+line has, per hop, n, p50, p99 and min of the hold and how many holds were below d (should be
+0), and `achieved_delay_ms`, the mean hold over both hops. A second fit per concurrency, of
+TPOT mean against `achieved_delay_ms`, sits beside the checked one and is never checked. If
+the two slopes differ, late wake-ups account for the difference, not the pipeline.
+The fits state; they assert nothing. The file goes to `runs/` next to the run record. At the
+end the delay is set back to 0.
+
+Timeouts: `--timeout` (per request, default 300 s) must be at least twice the network time of
+one request at the largest delay, and the runner refuses less. The gateway's step timeout
+(default 10 s) is far above the 2 x (d + 4.5) ms plus compute a step needs at d = 50.
+
+Not done here: the optional toxiproxy cross-check.
+
 ## Starting the system
 
 `pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway
@@ -717,6 +1012,11 @@ one host each stage gets half; `--threads` sets it. Ctrl-C stops everything. If 
 exits by itself, the launcher stops the rest and exits with code 1 (a worker that dies is
 not such a case: its supervisor restarts it). Closing the terminal also stops everything on
 macOS. Force killing the launcher leaves its processes running.
+
+`--heartbeat-timeout SECONDS` passes the gateway's heartbeat timeout through, so it is
+accepted only with the gateway role on this laptop. The gateway checks the range (above the
+0.5 s beat interval and below the 8 s keepalive timeout); an out-of-range value makes it
+exit, and the launcher then stops the rest. See [Beat gaps](#beat-gaps) for how to choose it.
 
 Before every run, close other programs and use the same power state. The launcher logs the
 available memory and power state at the start, warns on battery, and writes a run record.
