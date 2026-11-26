@@ -397,6 +397,7 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 | `detected` | Each failure detection | as in [Failure detection](#failure-detection) |
 | `registered` | Each stage registration | as in [Failure detection](#failure-detection) |
 | `divergence` | A replayed token differs from the one sent | `t_ns`, `rid`, `attempt`, `step`, `token`, `history_token` |
+| `discard` | Each result or Nack the gateway drops; the `run` line then has `discard_lines` true | `t_ns`, `reason`, `source` (`result` or `nack`), `stage` and `epoch` of the sender, `nack_reason`, `rid`, `attempt`, `step` |
 | `run_end` | Run end | `t_ns`, `links`, `links_unreported`, `stage0_stage1_complete`, `write_errors` |
 
 - Hops are `gateway_stage0`, `stage0_stage1` and `stage1_gateway`. `phase` is `replay` for a
@@ -423,7 +424,7 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
   check has the round-trip time.
 - `accepted` is the verdict when a result arrives. A result accepted then can still be
   dropped when its request takes it from the queue, for example after a new Stage 1
-  registers. Such a drop is counted in `Gateway.discards`, not in this file.
+  registers. Such a drop is counted in `Gateway.discards` and has a `discard` line.
 - A message queued just as its stream ended is counted although it was not sent. A file
   with no `run_end` is from a run that did not stop cleanly. Send SIGINT, or CTRL_BREAK on
   Windows, not a forced kill.
