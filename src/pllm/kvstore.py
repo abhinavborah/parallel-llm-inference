@@ -64,11 +64,14 @@ class Stale(Exception):
         super().__init__(f"request {rid!r} attempt {attempt} {what} {newer}")
 
 
+def bytes_per_position(config: ModelConfig, num_layers: int) -> int:
+    """KV bytes one position holds on a stage of num_layers layers (fp32 keys and values)."""
+    return num_layers * 2 * config.num_kv_heads * config.head_dim * FLOAT_BYTES
+
+
 class KVStore:
     def __init__(self, config: ModelConfig, num_layers: int, new_cache: Callable[[], KVCache]):
-        self.bytes_per_position = (
-            num_layers * 2 * config.num_kv_heads * config.head_dim * FLOAT_BYTES
-        )
+        self.bytes_per_position = bytes_per_position(config, num_layers)
         self._new_cache = new_cache
         self._caches: dict[str, KVCache] = {}
         self._freed: OrderedDict[str, int] = OrderedDict()  # rid to the attempt freed
