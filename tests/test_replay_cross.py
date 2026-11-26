@@ -115,10 +115,25 @@ def full_replay(history):
 
 
 def kill(run, stage):
-    """Stop a stage, and wait until the gateway has declared its epoch dead."""
+    """Stop a stage, and wait until the gateway has declared its epoch dead and handled the
+    record. The detector marks the epoch dead under its lock and calls the gateway's sink only
+    after releasing it, so is_dead alone can be true while the attempts are not yet bumped."""
     old = run.registry.stages[stage].epoch
-    stop_stage(run, stage)
-    wait_for(lambda: run.gateway.detector.is_dead(old), "the dead epoch to be declared")
+    detector = run.gateway.detector
+    real = detector._sink
+    handled = threading.Event()
+
+    def after_sink(record):
+        real(record)
+        if record["event"] == "detected" and record["declared"] and record["epoch"] == old:
+            handled.set()
+
+    detector._sink = after_sink
+    try:
+        stop_stage(run, stage)
+        wait_for(handled.is_set, "the dead epoch to be declared and handled by the gateway")
+    finally:
+        detector._sink = real
     return old
 
 
