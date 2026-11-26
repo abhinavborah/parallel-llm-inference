@@ -154,7 +154,9 @@ def test_the_delay_counts_as_transit_and_leaves_budgets_alone(system):
         assert released == pytest.approx(entered[key] + 0.05, abs=1e-6)  # not the arrival
         assert handled >= released
     for (b0, *_), (b1, *_) in zip(at0, at1, strict=True):
-        assert b0 - 50 < b1 <= b0  # Stage 1's 50 ms is not taken off either
+        # Stage 1's 50 ms is not taken off either. The budget sent on is the time left
+        # rounded up, so with no clock tick between (Windows) it can read 1 ms more.
+        assert b0 - 50 < b1 <= b0 + 1
 
 
 def test_tokens_and_order_are_unchanged_by_a_delay(system):
