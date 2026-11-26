@@ -624,14 +624,19 @@ uv run python -m pllm.launch smollm2-135m --roles gateway stage1
 uv run python -m pllm.launch smollm2-135m --roles stage0
 # macOS, after 10 minutes idle; stop it with Ctrl-C after 10 more minutes
 uv run python -m pllm.x2 pipeline smollm2-135m --concurrency 4 --repeats 1 --requests 1000 --metrics runs/<gateway>.metrics.jsonl
-# macOS, after stopping both launchers
+# macOS, after stopping the load, with both launchers still running
 uv run python -m pllm.beatgaps runs/<gateway>.metrics.jsonl
 ```
 
+Run the recorder before stopping either launcher. Stopping one ends that stage's heartbeat
+stream, the gateway declares the stage dead, and the recorder counts that declaration, so a
+later call on the same file reports fail. The metrics file is written a line at a time, so
+reading it while the gateway runs is safe; the run record of that call holds the measurement.
 The recorder needs only the completed requests to place the load window, so stopping the
-load early is fine. Then start the gateway again with the chosen value, for example
-`--heartbeat-timeout 3.0` on the macOS launcher, repeat the run, and check that the verdict
-is pass. The value must stay below the 8 s keepalive timeout.
+load early is fine. Then stop both launchers, start the gateway again with the chosen value,
+for example `--heartbeat-timeout 3.0` on the macOS launcher, repeat the run in the same
+order, and check that the verdict is pass. The value must stay below the 8 s keepalive
+timeout.
 
 ## X1a: the split against the single process
 
