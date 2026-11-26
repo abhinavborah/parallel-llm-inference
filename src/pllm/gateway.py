@@ -141,6 +141,9 @@ and counted by reason in discards:
 - stale_nack: a Nack that names no step a running request waits on (the request ended, or
   another attempt or step), counted when it arrives or when a queued one is taken.
 
+Each drop also writes one discard line to the metrics file, with its reason and what was
+dropped, so a run can be judged from the file alone (pllm.x5, pllm.x6).
+
 Only an accepted result moves the request on and reaches the client, so each (request,
 step) is streamed once and in order. A result is checked when it arrives and again when the
 request takes it, since a result can be queued just before the step it was for completes or
@@ -592,6 +595,8 @@ class Gateway(
             )
             if not running:  # a request that ended, another attempt or another step
                 self._discard("stale_nack")
+        if not running:
+            self._discard_line("stale_nack", message.nack)
         log.warning(
             "stage %d nacked %s attempt %d step %d: %s", n.stage, n.rid, n.attempt, n.step, n.reason
         )
@@ -800,6 +805,25 @@ class Gateway(
         self.dropped += 1
         self.discards[reason] += 1
 
+    def _discard_line(self, reason: str, message) -> None:
+        """Write one drop to the metrics file. Call without the lock held. epoch and stage
+        name the sender: of a result, the last stage; of a Nack, the stage that refused."""
+        nack = isinstance(message, protocol_pb2.Nack)
+        self.recorder.event(
+            {
+                "event": "discard",
+                "t_ns": self.recorder.now(),
+                "reason": reason,
+                "source": "nack" if nack else "result",
+                "stage": message.stage if nack else STAGES[-1],
+                "epoch": message.epoch,
+                "nack_reason": message.reason if nack else None,
+                "rid": message.rid,
+                "attempt": message.attempt,
+                "step": message.step,
+            }
+        )
+
     def Push(self, request_iterator, context):
         for result in request_iterator:
             with self._lock:
@@ -811,6 +835,7 @@ class Gateway(
             if reason is None:
                 request.results.put(result)
             else:
+                self._discard_line(reason, result)
                 log.warning(
                     "dropped result %s attempt %d step %d epoch %d: %s",
                     result.rid,
@@ -1286,6 +1311,7 @@ class Gateway(
                         return result
                 with self._lock:
                     self._discard(reason)
+                self._discard_line(reason, result)
             why = link.failure()
             if why is not None:
                 if request.recovering or self._declared_soon(request, attempt, context):
@@ -1567,6 +1593,7 @@ def main(argv: list[str] | None = None) -> None:
                 "kv_budget_bytes": kv_budget,
                 "kv_bytes_per_position": kv_per_position,
                 "hop_delay_control": args.hop_delay_control,
+                "discard_lines": True,  # each dropped result or Nack has a line
                 "argv": sys.argv,
             },
         )
