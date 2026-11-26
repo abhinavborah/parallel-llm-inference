@@ -47,11 +47,13 @@ def commands(
     dashboard: bool = False,
     hop_delay_control: bool = False,
     heartbeat_timeout: float | None = None,
+    no_kv_admission: bool = False,
 ) -> dict[str, list[str]]:
     """The command of each role in start order: the stages register with the gateway. With
     dashboard, the gateway also serves the live page. With hop_delay_control, the gateway
     and Stage 1 take the X4 hop delay from runs/hop_delay_ms (pllm.x4). heartbeat_timeout
-    goes to the gateway, which checks its range."""
+    goes to the gateway, which checks its range. no_kv_admission turns the gateway's Host B
+    KV admission off (R5.3)."""
     wanted = set(roles)
     out = {}
     for role in config.ROLES:
@@ -65,6 +67,8 @@ def commands(
                 out[role].append("--hop-delay-control")
             if heartbeat_timeout is not None:
                 out[role] += ["--heartbeat-timeout", str(heartbeat_timeout)]
+            if no_kv_admission:
+                out[role].append("--no-kv-admission")
         else:
             stage = role.removeprefix("stage")
             out[role] = [
@@ -167,6 +171,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         metavar="SECONDS",
         help="passed to the gateway: no Beat for this long declares a stage dead",
     )
+    parser.add_argument(
+        "--no-kv-admission",
+        action="store_true",
+        help="passed to the gateway: admit requests without checking Host B's KV budget",
+    )
     args = parser.parse_args(argv)
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
@@ -176,6 +185,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--dashboard needs the gateway role on this laptop")
     if args.heartbeat_timeout is not None and "gateway" not in args.roles:
         parser.error("--heartbeat-timeout needs the gateway role on this laptop")
+    if args.no_kv_admission and "gateway" not in args.roles:
+        parser.error("--no-kv-admission needs the gateway role on this laptop")
     if args.heartbeat_timeout is not None and not 0 < args.heartbeat_timeout < float("inf"):
         parser.error("--heartbeat-timeout must be a positive number of seconds")
     try:
@@ -234,6 +245,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.dashboard,
             hop_delay_control=args.hop_delay_control,
             heartbeat_timeout=args.heartbeat_timeout,
+            no_kv_admission=args.no_kv_admission,
         )
         code = run(to_start, done)
         if code:

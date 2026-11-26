@@ -94,10 +94,11 @@ within the heartbeat timeout, when it replays. A request whose prompt and max_to
 the model's context length is refused at admission, so no valid request grows a cache past
 the model's context. That bounds each request, not Host B's memory: with an even split, one
 request at the cap holds about 180 MiB of Stage 0 cache for SmolLM2 (8192 positions) but
-about 4.4 GiB for Qwen3-0.6B (40960 positions), more than Host B has. Admission by Host B's
-KV budget (R5.3) is #34. Equality under concurrency rests on each stage handling its stream
-one step at a time: requests never share a model call within a stage. One long prefill at a
-stage delays every other request's next step there (head-of-line blocking). Each Generate
+about 4.4 GiB for Qwen3-0.6B (40960 positions), more than Host B has; admission by Host B's
+KV budget (R5.3, below) bounds the sum. Equality under concurrency rests on each stage
+handling its stream one step at a time: requests never share a model call within a stage.
+One long prefill at a stage delays every other request's next step there (head-of-line
+blocking). Each Generate
 holds a server thread for its life, so serve() caps running requests at max_workers -
 RESERVED_THREADS; without the cap, a full pool leaves no thread for Results.Push and every
 running request stalls until its deadline.
@@ -117,6 +118,15 @@ when its deadline passes fails with DEADLINE_EXCEEDED. queue_peak and in_flight_
 the deepest the queue has been and the most steps in flight at once. A step whose request
 failed at its deadline can still be at a stage after its credit came back; the stage's
 bounded inbox (pllm.stage_service) is the hard bound there.
+
+KV admission (R5.3). Stage 0 runs on Host B, whose worker budget is 0.7 GiB of peak RSS.
+main sets kv_budget to that budget less the runtime, a margin and the Stage 0 weights, and
+kv_per_position to Stage 0's KV bytes per position. Before a request may queue, it reserves
+(prompt tokens + max_tokens) x kv_per_position; if the reservations already held leave less
+than that, it is refused at once with RESOURCE_EXHAUSTED, counted in kv_rejected as well as
+in the "rejected" outcome. Queued requests hold their reservation too. The reservation is
+given back when the request ends, however it ends. kv_budget None leaves it unchecked:
+main refuses to start when nothing is left for KV cache unless --no-kv-admission says so.
 
 Result filter and exactly-once delivery (R4.7, R4.8): a result is accepted only when its
 request is running and its attempt, its step and its epoch all match the request's attempt,
@@ -160,9 +170,11 @@ from pllm import config, faults, metrics, prompts, runrecord, wire
 from pllm.control import Registration, Registry, expected_model, load_ns_of
 from pllm.detection import HEARTBEAT_TIMEOUT_SECONDS, STEP_TIMEOUT_SECONDS, Detector
 from pllm.heartbeat import HEARTBEAT_SECONDS
+from pllm.kvstore import bytes_per_position
 from pllm.model import ModelConfig
 from pllm.models import MODELS_DIR, PINNED
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
+from pllm.split import stage_weight_bytes
 from pllm.stage_service import _DONE, _drain, budget_ms
 
 log = logging.getLogger("pllm.gateway")
@@ -348,6 +360,10 @@ class Gateway(
         self._in_flight = 0  # steps sent whose result has not come
         self.in_flight_peak = 0
         self._credit_waiting: collections.deque = collections.deque()  # one Event per waiter
+        self.kv_budget: int | None = None  # Stage 0 KV bytes admitted at once; main sets it
+        self.kv_per_position = 0  # Stage 0 KV bytes per position; main sets it
+        self._kv_reserved = 0  # bytes reserved by requests running or queued
+        self.kv_rejected = 0  # requests refused because their KV did not fit
         self._lock = threading.Lock()
         # Register and opening a heartbeat stream run one at a time, so a stream cannot
         # pass its epoch check just before a newer registration and then become current.
@@ -517,6 +533,9 @@ class Gateway(
                 "max_queued": self.max_queued,
                 "in_flight": self._in_flight,
                 "credits": self.credits,
+                "kv_budget": self.kv_budget,
+                "kv_reserved": self._kv_reserved,
+                "kv_rejected": self.kv_rejected,
                 "tokens_out": self.tokens_out,
                 "outcomes": dict(self.outcomes),
                 "discards": dict(self.discards),
@@ -816,22 +835,57 @@ class Gateway(
     def Generate(self, req, context):
         arrived = self.recorder.now()
         ids = None
+        reserved = 0  # set only once _reserve returns, so a refusal gives back nothing
         try:
             ids = self._admit(req, context)
+            reserved = self._reserve(len(ids) + req.max_tokens, context)
             deadline = time.monotonic() + req.timeout_ms / 1000  # time in the queue counts
             entered = self._enter(deadline, context)
         except Exception:
+            self._release(reserved)
             self._rejected(req, context, arrived, len(ids) if ids else None)
             raise
         if not entered:  # the client went away while the request was queued
+            self._release(reserved)
             self._rejected(req, context, arrived, len(ids), "cancelled by the client")
             return
         try:
             yield from self._generate(req, ids, deadline, context, arrived)
         finally:
             self._leave()
+            self._release(reserved)
 
     # ------------------------------------------------------------------ flow control
+
+    def _reserve(self, positions: int, context) -> int:
+        """Reserve Stage 0 KV bytes for positions (R5.3), or refuse at once with
+        RESOURCE_EXHAUSTED when the reservations held leave too little. Returns the bytes."""
+        if self.kv_budget is None:
+            return 0
+        need = positions * self.kv_per_position
+        with self._lock:
+            fits = self._kv_reserved + need <= self.kv_budget
+            if fits:
+                self._kv_reserved += need
+            else:
+                self.kv_rejected += 1
+                held = self._kv_reserved
+        if not fits:
+            if need > self.kv_budget:
+                why = "more than the whole budget, so it can never be admitted"
+            else:
+                why = f"{held} are reserved; try again later"
+            context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                f"the request needs {need} bytes of KV cache on Stage 0 of a "
+                f"{self.kv_budget} byte budget; {why}",
+            )
+        return need
+
+    def _release(self, nbytes: int) -> None:
+        """Give back a reservation made by _reserve (0 gives back nothing)."""
+        with self._lock:
+            self._kv_reserved -= nbytes
 
     def _enter(self, deadline: float, context) -> bool:
         """Take a running slot, waiting in the admission queue if every slot is taken
@@ -1361,6 +1415,25 @@ def seconds_above(low: float):
     return parse
 
 
+def kv_budget_of(host_b: config.HostBBudget, stage0_weights: int, k: int, off: bool) -> int | None:
+    """The Stage 0 KV bytes the gateway admits by (R5.3): Host B's worker budget less its
+    runtime, the margin and the weights of layers 0 to k - 1. None when off. Raises
+    ValueError when nothing is left, so a run that cannot bound Host B says so explicitly."""
+    if off:
+        return None
+    left = host_b.worker_bytes - host_b.runtime_bytes - host_b.margin_bytes - stage0_weights
+    if left <= 0:
+        mib = 2**20
+        raise ValueError(
+            f"the {host_b.worker_bytes / mib:.1f} MiB Host B budget less the "
+            f"{host_b.runtime_bytes / mib:.1f} MiB runtime, the {host_b.margin_bytes / mib:.1f} "
+            f"MiB margin and {stage0_weights / mib:.1f} MiB of Stage 0 weights (layers 0 to "
+            f"{k - 1}) leaves no room for KV cache, so no request could be admitted (R5.3); "
+            "--no-kv-admission runs without the check"
+        )
+    return left
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the gateway for one model.")
     parser.add_argument("model", choices=sorted(PINNED))
@@ -1390,6 +1463,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="delay each step sent to Stage 0 by the ms in runs/hop_delay_ms (X4, pllm.x4)",
     )
+    parser.add_argument(
+        "--no-kv-admission",
+        action="store_true",
+        help="admit requests without checking Host B's KV budget (R5.3 off)",
+    )
     args = parser.parse_args(argv)
     if args.heartbeat_timeout >= wire.KEEPALIVE_TIMEOUT_SECONDS:
         # a longer stall would break the stream by keepalive first and declare at once
@@ -1401,9 +1479,15 @@ def main(argv: list[str] | None = None) -> None:
     try:
         hosts = config.load()
         expected = expected_model(args.model, args.split_point)
-        hidden = ModelConfig.from_file(model_dir / "config.json").hidden_size
+        model_config = ModelConfig.from_file(model_dir / "config.json")
+        hidden = model_config.hidden_size
         tokenizer = Tokenizer(args.model)
         limits = config.flow_limits()
+        k = expected.split_point
+        kv_budget = kv_budget_of(
+            config.host_b_budget(), stage_weight_bytes(model_dir, 0, k), k, args.no_kv_admission
+        )
+        kv_per_position = bytes_per_position(model_config, k)
         started = {"started": datetime.now(UTC).isoformat(), "script": "gateway"}
         path = args.metrics or runrecord.output_path(started, ".metrics.jsonl")
         recorder = metrics.Recorder(
@@ -1417,6 +1501,8 @@ def main(argv: list[str] | None = None) -> None:
                 **runrecord.machine(),
                 "heartbeat_timeout_s": args.heartbeat_timeout,
                 "step_timeout_s": args.step_timeout,
+                "kv_budget_bytes": kv_budget,
+                "kv_bytes_per_position": kv_per_position,
                 "hop_delay_control": args.hop_delay_control,
                 "argv": sys.argv,
             },
@@ -1437,6 +1523,16 @@ def main(argv: list[str] | None = None) -> None:
         step_timeout=args.step_timeout,
     )
     gateway.recorder = recorder
+    if kv_budget is None:
+        log.warning("KV admission is off (--no-kv-admission): Host B's memory is not bounded")
+    else:
+        gateway.kv_budget, gateway.kv_per_position = kv_budget, kv_per_position
+        log.info(
+            "KV admission: budget %.1f MiB, %d bytes per position, %d positions",
+            kv_budget / 2**20,
+            kv_per_position,
+            kv_budget // kv_per_position,
+        )
     if args.hop_delay_control:
 
         def apply(hold: faults.HopDelay) -> None:
