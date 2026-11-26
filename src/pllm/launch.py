@@ -18,7 +18,7 @@ from collections.abc import Iterable, Sequence
 
 import psutil
 
-from pllm import config, faults, runrecord
+from pllm import config, faults, netcheck, runrecord
 from pllm.models import MODELS_DIR, PINNED
 
 log = logging.getLogger("pllm.launch")
@@ -190,9 +190,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if power is not None and not power["plugged_in"]:
             log.warning("on battery: use the same power state for every run")
-        code = run(commands(args.model, args.roles, threads, args.dashboard), done)
+        # Preset, so the record's keys do not change while the probe thread fills them.
+        rec["probe"] = None
+        other = {r: getattr(hosts, r) for r in config.ROLES if r not in args.roles}
+        prober = threading.Thread(target=_probe_other_laptop, args=(rec, other, done))
+        if other:
+            prober.start()
+        try:
+            code = run(commands(args.model, args.roles, threads, args.dashboard), done)
+        finally:
+            done.set()
+            if other:
+                prober.join()
         if code:
             raise SystemExit(code)
+
+
+def _probe_other_laptop(rec: dict, endpoints: dict, done: threading.Event) -> None:
+    """Record a short round trip to the other laptop's ports once they answer."""
+    result = netcheck.short_probe(endpoints, done)
+    for role, r in result["roles"].items():
+        if "error" in r:
+            log.warning("no round trip to %s at %s: %s", role, r["address"], r["error"])
+        else:
+            log.info("round trip to %s at %s: median %.2f ms", role, r["address"], r["median_ms"])
+    rec["probe"], rec["rtt_ms"] = result, result["rtt_ms"]
 
 
 if __name__ == "__main__":

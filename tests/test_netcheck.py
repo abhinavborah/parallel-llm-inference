@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from pllm import netcheck, runrecord
+from pllm import config, netcheck, runrecord
 
 
 def test_summary_uses_nearest_rank_for_p95():
@@ -294,3 +294,53 @@ _real_probe = netcheck.probe
 
 def _probe_with_short_timeout(host, port, count):
     return _real_probe(host, port, count, timeout=2)
+
+
+def _endpoint(port):
+    return config.Endpoint("127.0.0.1", port)
+
+
+def test_the_short_probe_times_each_connect(echo_server):
+    result = netcheck.short_probe({"stage0": _endpoint(echo_server)}, threading.Event(), count=4)
+    assert result["roles"]["stage0"]["count"] == 4
+    assert result["roles"]["stage0"]["address"] == f"127.0.0.1:{echo_server}"
+    assert result["rtt_ms"] > 0
+
+
+def test_the_short_probe_waits_for_a_port_that_comes_up_late():
+    late = socket.socket()
+    late.bind(("127.0.0.1", 0))  # bound but not listening, so connecting is refused
+    timer = threading.Timer(0.5, late.listen)
+    timer.start()
+    try:
+        result = netcheck.short_probe(
+            {"stage0": _endpoint(late.getsockname()[1])}, threading.Event(), count=3, poll=0.1
+        )
+    finally:
+        timer.cancel()
+        late.close()
+    assert result["roles"]["stage0"]["count"] == 3
+    assert result["rtt_ms"] is not None
+
+
+def test_a_stop_ends_the_short_probe_with_the_error_recorded(echo_server):
+    with socket.socket() as closed:
+        closed.bind(("127.0.0.1", 0))
+        endpoints = {
+            "stage0": _endpoint(closed.getsockname()[1]),
+            "gateway": _endpoint(echo_server),
+        }
+        stop = threading.Event()
+        results = []
+        thread = threading.Thread(
+            target=lambda: results.append(netcheck.short_probe(endpoints, stop, poll=0.1))
+        )
+        thread.start()
+        time.sleep(0.3)
+        stop.set()
+        thread.join(timeout=10)  # no tighter bound: a refused connect on Windows can take 2 s
+    assert not thread.is_alive()
+    (result,) = results
+    assert "error" in result["roles"]["stage0"]
+    # The round trip comes from the role that answered only.
+    assert result["rtt_ms"] == result["roles"]["gateway"]["median_ms"]

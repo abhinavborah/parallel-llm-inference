@@ -692,6 +692,8 @@ macOS. Force killing the launcher leaves its processes running.
 
 Before every run, close other programs and use the same power state. The launcher logs the
 available memory and power state at the start, warns on battery, and writes a run record.
+For a two-laptop run it also logs a short round trip to each of the other laptop's roles once
+their ports answer (see "Run records").
 
 ### Windows setup
 
@@ -773,6 +775,11 @@ $env:PLLM_CONFIG = "config/hosts.local.toml"
 Every script writes a JSON record to `runs/` (ignored by git) with the commit, model and
 revision, split point, thread count, host, OS, network, round-trip time, available memory,
 power state and dates.
+
+In the launch record, `rtt_ms` is the median of every timed TCP connect to the other
+laptop's roles, five per role once its port answers, and `probe` holds the figures per role. It is a
+connect time, not the echo round trip of `pllm.netcheck probe`. It is null in single-host
+mode, and a role that never answered before the run stopped is recorded with its error.
 
 ## Host checks
 

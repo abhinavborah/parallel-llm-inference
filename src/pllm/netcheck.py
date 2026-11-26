@@ -118,6 +118,39 @@ def probe(host: str, port: int, count: int, timeout: float = 5.0) -> dict:
     return {"connect_ms": connect_ms, "count": count, **summary(rtts)}
 
 
+def short_probe(
+    endpoints: dict[str, config.Endpoint],
+    stop: threading.Event,
+    count: int = 5,
+    timeout: float = 1.0,
+    poll: float = 1.0,
+) -> dict:
+    """Time `count` TCP connects to each endpoint, a round trip each (SYN and SYN-ACK).
+
+    For the other laptop's ports, which run gRPC rather than the echo server. A port that
+    does not answer yet is tried again every `poll` seconds until it does or `stop` is set.
+    rtt_ms is the median of every timed connect, or None if no port answered.
+    """
+    roles, timed = {}, []
+    for role, endpoint in endpoints.items():
+        while True:
+            try:
+                connects = []
+                for _ in range(count):
+                    start = time.perf_counter()
+                    socket.create_connection((endpoint.host, endpoint.port), timeout).close()
+                    connects.append((time.perf_counter() - start) * 1000)
+            except OSError as err:  # refused or timed out: not up yet, or not reachable
+                if stop.wait(poll):
+                    roles[role] = {"address": endpoint.address, "error": str(err)}
+                    break
+                continue
+            roles[role] = {"address": endpoint.address, "count": count, **summary(connects)}
+            timed += connects
+            break
+    return {"roles": roles, "rtt_ms": statistics.median(timed) if timed else None}
+
+
 def multicast_sender(interface: str = "0.0.0.0") -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
