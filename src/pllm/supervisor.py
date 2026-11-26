@@ -361,13 +361,19 @@ def serve_control(supervisor: Supervisor, bind: tuple[str, int]) -> ThreadingHTT
 
 
 def worker_command(
-    model: str, stage: int, threads: int | None, hop_delay_control: bool = False
+    model: str,
+    stage: int,
+    threads: int | None,
+    hop_delay_control: bool = False,
+    split_point: int | None = None,
 ) -> list[str]:
     command = [sys.executable, "-m", "pllm.worker", model, "--stage", str(stage), "--serve"]
     if threads is not None:
         command += ["--threads", str(threads)]
     if hop_delay_control:
         command.append("--hop-delay-control")
+    if split_point is not None:
+        command += ["--split-point", str(split_point)]
     return command
 
 
@@ -376,6 +382,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("model", choices=sorted(PINNED))
     parser.add_argument("--stage", type=int, choices=(0, 1), required=True)
     parser.add_argument("--threads", type=int, help="torch threads for the worker")
+    parser.add_argument("--split-point", type=int, help="passed to the worker (split sweeps)")
     parser.add_argument("--log", help="JSON-lines event log (default runs/supervisor_stageN.jsonl)")
     parser.add_argument(
         "--hop-delay-control", action="store_true", help="Stage 1 only: passed to the worker"
@@ -393,7 +400,9 @@ def main(argv: list[str] | None = None) -> None:
     stage_port = getattr(hosts, f"stage{args.stage}").port
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     supervisor = Supervisor(
-        worker_command(args.model, args.stage, args.threads, args.hop_delay_control),
+        worker_command(
+            args.model, args.stage, args.threads, args.hop_delay_control, args.split_point
+        ),
         ready_address=("127.0.0.1", stage_port),
         log_path=args.log or config.REPO_ROOT / "runs" / f"supervisor_stage{args.stage}.jsonl",
         cwd=config.REPO_ROOT,
