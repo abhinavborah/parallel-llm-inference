@@ -120,12 +120,13 @@ failed at its deadline can still be at a stage after its credit came back; the s
 bounded inbox (pllm.stage_service) is the hard bound there.
 
 KV admission (R5.3). Stage 0 runs on Host B, whose worker budget is 0.7 GiB of peak RSS.
-main sets kv_budget to that budget less the runtime and the Stage 0 weights, and
+main sets kv_budget to that budget less the runtime, a margin and the Stage 0 weights, and
 kv_per_position to Stage 0's KV bytes per position. Before a request may queue, it reserves
 (prompt tokens + max_tokens) x kv_per_position; if the reservations already held leave less
 than that, it is refused at once with RESOURCE_EXHAUSTED, counted in kv_rejected as well as
 in the "rejected" outcome. Queued requests hold their reservation too. The reservation is
-given back when the request ends, however it ends. kv_budget None leaves it unchecked.
+given back when the request ends, however it ends. kv_budget None leaves it unchecked:
+main refuses to start when nothing is left for KV cache unless --no-kv-admission says so.
 
 Result filter and exactly-once delivery (R4.7, R4.8): a result is accepted only when its
 request is running and its attempt, its step and its epoch all match the request's attempt,
@@ -870,10 +871,14 @@ class Gateway(
                 self.kv_rejected += 1
                 held = self._kv_reserved
         if not fits:
+            if need > self.kv_budget:
+                why = "more than the whole budget, so it can never be admitted"
+            else:
+                why = f"{held} are reserved; try again later"
             context.abort(
                 grpc.StatusCode.RESOURCE_EXHAUSTED,
-                f"the request needs {need} bytes of KV cache on Stage 0; {held} of the "
-                f"{self.kv_budget} byte budget are reserved; try again later",
+                f"the request needs {need} bytes of KV cache on Stage 0 of a "
+                f"{self.kv_budget} byte budget; {why}",
             )
         return need
 
@@ -1410,6 +1415,25 @@ def seconds_above(low: float):
     return parse
 
 
+def kv_budget_of(host_b: config.HostBBudget, stage0_weights: int, k: int, off: bool) -> int | None:
+    """The Stage 0 KV bytes the gateway admits by (R5.3): Host B's worker budget less its
+    runtime, the margin and the weights of layers 0 to k - 1. None when off. Raises
+    ValueError when nothing is left, so a run that cannot bound Host B says so explicitly."""
+    if off:
+        return None
+    left = host_b.worker_bytes - host_b.runtime_bytes - host_b.margin_bytes - stage0_weights
+    if left <= 0:
+        mib = 2**20
+        raise ValueError(
+            f"the {host_b.worker_bytes / mib:.1f} MiB Host B budget less the "
+            f"{host_b.runtime_bytes / mib:.1f} MiB runtime, the {host_b.margin_bytes / mib:.1f} "
+            f"MiB margin and {stage0_weights / mib:.1f} MiB of Stage 0 weights (layers 0 to "
+            f"{k - 1}) leaves no room for KV cache, so no request could be admitted (R5.3); "
+            "--no-kv-admission runs without the check"
+        )
+    return left
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the gateway for one model.")
     parser.add_argument("model", choices=sorted(PINNED))
@@ -1439,6 +1463,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="delay each step sent to Stage 0 by the ms in runs/hop_delay_ms (X4, pllm.x4)",
     )
+    parser.add_argument(
+        "--no-kv-admission",
+        action="store_true",
+        help="admit requests without checking Host B's KV budget (R5.3 off)",
+    )
     args = parser.parse_args(argv)
     if args.heartbeat_timeout >= wire.KEEPALIVE_TIMEOUT_SECONDS:
         # a longer stall would break the stream by keepalive first and declare at once
@@ -1454,11 +1483,10 @@ def main(argv: list[str] | None = None) -> None:
         hidden = model_config.hidden_size
         tokenizer = Tokenizer(args.model)
         limits = config.flow_limits()
-        # R5.3: Host B's budget less its runtime and the Stage 0 layers this run splits at
-        host_b = config.host_b_budget()
         k = expected.split_point
-        stage0_weights = stage_weight_bytes(model_dir, 0, k)
-        kv_budget = host_b.worker_bytes - host_b.runtime_bytes - stage0_weights
+        kv_budget = kv_budget_of(
+            config.host_b_budget(), stage_weight_bytes(model_dir, 0, k), k, args.no_kv_admission
+        )
         kv_per_position = bytes_per_position(model_config, k)
         started = {"started": datetime.now(UTC).isoformat(), "script": "gateway"}
         path = args.metrics or runrecord.output_path(started, ".metrics.jsonl")
@@ -1473,7 +1501,7 @@ def main(argv: list[str] | None = None) -> None:
                 **runrecord.machine(),
                 "heartbeat_timeout_s": args.heartbeat_timeout,
                 "step_timeout_s": args.step_timeout,
-                "kv_budget_bytes": kv_budget if kv_budget > 0 else None,
+                "kv_budget_bytes": kv_budget,
                 "kv_bytes_per_position": kv_per_position,
                 "hop_delay_control": args.hop_delay_control,
                 "argv": sys.argv,
@@ -1495,23 +1523,15 @@ def main(argv: list[str] | None = None) -> None:
         step_timeout=args.step_timeout,
     )
     gateway.recorder = recorder
-    mib = 2**20
-    if kv_budget > 0:
+    if kv_budget is None:
+        log.warning("KV admission is off (--no-kv-admission): Host B's memory is not bounded")
+    else:
         gateway.kv_budget, gateway.kv_per_position = kv_budget, kv_per_position
         log.info(
             "KV admission: budget %.1f MiB, %d bytes per position, %d positions",
-            kv_budget / mib,
+            kv_budget / 2**20,
             kv_per_position,
             kv_budget // kv_per_position,
-        )
-    else:
-        log.warning(
-            "KV admission is off: the %.1f MiB Host B budget less the %.1f MiB runtime and "
-            "%.1f MiB of Stage 0 weights (layers 0 to %d) leaves no room for KV cache",
-            host_b.worker_bytes / mib,
-            host_b.runtime_bytes / mib,
-            stage0_weights / mib,
-            k - 1,
         )
     if args.hop_delay_control:
 

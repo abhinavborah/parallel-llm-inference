@@ -263,3 +263,15 @@ def test_main_passes_the_heartbeat_timeout_to_the_gateway(tmp_path, monkeypatch)
     launch.main(["smollm2-135m", "--roles", "gateway", "stage1", "--heartbeat-timeout", "4"])
     assert started["gateway"][-2:] == ["--heartbeat-timeout", "4.0"]
     assert "--heartbeat-timeout" not in started["stage1"]
+
+
+def test_no_kv_admission_goes_to_the_gateway_only():
+    plain = launch.commands("smollm2-135m", ["gateway", "stage0"], 3)
+    off = launch.commands("smollm2-135m", ["gateway", "stage0"], 3, no_kv_admission=True)
+    assert off["gateway"] == [*plain["gateway"], "--no-kv-admission"]
+    assert off["stage0"] == plain["stage0"]
+
+
+def test_main_refuses_no_kv_admission_without_the_gateway(capsys):
+    assert run_main(["smollm2-135m", "--roles", "stage0", "--no-kv-admission"]) == 2
+    assert "needs the gateway role" in capsys.readouterr().err

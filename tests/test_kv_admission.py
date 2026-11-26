@@ -92,6 +92,7 @@ def test_a_request_one_byte_over_the_budget_is_refused_at_once_and_counted(syste
     code, details = code_of(run.call(max_tokens=TOKENS))
     assert time.monotonic() - began < FAST
     assert code == grpc.StatusCode.RESOURCE_EXHAUSTED and "KV cache" in details
+    assert "can never be admitted" in details  # alone it is over the whole budget
     assert run.gateway.kv_rejected == 1 and run.gateway.outcomes["rejected"] == 1
     assert len(run.servicer0.store) == 0 and len(run.servicer1.store) == 0  # never sent
     idle(run)
@@ -138,6 +139,7 @@ def test_a_queued_request_holds_its_reservation(system):
     assert run.gateway._kv_reserved == 2 * one
     code, details = code_of(run.call(max_tokens=TOKENS))
     assert code == grpc.StatusCode.RESOURCE_EXHAUSTED and "KV cache" in details
+    assert "try again later" in details  # it fits once a reservation is given back
     for thread, out in started:
         thread.join(WAIT)
         assert len(out[0]) == TOKENS
@@ -218,17 +220,35 @@ def test_the_committed_host_b_budget_is_the_agreed_one():
     budget = config.host_b_budget()
     assert budget.worker_bytes == int(0.7 * 2**30)
     assert budget.runtime_bytes == 196 * 2**20
+    assert budget.margin_bytes == 64 * 2**20
+
+
+MIB = 2**20
+HOST_B = config.HostBBudget(700 * MIB, 200 * MIB, 50 * MIB)
+
+
+def test_the_kv_budget_is_what_runtime_margin_and_weights_leave():
+    assert gateway.kv_budget_of(HOST_B, 300 * MIB, 15, off=False) == 150 * MIB
+
+
+@pytest.mark.parametrize("weights", [450 * MIB, 600 * MIB])
+def test_no_room_for_kv_cache_refuses_to_start_unless_turned_off(weights):
+    with pytest.raises(ValueError, match="--no-kv-admission"):
+        gateway.kv_budget_of(HOST_B, weights, 14, off=False)
+    assert gateway.kv_budget_of(HOST_B, weights, 14, off=True) is None
 
 
 @pytest.mark.parametrize(
     "lines, message",
     [
-        ("host_b_runtime_mib = 196\n", "host_b_budget_gib"),
+        ("host_b_runtime_mib = 196\nhost_b_margin_mib = 64\n", "host_b_budget_gib"),
         ("host_b_budget_gib = 0\nhost_b_runtime_mib = 196\n", "host_b_budget_gib"),
         ("host_b_budget_gib = 0.7\nhost_b_runtime_mib = -1\n", "host_b_runtime_mib"),
         ("host_b_budget_gib = true\nhost_b_runtime_mib = 196\n", "host_b_budget_gib"),
         ("host_b_budget_gib = inf\nhost_b_runtime_mib = 196\n", "host_b_budget_gib"),
-        ("host_b_budget_gib = 0.1\nhost_b_runtime_mib = 196\n", "must be below"),
+        ("host_b_budget_gib = 0.7\nhost_b_runtime_mib = 196\n", "host_b_margin_mib"),
+        ("host_b_budget_gib = 0.7\nhost_b_runtime_mib = 196\nhost_b_margin_mib = 0\n", "margin"),
+        ("host_b_budget_gib = 0.25\nhost_b_runtime_mib = 196\nhost_b_margin_mib = 64\n", "below"),
     ],
 )
 def test_bad_host_b_budgets_are_rejected(tmp_path, lines, message):

@@ -316,27 +316,37 @@ logits equal the single-process reference (tested with small random models).
     the next hop, may hold at a stage. A full inbox stops the stage reading, so gRPC flow
     control slows the sender; on a healthy stream nothing is dropped. A stream that ends
     (a route change, a failed next hop) discards what it held, as before.
-  - KV admission (R5.3), from `host_b_budget_gib` (0.7) and `host_b_runtime_mib` (196).
-    Stage 0 runs on Host B, whose worker budget is 0.7 GiB of peak RSS for the whole process
-    (R1.7). The gateway subtracts the runtime (the RSS of a fresh process after importing
-    torch and the model code, measured on Host B) and the fp32 size of Stage 0's layers at
-    the split in use, read from the shapes in `model.safetensors`. The mapped embedding is
-    read with file reads, so it adds nothing. What is left is the KV budget. Each request
+  - KV admission (R5.3), from `host_b_budget_gib` (0.7), `host_b_runtime_mib` (196) and
+    `host_b_margin_mib` (64). Stage 0 runs on Host B, whose worker budget is 0.7 GiB of peak
+    RSS for the whole process (R1.7). The gateway subtracts the runtime (the RSS of a fresh
+    process after importing torch and the model code, measured on Host B), the margin, and
+    the fp32 size of Stage 0's layers at the split in use, read from the shapes in
+    `model.safetensors`. The mapped embedding is read with file reads, so it adds nothing.
+    What is left is the KV budget. The margin is a proposed figure, not a measurement, for
+    the worker memory that runtime plus weights leave out, all inside the 0.7 GiB: a serving
+    Stage 0 for SmolLM2 read about 415 MiB idle, about 16 MiB above them (a check on Host B
+    on 2026-11-26, not a recorded run), one appended layer (below), the attention scores of
+    a 512 token prefill (about 18 MiB) and gRPC message copies. Each request
     reserves (prompt tokens + `max_tokens`) x Stage 0 KV bytes per position (layers x 2 x
     kv heads x head dim x 4) before it may queue. One that does not fit beside the
-    reservations already held is refused at once with RESOURCE_EXHAUSTED and counted in
+    reservations already held is refused at once with RESOURCE_EXHAUSTED (its message says
+    when it is over the whole budget, so a retry cannot help) and counted in
     `Gateway.kv_rejected` as well as the `rejected` outcome. Queued requests hold their
     reservation, and every way a request ends gives it back. The gateway logs the budget at
     start and writes `kv_budget_bytes` and `kv_bytes_per_position` to the metrics file.
-    - SmolLM2 (k = 15): 202.6 MiB of weights leave 318.2 MiB, 23,040 bytes per position,
-      14,483 positions. At the committed limits (22 requests of at most 528 positions) it
-      does not bind; it binds once `max_tokens` is large, for example 7 requests of 2,000.
+    - SmolLM2 (k = 15): 202.6 MiB of weights leave 254.2 MiB, 23,040 bytes per position,
+      11,570 positions. At the committed limits (22 requests of at most 528 positions) 21
+      fit, so it binds only when nearly all 22 are that long; with
+      longer requests it binds sooner, for example 5 requests of 2,000 positions.
     - Qwen3-0.6B (k = 14): 840.1 MiB of Stage 0 weights alone exceed 0.7 GiB, so no KV
-      budget is left. The gateway warns with the numbers and runs with KV admission off.
+      budget is left. The gateway refuses to start with the numbers; `--no-kv-admission`
+      (on the gateway or the launcher) runs it without the check, and the run record then
+      has `kv_budget_bytes` null.
     - Limits. It reserves each request's maximum, not measured use (R5.10 tunes it). An
       append copies one layer of one request, so a step briefly holds one more layer (about
-      12 MiB at 8,192 positions for SmolLM2). Prefill activations and gRPC buffers are not
-      counted either; the 0.5 GiB headroom above the budget covers them. The gateway gives a
+      12 MiB at 8,192 positions for SmolLM2). That layer, prefill activations and gRPC
+      buffers are worker memory, so they come out of the margin, not the 0.5 GiB headroom
+      above the budget (R1.7 keeps that for other programs). The gateway gives a
       reservation back when the request ends, but Stage 0 frees the cache only when the
       `Free` arrives on its heartbeat stream (every 0.5 s), so requests admitted in that gap
       can briefly overlap the freed caches by up to what they cache in that gap.
@@ -1017,6 +1027,10 @@ macOS. Force killing the launcher leaves its processes running.
 accepted only with the gateway role on this laptop. The gateway checks the range (above the
 0.5 s beat interval and below the 8 s keepalive timeout); an out-of-range value makes it
 exit, and the launcher then stops the rest. See [Beat gaps](#beat-gaps) for how to choose it.
+
+`--no-kv-admission` passes the gateway's flag through (gateway role only): requests are then
+admitted without Host B's KV budget (R5.3). The gateway refuses to start without it when the
+model's Stage 0 leaves no KV budget, as Qwen3-0.6B does.
 
 Before every run, close other programs and use the same power state. The launcher logs the
 available memory and power state at the start, warns on battery, and writes a run record.
