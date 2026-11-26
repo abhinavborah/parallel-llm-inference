@@ -196,6 +196,7 @@ def test_a_registration_reports_the_wait_since_the_declaration():
         "time": 1234.5,
         "waited_ns": 3 * SECOND,
         "route_queued_ns": clock.ns,
+        "load_ns": None,
     }
 
 
@@ -435,6 +436,7 @@ def beating(tmp_path):
         each.close()
 
 
+@pytest.mark.fault
 @pytest.mark.parametrize("stage", [0, 1])
 def test_a_killed_stage_is_detected_by_its_stream_break(plane, stage):
     proc, epoch = plane.child(stage)
@@ -451,6 +453,7 @@ def test_a_killed_stage_is_detected_by_its_stream_break(plane, stage):
     assert len(detected(plane.detector, epoch=epoch)) == 1
 
 
+@pytest.mark.fault
 def test_a_suspended_stage_is_detected_by_its_heartbeat_timeout(plane):
     proc, epoch = plane.child(1)
     faults.suspend(proc.pid)  # its sockets stay open, so no stream breaks
@@ -462,6 +465,7 @@ def test_a_suspended_stage_is_detected_by_its_heartbeat_timeout(plane):
     assert detected(plane.detector, path="stream_break") == []
 
 
+@pytest.mark.fault
 def test_a_slow_step_is_recorded_without_declaring_the_stage_and_the_request_completes(beating):
     run = beating(delay1=0.5)
     run.gateway.detector.step_timeout_ns = round(0.2 * SECOND)
@@ -474,6 +478,7 @@ def test_a_slow_step_is_recorded_without_declaring_the_stage_and_the_request_com
     assert detected(run.gateway.detector, declared=True) == []
 
 
+@pytest.mark.fault
 def test_a_step_past_its_timeout_on_a_live_stage_fails_the_request_at_its_deadline(beating):
     """R5.5: the step timeout records the step, and the request still fails at its own
     deadline, not earlier at the step timeout and not later. The other outcome, a stage
@@ -493,6 +498,7 @@ def test_a_step_past_its_timeout_on_a_live_stage_fails_the_request_at_its_deadli
     assert not run.gateway.requests
 
 
+@pytest.mark.fault
 def test_a_step_held_by_a_suspended_stage_names_it_then_its_timeout_declares_it(plane):
     plane.detector.heartbeat_timeout_ns = 4 * SECOND
     plane.detector.step_timeout_ns = 3 * SECOND
@@ -528,6 +534,7 @@ def start_replacement(run, stage):
     return servicer, run.join(stage, servicer, port)
 
 
+@pytest.mark.fault
 @pytest.mark.parametrize("stage", [0, 1])
 def test_a_dead_epoch_waits_for_a_new_registration_and_a_route_update(beating, tmp_path, stage):
     run = beating()
@@ -556,6 +563,7 @@ def test_a_dead_epoch_waits_for_a_new_registration_and_a_route_update(beating, t
     assert [(t.token, t.top_logit) for t in got] == list(zip(*expected, strict=True))
 
 
+@pytest.mark.fault
 def test_a_register_before_detection_writes_one_record_and_a_later_break_none(plane):
     proc, epoch = plane.child(1)
     new = plane.register(1)
@@ -610,6 +618,7 @@ def test_a_replacement_takes_precedence_over_the_declared_death_of_a_stream(plan
     assert plane.gateway._refusal(session)[0] == grpc.StatusCode.FAILED_PRECONDITION
 
 
+@pytest.mark.fault
 def test_a_stage_resumed_with_no_replacement_is_told_and_exits(plane):
     proc, epoch = plane.child(1)
     faults.suspend(proc.pid)
@@ -621,6 +630,7 @@ def test_a_stage_resumed_with_no_replacement_is_told_and_exits(plane):
     assert len(detected(plane.detector, epoch=epoch)) == 1
 
 
+@pytest.mark.fault
 def test_a_resumed_stage_is_replaced_by_its_supervisor_with_no_manual_step(plane, tmp_path):
     port = free_port()
     supervisor = Supervisor(
@@ -647,6 +657,7 @@ def test_a_resumed_stage_is_replaced_by_its_supervisor_with_no_manual_step(plane
         supervisor.stop()
 
 
+@pytest.mark.fault
 def test_a_stage_resumed_after_a_replacement_stops_beating_and_keeps_running(plane, tmp_path):
     proc, epoch = plane.child(1)
     faults.suspend(proc.pid)
@@ -663,6 +674,7 @@ def test_a_stage_resumed_after_a_replacement_stops_beating_and_keeps_running(pla
     assert plane.registry.stages[1].epoch == new
 
 
+@pytest.mark.fault
 def test_a_stream_opened_by_a_dead_epoch_is_refused_at_its_first_beat(plane):
     epoch = plane.register(0)
     plane.detector.declare(0, epoch, "stream_break", "broken")
@@ -671,6 +683,7 @@ def test_a_stream_opened_by_a_dead_epoch_is_refused_at_its_first_beat(plane):
     assert plane.gateway.beats() == {} and plane.detector.is_dead(epoch)
 
 
+@pytest.mark.fault
 def test_a_worker_whose_epoch_is_declared_dead_ends_with_an_error(tmp_path):
     """The path a serving worker takes: join_gateway raises and main exits with code 1."""
     tiny_reference(tmp_path, layers=LAYERS)

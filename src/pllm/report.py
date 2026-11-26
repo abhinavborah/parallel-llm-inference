@@ -30,6 +30,16 @@ gateway's one clock (pllm.metrics), so no two machines' clocks are ever compared
   window with no beat from that stage (a late first beat, a heartbeat that reconnected,
   beats that stopped), and the summary warns when it is over 1 s. Utilisation is busy time
   over the window; two streams working at once on one stage can push it above 1.
+- Recoveries (R6.12): one row per `recovery` line the gateway wrote (pllm.gateway), its
+  parts in ms. Stale outputs discarded are counted here only: the results of the request
+  that the gateway dropped (hop lines with accepted false) at an attempt from the previous
+  recovery's attempt of that request (1 for the first) up to, not including, this one's,
+  over the whole run. So a late result of a resumed old stage counts even after the
+  recovery line, and a request that recovers twice counts each result once. Nacks have no
+  hop line and are not counted; a duplicate of the current attempt is not a stale output.
+  A result accepted on arrival but dropped when its request took it (the attempt was bumped
+  in between) has an accepted hop line and is not counted either; the gateway's run-wide
+  discards count it.
 """
 
 import argparse
@@ -40,6 +50,8 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from pllm.metrics import STAGE1_GATEWAY
 
 GAP_WARNING_S = 1.0  # a beat gap longer than this is called out in the summary
 RUNS = Path("runs")
@@ -54,6 +66,7 @@ REQUIRED = {  # a line missing one of these is counted as unreadable
     "request": ("outcome", "output_tokens", "arrived_ns", "first_token_ns", "last_token_ns"),
     "beat": ("t_ns", "stage", "epoch", "busy_ns", "steps"),
     "bytes": ("hop", "msg", "phase", "messages", "bytes", "payload_bytes", "positions"),
+    "recovery": ("t_ns", "rid", "attempt", "recovered", "recomputed_tokens"),
 }
 
 
@@ -77,6 +90,8 @@ class Run:
     requests: list[dict] = field(default_factory=list)
     beats: list[dict] = field(default_factory=list)
     bytes: list[dict] = field(default_factory=list)
+    recoveries: list[dict] = field(default_factory=list)
+    dropped: list[tuple] = field(default_factory=list)  # (rid, attempt) of each dropped result
     end: dict | None = None
     bad_lines: int = 0
 
@@ -113,6 +128,11 @@ def load(path: Path) -> Run:
                 run.beats.append(row)
             elif kind == "bytes":
                 run.bytes.append(row)
+            elif kind == "recovery":
+                run.recoveries.append(row)
+            elif kind == "hop":
+                if row.get("hop") == STAGE1_GATEWAY and row.get("accepted") is False:
+                    run.dropped.append((row.get("rid"), row.get("attempt")))
             elif kind == "run_end":
                 run.end = row
     return run
@@ -218,6 +238,8 @@ def summary(run: Run) -> dict:
         "complete_run": run.end is not None,
         "stage0_stage1_complete": (run.end or {}).get("stage0_stage1_complete"),
         "bad_lines": run.bad_lines,
+        "recoveries": len(run.recoveries),
+        "recovered": sum(1 for r in run.recoveries if r["recovered"]),
     }
     for key, _ in LATENCIES:
         values = lat[key]
@@ -302,11 +324,72 @@ def bytes_rows(run: Run) -> list[list]:
     return rows
 
 
+RECOVERY_HEADER = [
+    "rid",
+    "attempt",
+    "recovered",
+    "stage",
+    "old_epoch",
+    "new_epoch",
+    "path",
+    "detection_ms",
+    "respawn_ms",
+    "weight_load_ms",
+    "overlap",
+    "replay_prefill_ms",
+    "total_ms",
+    "recomputed_tokens",
+    "divergences",
+    "stale_discarded",
+]
+
+
+def recovery_rows(run: Run) -> list[list]:
+    """One row per recovery, in the order they ended, with its stale outputs discarded."""
+    rows = []
+    since: dict[str, int] = {}  # rid: the attempt the previous recovery ended on
+    for r in sorted(run.recoveries, key=lambda r: r["t_ns"]):
+        low, high = since.get(r["rid"], 1), r["attempt"]
+        since[r["rid"]] = high
+        stale = sum(
+            1
+            for rid, attempt in run.dropped
+            if rid == r["rid"] and isinstance(attempt, int) and low <= attempt < high
+        )
+        rows.append(
+            [
+                r["rid"],
+                r["attempt"],
+                r["recovered"],
+                r.get("stage"),
+                r.get("old_epoch"),
+                r.get("new_epoch"),
+                r.get("path"),
+                _ms(r.get("detection_ns")),
+                _ms(r.get("respawn_ns")),
+                _ms(r.get("weight_load_ns")),
+                r.get("overlap"),
+                _ms(r.get("replay_prefill_ns")),
+                _ms(r.get("total_ns")),
+                r["recomputed_tokens"],
+                r.get("divergences"),
+                stale,
+            ]
+        )
+    return rows
+
+
+def _ms(ns) -> float | None:
+    return None if ns is None else ns / 1e6
+
+
 def write_run(run: Run, s: dict, folder: Path) -> None:
     folder.mkdir(parents=True)
     _csv(folder / "latency.csv", LATENCY_HEADER, latency_rows(s))
     _csv(folder / "stages.csv", STAGE_HEADER, stage_rows(s))
     _csv(folder / "bytes.csv", BYTES_HEADER, bytes_rows(run))
+    recoveries = recovery_rows(run)
+    _csv(folder / "recovery.csv", RECOVERY_HEADER, recoveries)
     outcome_rows = sorted(s["outcomes"].items())
     text = [f"# {s['run']}", ""]
     text += [
@@ -333,6 +416,8 @@ def write_run(run: Run, s: dict, folder: Path) -> None:
     text += ["", "## Stages (busy time within the window)", ""]
     text += _markdown(STAGE_HEADER, stage_rows(s)) if s["stages"] else ["No window."]
     text += ["", "## Bytes per hop", ""] + _markdown(BYTES_HEADER, bytes_rows(run))
+    text += ["", f"## Recoveries ({s['recovered']} of {s['recoveries']} recovered)", ""]
+    text += _markdown(RECOVERY_HEADER, recoveries) if recoveries else ["None."]
     (folder / "summary.md").write_text("\n".join(text) + "\n", encoding="utf-8")
     plot_run(run, folder)
 

@@ -276,6 +276,7 @@ class Split:
             servicer.close()
 
 
+@pytest.mark.fault
 @pytest.mark.parametrize("suspended", [0, 1], ids=["stage0", "stage1"])
 def test_with_a_suspended_worker_every_request_ends_by_its_deadline(tmp_path, suspended):
     """A real stage process is suspended with requests in flight and more arriving: each

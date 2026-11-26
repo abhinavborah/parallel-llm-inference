@@ -28,6 +28,8 @@ from pllm import metrics
 from pllm.faults import StepDelay
 from pllm.stage_service import StageServicer
 
+pytestmark = pytest.mark.fault
+
 LAYERS = 4
 K = 2
 BEAT = 0.05
@@ -227,15 +229,17 @@ def test_the_pause_doubles_up_to_its_cap_and_never_passes_the_deadline(monkeypat
 # -------------------------------------------------------------- R6.10: a slow worker
 
 
+@pytest.mark.parametrize("stage", [0, 1], ids=["stage0", "stage1"])
 def test_a_worker_slower_than_the_step_timeout_fails_requests_at_their_deadline_within_bounds(
     system,  # noqa: F811
+    stage,
 ):
-    """Stage 1 takes 0.5 s a step against a step timeout of 0.2 s. Three running slots and a
+    """One stage takes 0.5 s a step against a step timeout of 0.2 s. Three running slots and a
     queue of two take five requests; three more are refused at once. Every admitted request
     fails with DEADLINE_EXCEEDED at its deadline, none waits past it, and the queue, the
     steps in flight and each inbox stay within their bounds. Afterwards nothing is left."""
     run = system(running=3, max_queued=2, credits=2, inbox_size=2)
-    run.servicer1.worker.delay = StepDelay(0.5)
+    getattr(run, f"servicer{stage}").worker.delay = StepDelay(0.5)
     run.gateway.detector.step_timeout_ns = 200_000_000
     timeout_s = 1.5
     out, _ = run_all(run, 8, start_gap=0.02, max_tokens=20, timeout_ms=round(timeout_s * 1000))

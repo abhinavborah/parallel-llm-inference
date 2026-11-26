@@ -84,6 +84,15 @@ already seen for its (rid, attempt) is counted in order_violations and logged; n
 changes for it. Each stage checks what it receives, so both hops into the stages are
 checked; the gateway checks the hop out of the last stage with its result filter.
 
+Hop delay (R7.7, decision #48): hop_delay, None unless set, delays every message this
+stage receives. It is set on Stage 1 only, for the X4 sweep, and models the Stage 0 to
+Stage 1 hop. The reader stamps each message with its release time on arrival, and its
+deadline is set from that release, so the delay counts as transit (#32). The handler waits
+for the release before the usual checks, and lets the message go if the stream is cancelled
+meanwhile. Messages in delay wait in the bounded inbox, so backpressure still holds; a
+Beat's inbox depth counts them, except the one the handler is holding. Each stream is first
+in, first out, as on one TCP stream: a message waits for the ones ahead of it.
+
 Chain over a single host or two: every address comes from the caller, which reads it from
 the hosts file. Nothing here depends on the operating system (R3.15).
 """
@@ -99,6 +108,7 @@ import grpc
 import torch
 
 from pllm import metrics, wire
+from pllm.faults import HopDelay, sleep_until
 from pllm.kvstore import Gap, KVStore, Stale
 from pllm.ordering import StepOrder
 from pllm.proto import protocol_pb2, protocol_pb2_grpc
@@ -195,6 +205,7 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         self._working: dict[int, int] = {}  # per stream thread, when its current step began
         self._busy_lock = threading.Lock()
         self.order = StepOrder(f"stage {self.stage_index}")  # R3.7, on every message
+        self.hop_delay: HopDelay | None = None  # read per message, so it can change while running
 
     @property
     def order_violations(self) -> int:
@@ -303,7 +314,10 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         def pump():
             try:
                 for request in request_iterator:  # the deadline is set on arrival
-                    item = (request, due(request.budget_ms, time.monotonic()))
+                    now, hold = time.monotonic(), self.hop_delay
+                    release = None if hold is None else hold.release(request, now)
+                    arrived = now if release is None else release
+                    item = (request, due(request.budget_ms, arrived), hold, now, release)
                     if not _offer(inbox, item, ended.is_set):
                         return
                     depth = inbox.qsize()
@@ -317,6 +331,9 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
         def stuck() -> bool:  # stop waiting on a full outbox: the stream is ending
             return call.done() or self.channel is not channel
 
+        def gone() -> bool:  # stop holding a delayed message: no one will take its result
+            return stuck() or not context.is_active()
+
         threading.Thread(target=pump, daemon=True).start()
         try:
             while not call.done():
@@ -329,7 +346,11 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                     continue
                 if request is _DONE:
                     break
-                request, deadline = request
+                request, deadline, hold, entered, release = request
+                if release is not None:
+                    if not sleep_until(release, gone, POLL_SECONDS):
+                        continue  # the stream is ending; the loop's checks say how
+                    hold.held(request, entered, time.monotonic())
                 self.order.check(request.rid, request.attempt, request.step)
                 if deadline is not None and time.monotonic() >= deadline:
                     self._expire(request)

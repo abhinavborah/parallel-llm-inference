@@ -13,11 +13,13 @@ sends that late output:
   refuses them with BAD_SENDER. The Nack names an old attempt, so it fails nothing.
 
 The client sees each step once and the fault-free tokens. Equality is on one host, fp32,
-batch 1.
+batch 1. For Stage 1, the report counts each late result as a stale output of the request's
+recovery (R6.12).
 """
 
 import subprocess
 import sys
+import time
 
 import pytest
 from test_gateway import IDS, WAIT, wait_for
@@ -25,9 +27,12 @@ from test_heartbeat import Beating, reference
 from test_model import tiny_reference
 from test_replay import take
 
-from pllm import faults, metrics
+from pllm import faults, metrics, report
 from pllm.control import ExpectedModel
 from pllm.models import sha256_of
+from pllm.wire import KEEPALIVE_TIMEOUT_SECONDS
+
+pytestmark = pytest.mark.fault
 
 LAYERS = 4
 K = 2
@@ -112,6 +117,8 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
     real = bytes.fromhex(sha256_of(tmp_path / "model.safetensors"))
     run.registry.expected = ExpectedModel(real, LAYERS, K)
     neighbour = "" if stage == 1 else f"127.0.0.1:{run.ports[1]}"
+    metrics_file = tmp_path / "gateway.metrics.jsonl"
+    run.gateway.recorder = metrics.Recorder(metrics_file)
     outputs = outputs_of(run, stage)
 
     def spawn(delay, marks):
@@ -142,7 +149,7 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         before = begun()
         wait_for(lambda: begun() > before, "the old process to begin its next step")
         faults.suspend(old_proc.pid)  # within its delay: the output is not sent yet
-        suspended = old_proc
+        suspended, suspended_at = old_proc, time.monotonic()
 
         wait_for(lambda: run.gateway.detector.is_dead(old), "the old epoch to be declared dead")
         events = run.gateway.detector.events()
@@ -160,8 +167,11 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         )
         tokens += take(stream, 1)
 
+        held = time.monotonic() - suspended_at
         faults.resume(old_proc.pid)
         suspended = None
+        # past keepalive the old process's connections close and its late output is lost
+        assert held < KEEPALIVE_TIMEOUT_SECONDS, f"suspended {held:.1f} s, past keepalive"
 
         def late():
             return [o for o in outputs[declared:] if o[0] == old]
@@ -185,6 +195,12 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         assert [t.token for t in tokens] == expected
         assert run.gateway.replays >= 1 and run.gateway.divergences == 0
         assert stages[stage].epoch == new
+        if stage == 1:  # every dropped result of an older attempt, the late ones included
+            header = report.RECOVERY_HEADER
+            rows = report.recovery_rows(report.load(metrics_file))
+            [row] = [dict(zip(header, r, strict=True)) for r in rows if r[0] == tokens[0].rid]
+            dropped = [o for o in outputs if o[3] and o[1] < row["attempt"]]
+            assert row["stale_discarded"] == len(dropped) >= len(late()) >= 1
     finally:
         if suspended is not None:
             faults.resume(suspended.pid)
