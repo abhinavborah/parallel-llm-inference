@@ -160,20 +160,20 @@ def test_a_request_that_lives_through_max_deaths_fails_with_unavailable(beating)
 
 
 def test_a_refused_replay_waits_longer_each_time(beating, tmp_path, monkeypatch):
-    """The new Stage 1 learns Stage 0's epoch only after 1.2 s, so it refuses each replay
+    """The new Stage 1 learns Stage 0's epoch only after 2.5 s, so it refuses each replay
     until then. The pauses between the restarts grow, so the restarts stay few, and the
     request still finishes with the fault-free tokens."""
     hold = 2.5  # long enough for three restarts even when each one is slow
     run = beating(delay1=0.05)
     expected = reference(tmp_path, K, IDS, 6)[0]
     sent = starts(run.gateway)
-    pauses = []  # (the request's restarts before it, how long it took)
+    pauses = []  # (the request's restarts before it, how long it took, already replaying)
     real_pause = gateway_module.Gateway._pause
 
     def timed(request):
-        before, began = request.restarts, time.monotonic()
+        before, replaying, began = request.restarts, request.recovering, time.monotonic()
         real_pause(request)
-        pauses.append((before, time.monotonic() - began))
+        pauses.append((before, time.monotonic() - began, replaying))
 
     monkeypatch.setattr(gateway_module.Gateway, "_pause", staticmethod(timed))
     stream = run.call(max_tokens=6, timeout_ms=30_000)
@@ -196,13 +196,15 @@ def test_a_refused_replay_waits_longer_each_time(beating, tmp_path, monkeypatch)
     assert [t.token for t in tokens] == expected
     times = [at for at, rid, attempt in sent if rid == tokens[0].rid and attempt >= 2]
     gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
-    assert len(pauses) >= 3  # refused at least three times
+    # The pause after the stream failure that the death caused comes before the replay
+    # starts, so it is no refusal; only pauses taken while replaying are counted.
+    assert sum(replaying for *_, replaying in pauses) >= 3, pauses  # refused three times
     assert min(gaps) >= 0.9 * gateway_module.POLL_SECONDS
     # The pauses themselves grew. The gaps between restarts also hold the round trip, which
     # on a slow runner can be longer than the first pauses, so they are not compared. Each
     # pause is at least its doubled base; a slow runner can only make it longer.
-    assert [before for before, _ in pauses[:3]] == [0, 1, 2]
-    for doublings, (_, took) in enumerate(pauses[:3]):
+    assert [before for before, *_ in pauses[:3]] == [0, 1, 2]
+    for doublings, (_, took, _) in enumerate(pauses[:3]):
         assert took >= 0.9 * gateway_module.POLL_SECONDS * 2**doublings, pauses
     # a fixed 0.05 s pause would restart about 40 times in the hold; doubling gives about 6
     assert len(times) <= 9
