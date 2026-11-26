@@ -580,12 +580,28 @@ The two default timeouts are provisional: the beat gaps behind the 2.0 s value w
 on one laptop only. A laptop that pauses longer, for example while paging, needs a larger
 `--heartbeat-timeout`. The `run` line of the metrics file records the values in use.
 
+Every gRPC server and every channel between the processes (registration, heartbeat, the
+gateway's stream to Stage 0 and the stream between the stages) sets keepalive
+(`pllm.wire.channel_options`): each end pings after 2 s with no traffic and closes the
+connection when the ack is 8 s late. The client's and the dashboard's channels to the
+gateway do not, so run them on the gateway's laptop. A link that goes silent without a TCP
+reset, such as a Wi-Fi stall or a laptop that left the network, breaks every keepalive
+stream on it within 10 s instead of when the operating system gives up. The
+stage's heartbeat then opens a new stream, and the gateway's stream to Stage 0 and the
+stream between the stages fail instead of hanging. A stall shorter than 8 s breaks
+nothing. The gateway refuses a `--heartbeat-timeout` of 8 s or more: a longer stall would
+break the heartbeat stream first and declare the stage at once, so the tuned timeout would
+never be the one that decides.
+
 Limits:
 
 - A stage that breaks its heartbeat stream is dead to the gateway even if the process is
   fine, so a network blip now costs a respawn and a weight reload.
 - A worker suspended and never resumed produces no registration, because its supervisor sees
   a live process. The gateway waits.
+- A worker suspended for more than about 8 s has its connections closed by keepalive, since a
+  stopped process cannot answer a ping. Outputs it held for a closed stream can then be lost
+  rather than delivered late, so a stale-output run (X6) keeps each suspension under 8 s.
 
 ## X1a: the split against the single process
 
