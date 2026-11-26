@@ -1,9 +1,10 @@
 """Hop delay for X4 (R7.7, decision #48): the gateway to Stage 0 hop is delayed at the
-gateway's send, the Stage 0 to Stage 1 hop at Stage 1's receive. Pipelined and counted as
-transit. Real gateway and stages on loopback; timing bounds are loose, since CI runs on
-Windows and the tests share a laptop.
+gateway's send, the Stage 0 to Stage 1 hop at Stage 1's receive. Pipelined, counted as
+transit, set at run time from a file (pllm.faults.HopDelayControl). Real gateway and stages
+on loopback; timing bounds are loose, since CI runs on Windows and the tests share a laptop.
 """
 
+import logging
 import statistics
 import threading
 import time
@@ -14,7 +15,7 @@ from test_gateway import WAIT, System, wait_for
 from test_model import tiny_reference
 
 from pllm import faults
-from pllm.faults import HopDelay
+from pllm.faults import HopDelay, HopDelayControl
 
 LAYERS = 4
 K = 2
@@ -179,3 +180,22 @@ def test_no_hop_delay_keeps_the_plain_paths(system):
     run.tokens(max_tokens=2)
     assert run.gateway.hop_delay is None and run.servicer1.hop_delay is None
     assert not run.gateway._link.delayed
+
+
+# -------------------------------------------------------------- set at run time
+
+
+def test_a_bad_file_keeps_the_delay_and_is_logged_once(tmp_path, caplog):
+    path, applied = tmp_path / "hop_delay_ms", {}
+    control = HopDelayControl("gateway", lambda d: applied.__setitem__("gateway", d), path)
+    path.write_text("5")
+    control.poll()
+    with caplog.at_level(logging.WARNING, logger="pllm.faults"):
+        for text in ("fast", "-1", "inf"):
+            path.write_text(text)
+            control.poll()
+    assert applied["gateway"] == HopDelay(0.005)
+    assert len(caplog.records) == 1
+    path.unlink()
+    control.poll()
+    assert applied["gateway"] == HopDelay()  # no file is 0

@@ -1282,6 +1282,11 @@ def main(argv: list[str] | None = None) -> None:
         metavar="SECONDS",
         help=f"record a step with no result after this long (default {STEP_TIMEOUT_SECONDS})",
     )
+    parser.add_argument(
+        "--hop-delay-control",
+        action="store_true",
+        help="delay each step sent to Stage 0 by the ms in runs/hop_delay_ms (X4, pllm.x4)",
+    )
     args = parser.parse_args(argv)
     model_dir = MODELS_DIR / args.model
     try:
@@ -1303,6 +1308,7 @@ def main(argv: list[str] | None = None) -> None:
                 **runrecord.machine(),
                 "heartbeat_timeout_s": args.heartbeat_timeout,
                 "step_timeout_s": args.step_timeout,
+                "hop_delay_control": args.hop_delay_control,
                 "argv": sys.argv,
             },
         )
@@ -1322,6 +1328,14 @@ def main(argv: list[str] | None = None) -> None:
         step_timeout=args.step_timeout,
     )
     gateway.recorder = recorder
+    if args.hop_delay_control:
+
+        def apply(hold: faults.HopDelay) -> None:
+            gateway.hop_delay = hold
+            recorder.event({"event": "hop_delay", "t_ns": recorder.now(), "ms": hold.seconds * 1e3})
+
+        gateway.hop_delay = faults.HopDelay()
+        faults.HopDelayControl("gateway", apply).start(threading.Event())  # a daemon thread
     page = None
     if args.dashboard:
         from pllm import dashboard  # only when asked for: a plain gateway does not load it

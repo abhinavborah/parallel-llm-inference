@@ -360,10 +360,14 @@ def serve_control(supervisor: Supervisor, bind: tuple[str, int]) -> ThreadingHTT
 # ------------------------------------------------------------------------------ CLI
 
 
-def worker_command(model: str, stage: int, threads: int | None) -> list[str]:
+def worker_command(
+    model: str, stage: int, threads: int | None, hop_delay_control: bool = False
+) -> list[str]:
     command = [sys.executable, "-m", "pllm.worker", model, "--stage", str(stage), "--serve"]
     if threads is not None:
         command += ["--threads", str(threads)]
+    if hop_delay_control:
+        command.append("--hop-delay-control")
     return command
 
 
@@ -373,9 +377,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--stage", type=int, choices=(0, 1), required=True)
     parser.add_argument("--threads", type=int, help="torch threads for the worker")
     parser.add_argument("--log", help="JSON-lines event log (default runs/supervisor_stageN.jsonl)")
+    parser.add_argument(
+        "--hop-delay-control", action="store_true", help="Stage 1 only: passed to the worker"
+    )
     args = parser.parse_args(argv)
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
+    if args.hop_delay_control and args.stage != 1:
+        parser.error("--hop-delay-control is for --stage 1 only")
     try:
         hosts = config.load()
         control = config.supervisor_endpoint(args.stage)
@@ -384,7 +393,7 @@ def main(argv: list[str] | None = None) -> None:
     stage_port = getattr(hosts, f"stage{args.stage}").port
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     supervisor = Supervisor(
-        worker_command(args.model, args.stage, args.threads),
+        worker_command(args.model, args.stage, args.threads, args.hop_delay_control),
         ready_address=("127.0.0.1", stage_port),
         log_path=args.log or config.REPO_ROOT / "runs" / f"supervisor_stage{args.stage}.jsonl",
         cwd=config.REPO_ROOT,
