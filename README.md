@@ -210,9 +210,10 @@ The address comes from `[supervisor0]` and `[supervisor1]` in the hosts file, an
 supervisor listens on that host; without the tables it is the stage's host on port 50061 or
 50062. The examples use 50062, stage 1 on the Mac; for stage 0 on the Windows laptop use
 50061. A fault request from the other laptop needs that port reachable; with the Windows
-firewall off, as for now (see "Starting the system"), no rule is needed.
+firewall on, as on the college Wi-Fi, it needs an inbound rule (see "Windows setup").
 
-There is no authentication, so keep it on the lab network. `status` reports a worker
+There is no authentication, so use it only on a network you trust, or limit who can reach it
+(see "Network"). `status` reports a worker
 as suspended from the moment a suspend is applied until it is resumed or replaced; a suspend
 that lands as the worker exits can briefly mislabel its replacement.
 
@@ -464,7 +465,8 @@ counts tokens sent and requests ended by outcome (`Gateway.state()`).
 Safety, as for the supervisor's control port: a POST needs `Content-Type: application/json`,
 a Host the server answers to and no foreign Origin, no response has a CORS header and OPTIONS
 is not answered, so a page on another site cannot press the buttons from a browser. There is no
-authentication beyond that: keep it on the lab network. Open event streams (16), requests
+authentication beyond that: use it only on a network you trust (see "Network"). Open event
+streams (16), requests
 started from the page (64 at once), each client's backlog and request bodies are bounded. A
 viewer that vanishes without closing its connection keeps its place until a write to it
 fails, and a viewer that reads slowly loses its oldest events, so a card can miss its first
@@ -757,17 +759,31 @@ available memory and power state at the start, warns on battery, and writes a ru
   kept above it.
 - Stop the launcher with Ctrl-C. On Ctrl-Break `uv` itself exits at once with 0xC000013A, so
   the shell sees that code while the launcher finishes the stop behind it.
-- The Windows firewall is off for now, on the Public profile (agreed 2026-11-09), so the
-  Stage 0 and supervisor ports need no inbound rule.
-  `uv run python -m pllm.netcheck firewall --roles stage0` reports the state. If the firewall
-  is turned back on, allow both ports on the Public profile from an administrator PowerShell:
+- On the college Wi-Fi the Windows firewall is on (agreed 2026-11-26), so the Stage 0 and
+  supervisor ports need an inbound rule. On the phone hotspot it is off for now, on the
+  Public profile (agreed 2026-11-09), and no rule is needed.
+  `uv run python -m pllm.netcheck firewall --roles stage0` reports the state and names the
+  `python.exe` in use (run it from an administrator PowerShell to get a verdict).
+
+Both ports have no authentication and the college Wi-Fi is shared, so allow only the other
+laptop's address. From an administrator PowerShell, with the profile in use, that
+`python.exe` and the other laptop's current address:
 
 ```
-New-NetFirewallRule -DisplayName "pllm stage 0" -Direction Inbound -Protocol TCP -LocalPort 50051 -Profile Public -Action Allow
-New-NetFirewallRule -DisplayName "pllm supervisor 0" -Direction Inbound -Protocol TCP -LocalPort 50061 -Profile Public -Action Allow
+New-NetFirewallRule -DisplayName "pllm stage0" -Direction Inbound -Protocol TCP -LocalPort 50051,50061 -Program "<python.exe path>" -RemoteAddress <other laptop IP> -Profile <profile in use> -Action Allow
 ```
 
-Both ports have no authentication, so use only a network you trust.
+- A broader Allow rule for the same `python.exe` still lets every device in, so check the
+  inbound rules and disable such a rule. Windows may have made one when it first asked about
+  Python.
+- `uv` can reach its interpreter through two folders (a short version name that is a
+  junction to the full one). If the other laptop cannot connect, add the same rule for the
+  other path.
+- If the other laptop's address changes, update the rule. Its address on the hotspot is
+  different, so with the firewall on there, the rule needs that address.
+- If it still cannot connect, look for an inbound Block rule for the same `python.exe`,
+  which `netcheck firewall` lists. Cancelling the Windows prompt for Python, or leaving a
+  network type unticked there, can create one, and a Block rule wins over an Allow rule.
 
 ### macOS setup
 
@@ -777,14 +793,27 @@ Both ports have no authentication, so use only a network you trust.
 
 ### Network
 
-Both laptops join one phone hotspot; Ethernet and a direct cable are not used. Hotspot
-addresses can change each session, so only the hosts file changes: set each host to that
-session's address for the laptop and `network` to the network's name.
+Both laptops join the college Wi-Fi, the primary network for two-laptop runs; a phone
+hotspot is the fallback (changed 2026-11-26). Ethernet and a direct cable are not used.
+Addresses can change between sessions: set each host to that session's address for the
+laptop and `network` to the network's name (for example `college-wifi`), and with the
+firewall on, update the address in the inbound rule. Before any timed run, repeat the
+network probe three times in each direction with both laptops plugged in. If the p95
+round-trip spread stays high, report it with each timed result or use the hotspot. No level
+for "high" is set yet; it is to be agreed on #123.
+
+No port here has authentication, and the college Wi-Fi is shared. The rule under "Windows
+setup" limits only the Windows laptop's Stage 0 and supervisor ports. Nothing in this
+README limits the ports on the Mac, so any device on that Wi-Fi that can reach it can use
+them: the gateway (50050), Stage 1 (50052), its supervisor (50062), which takes kill and
+suspend requests, and the dashboard (50080) if it is bound to the LAN address. Keep the
+dashboard on 127.0.0.1, as the committed hosts file does, unless the other laptop needs it,
+and stop the processes when a run ends.
 
 ## Hosts and ports
 
 Every process reads its addresses from `config/hosts.toml`. The committed file runs all
-processes on one laptop. For a two-laptop run on the hotspot, copy it to
+processes on one laptop. For a two-laptop run, copy it to
 `config/hosts.local.toml` (ignored by git), set each host to that laptop's IP, and set
 `PLLM_CONFIG` to the copy:
 
@@ -831,13 +860,27 @@ uv run python -m pllm.netcheck multicast-send
 uv run python -m pllm.netcheck firewall --roles stage0
 ```
 
-For now the Windows laptop stays on the Public profile with the Windows firewall off
-(agreed 2026-11-09), so no inbound rule is needed and the check reports every port as
-allowed on Public. If the firewall is turned on again, the check reads the inbound rules
-for the profile in use, which needs an administrator shell (without one it gives no
-verdict), and prints a rule to add for that profile and the interpreter. With several
-network adapters, pass `--interface <this laptop's IP>` to the multicast commands.
-On a new hotspot session, check the addresses again and change only the hosts file. Every
+With the Windows firewall off on a profile (as on the phone hotspot for now, agreed
+2026-11-09), the check reports every port as allowed there. With it on (as on the college
+Wi-Fi), the check reads the inbound rules for the profile in use, which needs an
+administrator shell (without one it gives no
+verdict), and prints a rule to add for that profile and the interpreter. The printed rule
+has no address limit, so on the college Wi-Fi use the form under "Windows setup" instead.
+The check also does not read a rule's remote addresses: it reports a port as allowed
+whether or not the rule is limited. With several network adapters, pass
+`--interface <this laptop's IP>` to the multicast commands.
+
+With the Windows firewall on, the Stage 0 rule covers TCP only, so a multicast listen on
+the Windows laptop needs its own rule for UDP 50059; without it, hearing nothing says
+nothing about the network. Add it from an administrator PowerShell for the test and remove
+it afterwards, or run the multicast test on the hotspot with the firewall off:
+
+```
+New-NetFirewallRule -DisplayName "pllm multicast test" -Direction Inbound -Protocol UDP -LocalPort 50059 -Program "<python.exe path>" -RemoteAddress <other laptop IP> -Profile <profile in use> -Action Allow
+Remove-NetFirewallRule -DisplayName "pllm multicast test"
+```
+
+On a new session, check the addresses again (see "Network" above). Every
 probe, listen and firewall run writes a run record.
 
 ## Development
