@@ -2,6 +2,11 @@
 monitor, the probe, the verdicts, the split override, and one sweep on a real chain on
 loopback. Small random models only."""
 
+import ctypes
+import os
+import sys
+from types import SimpleNamespace
+
 import pytest
 from test_model import tiny_reference
 
@@ -9,6 +14,7 @@ from pllm import (
     capacity,
     config,
     launch,
+    procmem,
 )
 from pllm.capacity import HostCapacity, NoSplit, choose_split, sweep_points
 from pllm.control import ExpectedModel
@@ -153,6 +159,106 @@ def test_the_sweep_goes_from_even_to_the_chosen_split():
     for even, chosen, points in ((15, 15, 4), (15, 16, 4), (15, 0, 4), (15, 6, 1)):
         with pytest.raises(ValueError):
             sweep_points(even, chosen, points)
+
+
+# -------------------------------------------------------------- memory counters
+
+
+def test_the_process_list_is_read_entry_by_entry():
+    size = ctypes.sizeof(procmem._ProcessEntry)
+    data = b""
+    for pid, hard, faults, peak, more in ((4, 7, 100, 4096, True), (88, 0, 5, 8192, False)):
+        entry = procmem._ProcessEntry(
+            NextEntryOffset=size + 16 if more else 0,
+            UniqueProcessId=pid,
+            HardFaultCount=hard,
+            PageFaultCount=faults,
+            PeakWorkingSetSize=peak,
+        )
+        data += bytes(entry) + (b"\0" * 16 if more else b"")
+    assert procmem.parse_process_entries(data) == {4: (7, 100, 4096), 88: (0, 5, 8192)}
+    assert procmem.parse_process_entries(b"") == {}
+
+
+@pytest.mark.skipif(ctypes.sizeof(ctypes.c_void_p) != 8, reason="64-bit layout")
+def test_the_fields_sit_where_the_64_bit_windows_layout_has_them():
+    offsets = {
+        "HardFaultCount": 16,
+        "UniqueProcessId": 80,
+        "PageFaultCount": 128,
+        "PeakWorkingSetSize": 136,
+    }
+    for name, offset in offsets.items():
+        assert getattr(procmem._ProcessEntry, name).offset == offset
+
+
+def test_the_hard_fault_count_is_used_only_when_its_neighbours_match_psutil():
+    before = SimpleNamespace(num_page_faults=100, peak_wset=5000)
+    after = SimpleNamespace(num_page_faults=110, peak_wset=6000)
+    assert procmem.check_layout((3, 105, 5000), before, after)
+    assert not procmem.check_layout((3, 99, 5000), before, after)
+    assert not procmem.check_layout((3, 105, 6001), before, after)
+    assert not procmem.check_layout(None, before, after)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_this_windows_gives_a_hard_fault_count_for_this_process():
+    faults = procmem.windows_hard_faults()
+    assert faults is not None and os.getpid() in faults
+
+
+def test_the_linux_files_are_parsed():
+    stat = "12 (a ) odd (name) S 1 12 12 0 -1 4194304 900 0 37 0 5 1 0 0"
+    assert procmem.parse_stat_majflt(stat) == 37
+    assert procmem.parse_vm_hwm("Name:\tx\nVmHWM:\t  2048 kB\n") == 2048 * 1024
+    assert procmem.parse_vm_hwm("Name:\tx\n") is None
+
+
+class Proc:
+    pid = 9
+
+    def __init__(self, **info):
+        self.info = SimpleNamespace(**info)
+
+    def memory_info(self):
+        return self.info
+
+
+def test_each_system_reads_its_own_counters_and_leaves_the_rest_unknown():
+    win = procmem.process_counters(Proc(rss=10, peak_wset=20, num_page_faults=30), {9: 4}, "win32")
+    assert (win["peak_rss_bytes"], win["page_faults"], win["disk_faults"]) == (20, 30, 4)
+    unread = procmem.process_counters(Proc(rss=10, peak_wset=20, num_page_faults=30), None, "win32")
+    assert unread["disk_faults"] is None and unread["page_faults"] == 30
+    mac = procmem.process_counters(Proc(rss=10, pfaults=30, pageins=2), None, "darwin")
+    assert (mac["peak_rss_bytes"], mac["page_faults"], mac["disk_faults"]) == (None, 30, 2)
+    other = procmem.process_counters(Proc(rss=10), None, "sunos5")
+    assert other["peak_rss_bytes"] is other["page_faults"] is other["disk_faults"] is None
+    assert procmem.disk_counter_name("sunos5") is None
+
+
+def test_this_process_tree_can_be_read():
+    snap = procmem.tree_snapshot(os.getpid())
+    assert snap["rss_bytes"] > 0 and snap["processes"]
+    assert snap["disk_faults"] is not None
+    assert (snap["peak_rss_bytes"] is None) == (sys.platform == "darwin")
+    assert procmem.rss_reader(os.getpid())() > 0
+
+
+def snapshot_of(*rows):
+    keys = ("peak", "faults", "disk")
+    return {"processes": [{"pid": p, **dict(zip(keys, v, strict=True))} for p, *v in rows]}
+
+
+def test_a_counter_growth_is_unknown_unless_the_same_processes_give_it():
+    start = snapshot_of((1, 0, 5, 1), (2, 0, 10, 0))
+    assert procmem.delta(start, snapshot_of((2, 0, 12, 0), (1, 0, 8, 1)), "faults") == 5
+    assert procmem.delta(start, snapshot_of((1, 0, 8, 1)), "faults") is None
+    assert procmem.delta(start, snapshot_of((1, 0, 8, 1), (3, 0, 12, 0)), "faults") is None
+    assert procmem.delta(start, snapshot_of((1, 0, 4, 1), (2, 0, 12, 0)), "faults") is None
+    assert procmem.delta(start, snapshot_of((1, 0, None, 1), (2, 0, 12, 0)), "faults") is None
+    assert procmem.delta({"processes": []}, {"processes": []}, "faults") is None
+    assert procmem.total([{"x": 1}, {"x": None}], "x") is None
+    assert procmem.total([], "x") is None
 
 
 # -------------------------------------------------------------- one k for both laptops
