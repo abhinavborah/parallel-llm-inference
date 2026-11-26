@@ -665,9 +665,18 @@ no downloaded weights. The suite uses only 127.0.0.1.
 | R6.8 late outputs of a resumed stage rejected | suspend past the timeout, resume after the replacement (each stage) | `test_stale_after_suspend.py::test_a_resumed_old_stage_has_every_late_output_rejected` |
 | R6.9 attempts, MAX_DEATHS, growing pause, deadline | repeated stage deaths; a refused replay; no replacement | `test_fail_cleanly.py::test_each_declared_death_raises_every_attempt_by_exactly_one`, `::test_a_request_that_lives_through_max_deaths_fails_with_unavailable`, `::test_a_refused_replay_waits_longer_each_time`; `test_replay.py::test_with_no_replacement_the_request_fails_at_its_deadline`; `test_replay_cross.py` |
 | R6.10 a slow worker fails cleanly at the deadline, bounds hold | a step delay on each stage; a suspended worker | `test_fail_cleanly.py::test_a_worker_slower_than_the_step_timeout_fails_requests_at_their_deadline_within_bounds`; `test_deadlines.py::test_with_a_suspended_worker_every_request_ends_by_its_deadline` |
-| R6.11 a delayed or lost hop | none yet | open: #50, on the hop wrapper of #49 |
+| R6.11 a delayed or lost hop | one message lost, or held past the step timeout or past the deadline, on each hop | `test_hop_faults.py::test_a_lost_hop_message_fails_its_request_at_the_deadline_and_holds_up_no_other`, `::test_a_hop_message_late_past_the_step_timeout_still_completes_its_request`, `::test_a_hop_message_late_past_the_deadline_fails_its_request_and_its_result_is_dropped` |
 | R6.12 recovery time in four parts | kill of a real stage process (each stage); a stopped stage; suspend and resume | `test_recovery.py`; `test_stale_after_suspend.py` (stale outputs counted) |
 | R6.14 both stages at once | none yet | open: #52 |
+
+Hop faults (R6.11) use the hop wrapper of X4 (`pllm.faults.HopDelay`) on the gateway to
+Stage 0 hop and the Stage 0 to Stage 1 hop. Its `release()` is asked once per message, so a
+test picks one message to hold longer, or to lose by returning `faults.DROP`; a lost message
+never goes on, and the messages behind it are not held up. The step timeout records a late
+step and declares nothing, so the request completes if the message arrives inside its
+deadline, and otherwise fails with DEADLINE_EXCEEDED at the deadline; a late result is then
+dropped at the gateway. No replay is started for a lost message. The Stage 1 to gateway hop
+has no wrapper (decision #48). On either laptop: `uv run pytest tests/test_hop_faults.py`.
 
 ## Failure detection
 

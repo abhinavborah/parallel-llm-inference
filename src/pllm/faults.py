@@ -95,6 +95,9 @@ class StepDelay:
             time.sleep(self.seconds)
 
 
+DROP = float("inf")  # a release time that never comes: the message is lost
+
+
 @dataclass(frozen=True)
 class HopDelay:
     """Delay added to each message of one hop (R7.7, decision #48). Zero adds none.
@@ -113,7 +116,8 @@ class HopDelay:
             raise ValueError(f"hop delay must be finite and non-negative, got {self.seconds}")
 
     def release(self, message, now: float) -> float:
-        """When a message that entered the hop at now (monotonic seconds) may leave it."""
+        """When a message that entered the hop at now (monotonic seconds) may leave it.
+        DROP means never: the hop loses the message and the ones behind it go on (R6.11)."""
         return now + self.seconds
 
     def held(self, message, entered: float, left: float) -> None:
