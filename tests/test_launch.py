@@ -36,6 +36,21 @@ def test_the_dashboard_flag_goes_to_the_gateway_only():
     assert shown["stage0"] == plain["stage0"]
 
 
+def test_the_flow_overrides_go_to_the_gateway_only():
+    plain = launch.commands("smollm2-135m", ["gateway", "stage0"], 3)
+    extra = ["--admission-queue", "off", "--credits", "2"]
+    changed = launch.commands("smollm2-135m", ["gateway", "stage0"], 3, gateway_args=extra)
+    assert changed["gateway"] == [*plain["gateway"], *extra]
+    assert changed["stage0"] == plain["stage0"]
+
+
+@pytest.mark.parametrize("flags", [["--admission-queue", "off"], ["--credits", "2"]])
+def test_main_refuses_flow_overrides_on_a_laptop_without_the_gateway(flags, capsys):
+    with pytest.raises(SystemExit):
+        launch.main(["smollm2-135m", "--roles", "stage1", *flags])
+    assert "need the gateway role" in capsys.readouterr().err
+
+
 def test_main_refuses_the_dashboard_on_a_laptop_without_the_gateway(capsys):
     with pytest.raises(SystemExit):
         launch.main(["smollm2-135m", "--roles", "stage1", "--dashboard"])
