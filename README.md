@@ -696,8 +696,9 @@ available memory and power state at the start, warns on battery, and writes a ru
 - Use native Python, not WSL2.
 - Keep the charger in and select the best performance power plan or power mode in Settings.
 - The launcher is one more process on this laptop: about 39 MiB, plus 5 MiB for the virtual
-  environment's `python.exe` trampoline (measured on Windows 11, without `uv` itself), a small
-  part of the roughly 2.5 GB this laptop has for the worker.
+  environment's `python.exe` trampoline (measured on Windows 11, without `uv` itself). It is
+  not part of the worker's 0.7 GiB budget (requirement R1.7) but comes out of the headroom
+  kept above it.
 - Stop the launcher with Ctrl-C. On Ctrl-Break `uv` itself exits at once with 0xC000013A, so
   the shell sees that code while the launcher finishes the stop behind it.
 - The Windows firewall is off for now, on the Public profile (agreed 2026-11-09), so the
