@@ -250,7 +250,8 @@ is greedy, and on one host, in fp32, at batch 1 and one thread count the tokens 
 logits equal the single-process reference (tested with small random models).
 
 - The gateway runs on the Mac and loads only the tokenizer and `config.json`, not the
-  weights.
+  weights. For KV admission it reads the tensor shapes in `model.safetensors`, not the
+  tensors, so the file must be there; without it the gateway does not start.
 - A prompt whose prefill would exceed the receive limit from `[limits]` is rejected with
   INVALID_ARGUMENT before anything is sent to Stage 0 (for SmolLM2 at the committed limits,
   more than 512 tokens). A prompt whose request message is itself larger than the limit in
@@ -332,7 +333,7 @@ logits equal the single-process reference (tested with small random models).
       counted either; the 0.5 GiB headroom above the budget covers them. The gateway gives a
       reservation back when the request ends, but Stage 0 frees the cache only when the
       `Free` arrives on its heartbeat stream (every 0.5 s), so requests admitted in that gap
-      can briefly overlap the freed caches by up to their prompts.
+      can briefly overlap the freed caches by up to what they cache in that gap.
     - `uv run pytest tests/test_kv_admission.py` checks requests at exactly the budget and
       one byte over, a queued request holding its bytes, and that each way a request ends
       gives its reservation back.
