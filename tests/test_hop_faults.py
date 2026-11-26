@@ -8,11 +8,12 @@ the ones behind it, and the admission queue, credits and inboxes keep their boun
 Real gateway and stages on loopback.
 """
 
+import threading
 from dataclasses import dataclass, field
 
 import grpc
 import pytest
-from test_backpressure import run_all
+from test_backpressure import FAST, run_all
 from test_backpressure import system as system  # noqa: F401 (a fixture used below)
 from test_deadlines import TOLERANCE
 from test_gateway import WAIT, wait_for
@@ -26,28 +27,31 @@ HOPS = ("gateway", "stage1")  # where the wrapper sits: the gateway's send, Stag
 STEP_TIMEOUT_NS = 200_000_000
 TIMEOUT_S = 1.5
 TOKENS = 6
+OVERLOAD_S = 6.0  # the lost request keeps a slot and a credit until then
 
 
 @dataclass(frozen=True)
 class Lose(HopDelay):
     """Holds the first message of the hop at step for extra seconds; DROP loses it. hit
-    gets its (rid, attempt)."""
+    gets its (rid, attempt). The gateway sends on each request's thread, hence the lock."""
 
     step: int = 2
     extra: float = DROP
     hit: list = field(default_factory=list, compare=False, repr=False)
+    lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
 
     def release(self, message, now: float) -> float:
-        if message.step == self.step and not self.hit:
-            self.hit.append((message.rid, message.attempt))
-            return now + self.extra
+        with self.lock:
+            if message.step == self.step and not self.hit:
+                self.hit.append((message.rid, message.attempt))
+                return now + self.extra
         return super().release(message, now)
 
 
-def faulty(system, hop, fault):  # noqa: F811
+def faulty(system, hop, fault, **slow):  # noqa: F811
     """A run with the hop wrapper on before the first request (the gateway's link fixes
     whether it delays when it opens), the fault-free tokens, then the fault applied."""
-    run = system(running=3, max_queued=2, credits=2, inbox_size=2)
+    run = system(running=3, max_queued=2, credits=2, inbox_size=2, **slow)
     run.gateway.detector.step_timeout_ns = STEP_TIMEOUT_NS
     owner = run.gateway if hop == "gateway" else run.servicer1
     owner.hop_delay = HopDelay()
@@ -137,3 +141,38 @@ def test_a_hop_message_late_past_the_deadline_fails_its_request_and_its_result_i
         "the late result to be dropped at the gateway",
         timeout=WAIT,
     )
+
+
+@pytest.mark.parametrize("extra", (DROP, 0.4), ids=("lost", "late"))
+@pytest.mark.parametrize("hop", HOPS)
+def test_under_overload_with_a_lost_or_late_hop_message_every_bound_is_reached_and_holds(
+    system,  # noqa: F811
+    hop,
+    extra,
+):
+    """Stage 1 slowed, five requests fill the 3 running slots and the queue of 2 while step 2
+    of one of them is lost or held past the step timeout, then a sixth is refused at once.
+    The queue and the steps in flight reach their bounds and never pass them; the requests
+    the fault did not hit give the fault-free tokens, and a lost one fails at its deadline."""
+    lose = Lose(extra=extra)
+    run, plain = faulty(system, hop, lose, delay1=0.05)
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(
+            run_all(run, 5, max_tokens=TOKENS, timeout_ms=round(OVERLOAD_S * 1000))[0]
+        )
+    )
+    first.start()
+    wait_for(lambda: len(run.gateway._waiting) == 2, "three running and two queued")
+    ((refused, took),) = run_all(run, 1, max_tokens=TOKENS, timeout_ms=5000)[0]
+    first.join(WAIT)
+    (out,) = results
+    assert refused == grpc.StatusCode.RESOURCE_EXHAUSTED and took < FAST
+    late = [took for got, took in out if got == grpc.StatusCode.DEADLINE_EXCEEDED]
+    done = [got for got, _ in out if isinstance(got, list)]
+    assert len(late) == (extra == DROP) and len(late) + len(done) == 5, out
+    assert all(got == plain for got in done)
+    assert all(OVERLOAD_S - 0.1 <= took < OVERLOAD_S + TOLERANCE for took in late)
+    assert len(lose.hit) == 1
+    assert run.gateway.queue_peak == 2 and run.gateway.in_flight_peak == 2
+    assert_bounds(run)
