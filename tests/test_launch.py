@@ -1,3 +1,4 @@
+import json
 import signal
 import subprocess
 import sys
@@ -7,7 +8,7 @@ import time
 import psutil
 import pytest
 
-from pllm import config, launch
+from pllm import config, launch, runrecord
 
 
 def test_threads_split_the_cores_between_this_laptops_stages():
@@ -211,6 +212,62 @@ def test_main_rejects_zero_threads(capsys):
     assert run_main(["smollm2-135m", "--threads", "0"]) == 2
 
 
+@pytest.fixture
+def launch_record(tmp_path, monkeypatch):
+    """Model files present and records in tmp_path; returns a reader for the launch record."""
+    model_dir = tmp_path / "models" / "smollm2-135m"
+    model_dir.mkdir(parents=True)
+    for name in launch.PINNED["smollm2-135m"].files:
+        (model_dir / name).touch()
+    monkeypatch.setattr(launch, "MODELS_DIR", tmp_path / "models")
+    monkeypatch.setattr(runrecord, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(launch.signal, "signal", lambda *_: None)  # keep pytest's handlers
+
+    def read():
+        (path,) = (tmp_path / "runs").glob("*-launch.json")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    return read
+
+
+def test_single_host_mode_runs_no_probe(launch_record, monkeypatch):
+    calls = []
+    monkeypatch.setattr(launch, "run", lambda *_: 0)
+    monkeypatch.setattr(launch.netcheck, "short_probe", lambda *a: calls.append(a))
+    launch.main(["smollm2-135m"])
+    assert calls == []
+    rec = launch_record()
+    assert rec["probe"] is None and rec["rtt_ms"] is None
+
+
+def test_the_other_laptops_roles_are_probed_and_recorded(launch_record, monkeypatch):
+    probed = []
+
+    def fake_probe(endpoints, stop):
+        probed.append(sorted(endpoints))
+        return {"roles": {}, "rtt_ms": 4.5}
+
+    monkeypatch.setattr(launch, "run", lambda *_: 0)
+    monkeypatch.setattr(launch.netcheck, "short_probe", fake_probe)
+    launch.main(["smollm2-135m", "--roles", "stage0"])
+    assert probed == [["gateway", "stage1"]]
+    rec = launch_record()
+    assert rec["rtt_ms"] == 4.5 and rec["probe"]["rtt_ms"] == 4.5
+
+
+def test_a_failed_run_stops_the_probe_and_still_records_it(launch_record, monkeypatch):
+    def fake_probe(endpoints, stop):
+        assert stop.wait(10)  # blocks until the launcher stops it
+        return {"roles": {"stage1": {"address": "x", "error": "refused"}}, "rtt_ms": None}
+
+    monkeypatch.setattr(launch, "run", lambda *_: 1)
+    monkeypatch.setattr(launch.netcheck, "short_probe", fake_probe)
+    assert run_main(["smollm2-135m", "--roles", "stage0", "gateway"]) == 1
+    rec = launch_record()
+    assert rec["status"] == "error"
+    assert rec["probe"]["roles"]["stage1"]["error"] == "refused"
+
+
 def test_the_hop_delay_control_goes_to_the_gateway_and_stage_1_only():
     roles = ["gateway", "stage0", "stage1"]
     out = launch.commands("smollm2-135m", roles, 3, hop_delay_control=True)
@@ -258,6 +315,7 @@ def test_main_passes_the_heartbeat_timeout_to_the_gateway(tmp_path, monkeypatch)
     monkeypatch.setattr(launch, "MODELS_DIR", tmp_path)
     monkeypatch.setattr(runrecord, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(launch.signal, "signal", lambda *_: None)  # keep pytest's handlers
+    monkeypatch.setattr(launch.netcheck, "short_probe", lambda *_: {"roles": {}, "rtt_ms": None})
     started = {}
     monkeypatch.setattr(launch, "run", lambda to_start, done: started.update(to_start) or 0)
     launch.main(["smollm2-135m", "--roles", "gateway", "stage1", "--heartbeat-timeout", "4"])
