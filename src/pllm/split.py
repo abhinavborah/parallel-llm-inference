@@ -22,6 +22,7 @@ single-process model can drive it too.
 """
 
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -86,6 +87,24 @@ def check_layer_range(config: ModelConfig, layer_start: int, layer_end: int) -> 
         raise ValueError(f"layers {layer_start} to {layer_end} outside 0 to {config.num_layers}")
 
 
+def _in_range(name: str, layer_start: int, layer_end: int) -> bool:
+    """Whether a checkpoint tensor belongs to layers layer_start to layer_end - 1."""
+    parts = name.split(".")
+    return parts[:2] == ["model", "layers"] and layer_start <= int(parts[2]) < layer_end
+
+
+def stage_weight_bytes(model_dir: str | Path, layer_start: int, layer_end: int) -> int:
+    """The fp32 bytes Stage.load holds for these layers with a mapped embedding, from the
+    shapes in the safetensors header; no tensor is read. The mapped embedding reads rows
+    with file reads, so it adds nothing here."""
+    total = 0
+    with safe_open(Path(model_dir) / "model.safetensors", framework="pt") as f:
+        for name in f.keys():
+            if _in_range(name, layer_start, layer_end):
+                total += math.prod(f.get_slice(name).get_shape()) * 4
+    return total
+
+
 class Stage(LayerStack):
     """Layers layer_start to layer_end - 1, with the embedding if first and the norm and
     LM head if last."""
@@ -136,11 +155,7 @@ class Stage(LayerStack):
         weights = {}
         with safe_open(model_dir / "model.safetensors", framework="pt") as f:
             for name in f.keys():
-                parts = name.split(".")
-                in_range = (
-                    parts[:2] == ["model", "layers"] and layer_start <= int(parts[2]) < layer_end
-                )
-                if name in wanted or in_range:
+                if name in wanted or _in_range(name, layer_start, layer_end):
                     weights[name] = f.get_tensor(name).to(torch.float32)
         embed = (
             MappedEmbedding(model_dir / "model.safetensors") if first and mapped_embedding else None

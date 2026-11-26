@@ -51,6 +51,19 @@ max_prompt_tokens = 512
 admission_queue = 8
 credits = 8
 stage_inbox = 16
+# Memory-aware admission (R5.3). Host B runs Stage 0 with a worker budget of 0.7 GiB peak RSS
+# for the whole process (R1.7, agreed 2026-11-25). The runtime is the RSS of a fresh process
+# after importing torch and the model code, measured on Host B (194 to 196 MiB, 2026-11-07 and
+# 2026-11-09). The margin is a proposed figure, not a measurement, kept inside the budget for
+# what runtime plus weights leave out: a serving Stage 0 for SmolLM2 read about 415 MiB idle,
+# about 16 MiB above them (a check on Host B on 2026-11-26, not a recorded run); one appended
+# layer (about 12 MiB at 8,192 positions); attention scores of a 512 token prefill (about
+# 18 MiB); gRPC message copies (a few MiB). The gateway subtracts the runtime, the margin and
+# the Stage 0 weights (computed from the model file) and admits a request only while the KV
+# caches it has admitted fit what is left.
+host_b_budget_gib = 0.7
+host_b_runtime_mib = 196
+host_b_margin_mib = 64
 
 # Split point k per model: stage 0 runs layers 0 to k - 1, stage 1 runs k to the last layer.
 # Always read from this committed file, never from a local copy, so both laptops use the

@@ -160,6 +160,40 @@ def flow_limits(path: str | Path | None = None) -> FlowLimits:
     return FlowLimits(**values)
 
 
+@dataclass(frozen=True)
+class HostBBudget:
+    worker_bytes: int  # peak RSS of the whole Stage 0 worker on Host B (R1.7)
+    runtime_bytes: int  # RSS of the Python and PyTorch runtime before any weights
+    margin_bytes: int  # kept inside the budget for what the runtime and weights leave out
+
+
+def host_b_budget(path: str | Path | None = None) -> HostBBudget:
+    """Host B's worker budget, runtime and margin from [limits] (R1.7, R5.3). Read from the
+    committed file, like the flow limits, so the agreed budget is the one every run uses."""
+    path = Path(path) if path is not None else DEFAULT_PATH
+    with open(path, "rb") as f:
+        limits = tomllib.load(f).get("limits", {})
+    values = []
+    keys = (
+        ("host_b_budget_gib", 2**30),
+        ("host_b_runtime_mib", 2**20),
+        ("host_b_margin_mib", 2**20),
+    )
+    for key, unit in keys:
+        value = limits.get(key)
+        # bool is a subclass of int, so rule it out explicitly
+        number = isinstance(value, int | float) and not isinstance(value, bool)
+        if not number or not 0 < value < float("inf"):
+            raise ValueError(f"{path}: [limits] needs a positive number for {key!r}")
+        values.append(int(value * unit))
+    if values[1] + values[2] >= values[0]:
+        raise ValueError(
+            f"{path}: [limits] host_b_runtime_mib plus host_b_margin_mib must be below "
+            "host_b_budget_gib"
+        )
+    return HostBBudget(*values)
+
+
 def _endpoint(data: dict, role: str, path: Path) -> Endpoint:
     section = data.get(role)
     if not isinstance(section, dict):

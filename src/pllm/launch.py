@@ -19,7 +19,7 @@ from collections.abc import Iterable, Sequence
 
 import psutil
 
-from pllm import config, faults, runrecord
+from pllm import config, faults, netcheck, runrecord
 from pllm.models import MODELS_DIR, PINNED
 
 log = logging.getLogger("pllm.launch")
@@ -49,12 +49,14 @@ def commands(
     hop_delay_control: bool = False,
     heartbeat_timeout: float | None = None,
     split_point: int | None = None,
+    no_kv_admission: bool = False,
 ) -> dict[str, list[str]]:
     """The command of each role in start order: the stages register with the gateway. With
     dashboard, the gateway also serves the live page. With hop_delay_control, the gateway
     and Stage 1 take the X4 hop delay from runs/hop_delay_ms (pllm.x4). heartbeat_timeout
     goes to the gateway, which checks its range. split_point, if given, goes to the
-    gateway and to every stage in place of the hosts file's (split sweeps)."""
+    gateway and to every stage in place of the hosts file's (split sweeps). no_kv_admission
+    turns the gateway's Host B KV admission off (R5.3)."""
     wanted = set(roles)
     out = {}
     for role in config.ROLES:
@@ -68,6 +70,8 @@ def commands(
                 out[role].append("--hop-delay-control")
             if heartbeat_timeout is not None:
                 out[role] += ["--heartbeat-timeout", str(heartbeat_timeout)]
+            if no_kv_admission:
+                out[role].append("--no-kv-admission")
         else:
             stage = role.removeprefix("stage")
             out[role] = [
@@ -178,6 +182,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         metavar="SECONDS",
         help="passed to the gateway: no Beat for this long declares a stage dead",
     )
+    parser.add_argument(
+        "--no-kv-admission",
+        action="store_true",
+        help="passed to the gateway: admit requests without checking Host B's KV budget",
+    )
     args = parser.parse_args(argv)
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
@@ -187,6 +196,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--dashboard needs the gateway role on this laptop")
     if args.heartbeat_timeout is not None and "gateway" not in args.roles:
         parser.error("--heartbeat-timeout needs the gateway role on this laptop")
+    if args.no_kv_admission and "gateway" not in args.roles:
+        parser.error("--no-kv-admission needs the gateway role on this laptop")
     if args.heartbeat_timeout is not None and not 0 < args.heartbeat_timeout < float("inf"):
         parser.error("--heartbeat-timeout must be a positive number of seconds")
     try:
@@ -246,6 +257,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         if power is not None and not power["plugged_in"]:
             log.warning("on battery: use the same power state for every run")
         rec["heartbeat_timeout_s"] = args.heartbeat_timeout
+        # Preset, so the record's keys do not change while the probe thread fills them.
+        rec["probe"] = None
+        other = {r: getattr(hosts, r) for r in config.ROLES if r not in args.roles}
+        prober = threading.Thread(target=_probe_other_laptop, args=(rec, other, done))
+        if other:
+            prober.start()
         to_start = commands(
             args.model,
             args.roles,
@@ -254,10 +271,27 @@ def main(argv: Sequence[str] | None = None) -> None:
             hop_delay_control=args.hop_delay_control,
             heartbeat_timeout=args.heartbeat_timeout,
             split_point=args.split_point,
+            no_kv_admission=args.no_kv_admission,
         )
-        code = run(to_start, done)
+        try:
+            code = run(to_start, done)
+        finally:
+            done.set()
+            if other:
+                prober.join()
         if code:
             raise SystemExit(code)
+
+
+def _probe_other_laptop(rec: dict, endpoints: dict, done: threading.Event) -> None:
+    """Record a short round trip to the other laptop's ports once they answer."""
+    result = netcheck.short_probe(endpoints, done)
+    for role, r in result["roles"].items():
+        if "error" in r:
+            log.warning("no round trip to %s at %s: %s", role, r["address"], r["error"])
+        else:
+            log.info("round trip to %s at %s: median %.2f ms", role, r["address"], r["median_ms"])
+    rec["probe"], rec["rtt_ms"] = result, result["rtt_ms"]
 
 
 if __name__ == "__main__":
