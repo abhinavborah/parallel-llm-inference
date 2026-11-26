@@ -6,10 +6,11 @@ import pytest
 from test_model import tiny_reference
 
 from pllm import (
+    capacity,
     config,
     launch,
 )
-from pllm.capacity import HostCapacity
+from pllm.capacity import HostCapacity, NoSplit, choose_split, sweep_points
 from pllm.control import ExpectedModel
 from pllm.models import PINNED
 from pllm.supervisor import worker_command
@@ -42,6 +43,116 @@ def host(**kwargs) -> HostCapacity:
         "seconds_per_layer": 1.0,
     }
     return HostCapacity(**{**values, **kwargs})
+
+
+# -------------------------------------------------------------- the split function
+
+
+def test_a_slower_host_b_gets_fewer_layers_than_an_even_split_by_speed():
+    split = choose_split(30, host(seconds_per_layer=2.0), host())
+    assert split.k == 10 and split.even_k == 15 and split.k < split.even_k
+    assert split.host_b_step_seconds == split.host_a_step_seconds == 20
+    assert split.unconstrained_k == 10 and not split.forced_below_even
+    assert split.allowed == tuple(range(1, 15))
+
+
+def test_the_fixed_time_of_a_stage_moves_the_balance():
+    # Host A's norm and head cost 7 time units, so it takes fewer layers than 2 to 1 would
+    split = choose_split(30, host(seconds_per_layer=2.0), host(fixed_seconds=7.0))
+    assert split.k == 12  # max(24, 25) beats max(22, 26) and max(26, 24)
+
+
+def test_host_b_memory_limits_k_and_a_need_equal_to_the_free_memory_fits():
+    slow_a = host(seconds_per_layer=5.0)
+    exact = choose_split(30, host(free_bytes=100 + 7 * 10), slow_a)
+    assert exact.k == 7 and exact.host_b_bytes == 170
+    assert choose_split(30, host(free_bytes=100 + 7 * 10 - 1), slow_a).k == 6
+
+
+def test_host_a_memory_pushes_layers_to_host_b():
+    # Host A holds at most 18 layers, so k is at least 12 although speed would choose 3
+    split = choose_split(30, host(seconds_per_layer=9.0), host(free_bytes=100 + 18 * 10))
+    assert split.k == 12 and split.allowed == (12, 13, 14)
+
+
+@pytest.mark.parametrize("b_seconds", [1.0, 0.25])
+def test_a_choice_that_only_the_even_rule_made_says_so(b_seconds):
+    split = choose_split(30, host(seconds_per_layer=b_seconds), host())
+    assert split.k == 14 and split.forced_below_even
+    assert split.unconstrained_k >= 15
+
+
+def test_on_a_tie_the_smaller_k_wins():
+    # n = 5: k = 1 gives max(1, 2) and k = 2 gives max(2, 1.5)
+    split = choose_split(5, host(), host(seconds_per_layer=0.5))
+    assert split.k == 1
+
+
+def test_the_smallest_model_that_can_have_a_split_below_even():
+    assert choose_split(3, host(), host()).k == 1
+    with pytest.raises(NoSplit, match="no split below an even one"):
+        choose_split(2, host(), host())
+
+
+@pytest.mark.parametrize(
+    "host_b, host_a, reason",
+    [
+        (host(free_bytes=109), host(), "Host B cannot hold one layer"),
+        (host(), host(free_bytes=100 + 15 * 10), "Host A cannot hold the 16 layers"),
+        (host(free_bytes=0), host(free_bytes=0), "Host B cannot hold one layer"),
+        # each fits something, but no k fits both
+        (host(free_bytes=100 + 5 * 10), host(free_bytes=100 + 18 * 10), "both hosts at the same"),
+    ],
+)
+def test_no_split_is_returned_when_the_constraints_cannot_be_met(host_b, host_a, reason):
+    with pytest.raises(NoSplit, match=reason):
+        choose_split(30, host_b, host_a)
+
+
+@pytest.mark.parametrize("layers", [1, 0, -3, 2.5, True, None])
+def test_a_bad_layer_count_is_refused(layers):
+    with pytest.raises(ValueError, match="num_layers"):
+        choose_split(layers, host(), host())
+
+
+@pytest.mark.parametrize("name", list(vars(host())))
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, "3"])
+def test_a_missing_or_unusable_measurement_is_refused(name, value):
+    with pytest.raises(ValueError, match=name):
+        host(**{name: value})
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"free_bytes": -1},
+        {"fixed_bytes": -1},
+        {"bytes_per_layer": 0},
+        {"seconds_per_layer": 0.0},
+        {"seconds_per_layer": -1.0},
+    ],
+)
+def test_a_measurement_out_of_range_is_refused(bad):
+    with pytest.raises(ValueError):
+        host(**bad)
+
+
+def test_a_fit_that_predicts_no_time_is_refused():
+    with pytest.raises(ValueError, match="not positive"):
+        choose_split(30, host(fixed_seconds=-1.0), host())
+
+
+def test_the_even_split_is_half_the_layers():
+    assert [capacity.even_split(n) for n in (3, 4, 30)] == [1, 2, 15]
+
+
+def test_the_sweep_goes_from_even_to_the_chosen_split():
+    assert sweep_points(15, 6) == [15, 12, 9, 6]
+    assert sweep_points(15, 14) == [15, 14]
+    assert sweep_points(15, 5, points=2) == [15, 5]
+    for even, chosen, points in ((15, 15, 4), (15, 16, 4), (15, 0, 4), (15, 6, 1)):
+        with pytest.raises(ValueError):
+            sweep_points(even, chosen, points)
 
 
 # -------------------------------------------------------------- one k for both laptops
