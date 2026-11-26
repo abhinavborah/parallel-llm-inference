@@ -680,6 +680,12 @@ uv run python -m pllm.launch smollm2-135m --roles gateway stage1 --admission-que
 uv run python -m pllm.launch smollm2-135m --roles stage0
 ```
 
+On both laptops the hosts file named by `PLLM_CONFIG` needs `[supervisor0]` set to the
+Windows laptop's address on the network in use. A copy of `config/hosts.toml` keeps
+`127.0.0.1` there: Stage 0's supervisor then listens only on its own laptop, every memory
+sample from the other one fails, and the run does not pass. Delete the table to use Stage
+0's address, or set it. The supervisor's port (50061) must be reachable.
+
 The settings are the bound on and off, `--admission-queue 8` and `--admission-queue off`,
 both with `--credits 8`, then the bound on with `--credits` 1, 2 and 4.
 
@@ -699,8 +705,10 @@ uv run python -m pllm.x7 report runs/<first>-x7.jsonl runs/<second>-x7.jsonl --o
   table, if there is one, must name an address of the Windows laptop that this laptop can
   reach. The peak is compared with `--budget-mib` (default 716.8, the 0.7 GiB worker budget
   of R1.7): the worker's lifetime peak, which includes loading the model, or the largest
-  sample where there is no lifetime peak. With no supervisor reachable, memory is reported
-  as unknown, which is neither within the budget nor over it.
+  sample where there is no lifetime peak (`peak_source` says which; samples can miss a
+  spike between two of them). A reading over the budget is over it. Otherwise memory is
+  unknown when nothing could be read, when the reading taken after the load failed, or
+  when the worker was restarted during the load.
 - Each run writes a `.jsonl` file next to its run record in `runs/`: the setting, the
   admission queue's depth over time, and one result with the counts of completed, refused
   (RESOURCE_EXHAUSTED), late (DEADLINE_EXCEEDED) and otherwise failed requests, p50, p95
@@ -709,10 +717,15 @@ uv run python -m pllm.x7 report runs/<first>-x7.jsonl runs/<second>-x7.jsonl --o
   read them beside the refused count.
 - A run passes (exit code 0) when every offered request has its line, the load was above
   capacity (the offered rate was more than 1.1 times the completion rate, and at least one
-  request had to wait or was refused), the admission queue and the steps in flight stayed
-  within their bounds, and the worker was not over the budget.
-- `report` writes `table.md`, one row per setting, and `queue_depth.png`. It refuses runs
-  that were offered different loads.
+  request of this run had to wait or was refused), the admission queue and the steps in
+  flight stayed within their bounds, no beat showed a stage inbox over `stage_inbox`, and
+  the worker was read as within the budget. Unknown memory does not pass. `failures` in
+  the result says why a run did not. A beat adds up the inboxes of a stage's open streams,
+  one in a run with no fault, and samples them every 0.5 s.
+- `report` writes `table.md`, one row per setting, and `queue_depth.png`. For each run
+  with the bound on it says whether the end-to-end p99 is below that of the bound-off run
+  with the same credits, with the refused count beside it; a setting with no bound-off run
+  is not compared. It refuses runs that were offered different loads.
 
 ## Starting the system
 

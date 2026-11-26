@@ -347,8 +347,9 @@ def test_the_control_port_applies_kill_suspend_and_resume(tmp_path, running):
         assert call(port, "GET", "/status")[1]["free_ram_bytes"] > 0  # for the dashboard
         memory = call(port, "GET", "/status")[1]
         assert memory["worker_rss_bytes"] > 0  # the worker's own, for the Host B budget
-        if sys.platform == "win32":
-            assert memory["worker_peak_rss_bytes"] > 0
+        if sys.platform == "win32":  # the Host B budget is read from this lifetime peak
+            assert memory["worker_peak_rss_bytes"] is not None
+            assert memory["worker_peak_rss_bytes"] >= memory["worker_rss_bytes"]
         else:
             assert memory["worker_peak_rss_bytes"] is None
         assert call(port, "POST", "/suspend") == (

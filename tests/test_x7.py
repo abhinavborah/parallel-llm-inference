@@ -9,13 +9,16 @@ import io
 import json
 import threading
 import time
+import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from test_gateway import PROMPT, WAIT, System
+from test_gateway import DIGEST, PROMPT, WAIT, System, Words
 from test_model import tiny_reference
 
 from pllm import gateway, metrics, report, supervisor, x7
 from pllm.config import FlowLimits
+from pllm.control import ExpectedModel
 from pllm.proto import protocol_pb2
 
 LAYERS = 4
@@ -264,7 +267,7 @@ def test_a_beat_line_keeps_the_stage_inbox_depth(tmp_path):
 
 # ------------------------------------------------------------------ what passes
 
-SETTINGS = {"admission_queue": 2, "credits": 1}
+SETTINGS = {"admission_queue": 2, "credits": 1, "stage_inbox": 16}
 WITHIN = {"within_budget": True}
 
 
@@ -307,7 +310,13 @@ def test_a_run_passes_only_with_every_line_overload_held_bounds_and_memory_not_o
     assert analysed([*requests, depth()], offered=11)["passed"] is False  # a line is missing
     assert analysed(requests)["passed"] is False  # no depth lines: the bounds are unproven
     assert analysed([*requests, depth()], memory={"within_budget": False})["passed"] is False
-    assert analysed([*requests, depth()], memory={"within_budget": None})["passed"] is True
+    unknown = analysed([*requests, depth()], memory={"within_budget": None})
+    assert unknown["passed"] is False  # the budget criterion cannot be met without a reading
+    assert any("memory is unknown" in why for why in unknown["failures"])
+    assert good["failures"] == []
+    # nothing waited in this run: a peak left by an earlier run on the gateway does not count
+    stale = analysed([*requests, depth(queued=0, peak=2)])
+    assert stale["overloaded"] is False and stale["passed"] is False
     slow = [  # answered faster than they arrive: not an overload
         {
             **request(i),
@@ -343,6 +352,36 @@ def test_refused_and_failed_requests_are_counted_beside_the_latencies():
     assert result["latency"]["e2e"]["p99_ms"] == pytest.approx(report.percentile([1010.0] * 6, 99))
 
 
+def beat(stage, inbox):
+    return {
+        "type": "beat",
+        "t_ns": 5,
+        "stage": stage,
+        "epoch": 1,
+        "busy_ns": 0,
+        "steps": 0,
+        "inbox_depth": inbox,
+    }
+
+
+def test_a_stage_inbox_over_its_bound_fails_the_run():
+    rows = [*(request(i) for i in range(10)), depth()]
+    within = analysed([*rows, beat(0, 1), beat(1, 16)])
+    assert within["stage_inbox_held"] is True and within["passed"] is True
+    over = analysed([*rows, beat(0, 1), beat(1, 17)])
+    assert over["stage_inbox_held"] is False and over["passed"] is False
+    assert "a stage inbox went over its bound" in over["failures"]
+    assert analysed(rows)["stage_inbox_held"] is None  # no beat to judge by
+
+
+def test_a_cancelled_request_is_not_counted_as_ok():
+    cancelled = {**request(1, "RESOURCE_EXHAUSTED"), "outcome": "cancelled by the client"}
+    cancelled["code"] = None
+    result = analysed([request(0), cancelled, depth()], offered=2)
+    assert result["codes"] == {"OK": 1, "cancelled by the client": 1}
+    assert (result["completed"], result["other_failed"]) == (1, 1)
+
+
 # ------------------------------------------------------------------ Stage 0's memory
 
 
@@ -350,19 +389,81 @@ def sampled(address, budget=700.0):
     sampler = x7.MemorySampler(address, interval=0.02)
     with sampler:
         time.sleep(0.15)
+    sampler.sample()  # as run_load does after the load
     return sampler.result(budget)
+
+
+class Counting(FakeSupervisor):
+    """A supervisor whose restart count rises after the first reading."""
+
+    reads = 0
+
+    def status(self):
+        self.reads += 1
+        return {**super().status(), "restarts": 0 if self.reads == 1 else 1}
+
+
+@pytest.mark.parametrize("seen_by", ["a new pid", "the supervisor's restart count"])
+def test_a_restarted_worker_leaves_the_budget_unknown(serving, seen_by):
+    """The dead process's peak is lost, so a small new worker proves nothing."""
+    fake = FakeSupervisor(pids=[1, 2]) if seen_by == "a new pid" else Counting()
+    result = sampled(serving(fake))
+    assert result["worker_restarts_seen"] == 1 and result["within_budget"] is None
+
+
+def test_a_restart_does_not_hide_a_reading_over_the_budget(serving):
+    result = sampled(serving(FakeSupervisor(peak=710 * MIB, pids=[1, 2])))
+    assert result["within_budget"] is False
+
+
+def test_a_failed_last_reading_leaves_the_budget_unknown(serving):
+    fake = FakeSupervisor()
+    sampler = x7.MemorySampler(serving(fake), interval=0.02)
+    sampler.sample()
+    assert sampler.result(700.0)["within_budget"] is True
+    fake.rss = None  # the worker is gone when the load ends
+    sampler.sample()
+    result = sampler.result(700.0)
+    assert result["samples"] == 1 and result["last_sample_read"] is False
+    assert result["within_budget"] is None
+
+
+def test_a_reply_cut_short_is_a_failed_sample_not_the_end_of_the_sampler():
+    class Cut(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b'{"wo')
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Cut)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        sampler = x7.MemorySampler(f"127.0.0.1:{server.server_address[1]}", interval=0.02)
+        sampler.sample()  # raises nothing
+        with sampler:
+            time.sleep(0.2)
+            assert sampler._thread.is_alive()
+        assert sampler.failures >= 2 and sampler.samples == 0
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_the_lifetime_peak_is_read_against_the_budget(serving):
     result = sampled(serving(FakeSupervisor(rss=500 * MIB, peak=710 * MIB)))
     assert result["samples"] > 0 and result["peak_mib"] == 710
+    assert result["peak_source"] == "lifetime"
     assert result["within_budget"] is False
     assert sampled(serving(FakeSupervisor(rss=500 * MIB, peak=690 * MIB)))["within_budget"]
 
 
 def test_without_a_lifetime_peak_the_largest_sample_is_used(serving):
     result = sampled(serving(FakeSupervisor(rss=650 * MIB, peak=None)))
-    assert result["lifetime_peak_bytes"] is None
+    assert result["lifetime_peak_bytes"] is None and result["peak_source"] == "samples"
     assert result["peak_mib"] == 650 and result["within_budget"] is True
 
 
@@ -430,7 +531,8 @@ def test_the_report_tables_bounds_on_first_and_plots_the_depth(tmp_path):
         result_file(tmp_path, "c1", 8, 1),
     ]
     lines = x7.write_report(files, tmp_path / "out")
-    assert [line.split("|")[1:3] for line in lines[2:]] == [
+    rows = [line for line in lines if line.startswith("|")][2:]
+    assert [line.split("|")[1:3] for line in rows] == [
         [" 8 ", " 1 "],
         [" 8 ", " 8 "],
         [" off ", " 8 "],
@@ -438,6 +540,72 @@ def test_the_report_tables_bounds_on_first_and_plots_the_depth(tmp_path):
     written = (tmp_path / "out" / "table.md").read_text(encoding="utf-8")
     assert "completed requests only" in written and "rate 5.0" in written
     assert (tmp_path / "out" / "queue_depth.png").stat().st_size > 1000
+
+
+def test_the_report_says_per_credit_limit_whether_the_bound_keeps_p99_down(tmp_path):
+    def with_p99(name, queue, credits, p99):
+        path = result_file(tmp_path, name, queue, credits)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[-1]["latency"]["e2e"]["p99_ms"] = p99
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return path
+
+    files = [
+        with_p99("on8", 8, 8, 100.0),
+        with_p99("off8", None, 8, 300.0),
+        with_p99("on2", 8, 2, 900.0),
+        with_p99("off2", None, 2, 400.0),
+        with_p99("on1", 8, 1, 50.0),
+    ]
+    lines = x7.write_report(files, tmp_path / "out")
+    found = {line.split(":")[0]: line for line in lines if line.startswith("- ")}
+    assert "is below the bound-off 300.00 ms" in found["- queue 8, credits 8"]
+    assert "is NOT below the bound-off 400.00 ms" in found["- queue 8, credits 2"]
+    assert "not compared" in found["- queue 8, credits 1"]
+    written = (tmp_path / "out" / "table.md").read_text(encoding="utf-8")
+    assert all(line in written for line in found.values())
+
+
+@pytest.mark.parametrize(
+    ("flags", "queue", "credits"),
+    [([], 8, 8), (["--admission-queue", "off", "--credits", "2"], None, 2)],
+)
+def test_the_gateway_command_applies_the_flags_and_records_them(
+    tmp_path, monkeypatch, flags, queue, credits
+):
+    """gateway.main itself, with only the model files and the serving stood in for."""
+    seen = {}
+    monkeypatch.setattr(gateway, "expected_model", lambda *a: ExpectedModel(DIGEST, 30, 15))
+    shape = types.SimpleNamespace(hidden_size=64)
+    monkeypatch.setattr(gateway.ModelConfig, "from_file", lambda *a: shape)
+    monkeypatch.setattr(gateway, "Tokenizer", lambda *a: Words())
+    monkeypatch.setattr(gateway, "eos_ids", lambda *a: [])
+    monkeypatch.setattr(gateway, "max_positions", lambda *a: None)
+    monkeypatch.setattr(gateway, "stop_event", threading.Event)
+    monkeypatch.setattr(gateway, "serve", lambda built, *a: (None, 0))
+
+    def stopped(built, *args):
+        seen["gateway"] = built
+        built.recorder.finish()
+
+    monkeypatch.setattr(gateway, "run_until_stopped", stopped)
+    path = tmp_path / "m.jsonl"
+    gateway.main(["smollm2-135m", "--metrics", str(path), *flags])
+    settings = x7.gateway_settings(path)
+    assert (settings["admission_queue"], settings["credits"]) == (queue, credits)
+    assert settings["stage_inbox"] == 16 and settings["max_running"] == gateway.MAX_RUNNING
+    assert seen["gateway"].credits == credits
+    assert seen["gateway"].max_queued == (gateway.UNBOUNDED_QUEUE if queue is None else queue)
+
+
+def test_the_gateway_command_refuses_credits_above_the_stage_inbox(monkeypatch, capsys):
+    monkeypatch.setattr(gateway, "expected_model", lambda *a: ExpectedModel(DIGEST, 30, 15))
+    shape = types.SimpleNamespace(hidden_size=64)
+    monkeypatch.setattr(gateway.ModelConfig, "from_file", lambda *a: shape)
+    monkeypatch.setattr(gateway, "Tokenizer", lambda *a: Words())
+    with pytest.raises(SystemExit):
+        gateway.main(["smollm2-135m", "--credits", "17"])
+    assert "stage_inbox" in capsys.readouterr().err
 
 
 def test_runs_offered_different_loads_are_not_compared(tmp_path):

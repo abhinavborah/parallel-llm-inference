@@ -17,9 +17,11 @@ rate, count, prompts and token limit.
 
 Stage 0's memory is read from its laptop's supervisor while the load runs, and compared
 with the budget (R1.7). A run passes when every offered request has its line, the load was
-above capacity, the queue and the steps in flight stayed within their bounds, and the
-worker did not go over the budget. A run whose memory could not be read says so, and does
-not count as within the budget or over it.
+above capacity, the queue, the steps in flight and the stage inboxes stayed within their
+bounds, and the worker was read as within the budget; the result lists why a run did not
+pass. Memory that could not be read, or whose worker was restarted, is unknown, and a run
+with unknown memory does not pass. Whether the bound keeps p99 down needs two runs, so
+the report states it, per credit limit.
 
 Start a fresh gateway for each setting: the peaks it reports are kept since it started.
 
@@ -30,6 +32,7 @@ uv run python -m pllm.x7 report runs/*-x7.jsonl --out runs/x7-report
 """
 
 import argparse
+import http.client
 import json
 import math
 import random
@@ -133,22 +136,29 @@ class MemorySampler:
         self.rss_max: int | None = None  # the largest resident set sampled in the load
         self.peak: int | None = None  # the worker's own lifetime peak, where reported
         self.pids: set[int] = set()  # more than one: the worker was restarted
+        self.restart_counts: list[int] = []  # the supervisor's count, first and latest
+        self.last_read = False  # whether the latest sample got a reading
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="x7-memory", daemon=True)
 
     def sample(self) -> None:
+        self.last_read = False
         try:
             with urllib.request.urlopen(self.url, timeout=2) as reply:
                 status = json.load(reply)
             rss = status["worker_rss_bytes"]
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
             self.failures += 1
             return
         if rss is None:  # no worker at this moment, or it could not be read
             self.failures += 1
             return
         self.samples += 1
+        self.last_read = True
         self.pids.add(status.get("pid"))
+        restarts = status.get("restarts")
+        if restarts is not None:
+            self.restart_counts = [*(self.restart_counts or [restarts])[:1], restarts]
         self.rss_max = max(rss, self.rss_max or 0)
         peak = status.get("worker_peak_rss_bytes")
         if peak is not None:
@@ -169,18 +179,29 @@ class MemorySampler:
 
     def result(self, budget_mib: float) -> dict:
         """The memory fields of a result. The peak is the worker's lifetime peak where the
-        system reports it (it includes loading the model), else the largest sample."""
+        system reports it (it includes loading the model), else the largest sample;
+        peak_source says which. A reading over the budget is over it whatever else
+        happened. Otherwise the answer is unknown if the worker was restarted, since a
+        dead process's peak is lost, or if the last sample, taken after the load, failed."""
         values = [v for v in (self.peak, self.rss_max) if v is not None]
         worst = max(values) if values else None
+        counted = self.restart_counts[-1] - self.restart_counts[0] if self.restart_counts else 0
+        restarts = max(len(self.pids) - 1, counted, 0)
+        within = None if worst is None else worst <= budget_mib * MIB
+        if within and (restarts or not self.last_read):
+            within = None
+        source = "lifetime" if self.peak is not None else "samples" if values else None
         return {
             "samples": self.samples,
             "failed_samples": self.failures,
-            "worker_restarts_seen": max(0, len(self.pids) - 1),
+            "last_sample_read": self.last_read,
+            "worker_restarts_seen": restarts,
             "rss_max_bytes": self.rss_max,
             "lifetime_peak_bytes": self.peak,
             "budget_mib": budget_mib,
             "peak_mib": None if worst is None else worst / MIB,
-            "within_budget": None if worst is None else worst <= budget_mib * MIB,
+            "peak_source": source,
+            "within_budget": within,
         }
 
 
@@ -259,8 +280,10 @@ def analyse(rows: list[dict], run: report.Run, settings: dict, offered: int, mem
     """The result of one run, from the lines the gateway wrote during it."""
     done = report.completed(run)
     codes: dict[str, int] = {}
-    for r in run.requests:
-        codes[r.get("code") or "OK"] = codes.get(r.get("code") or "OK", 0) + 1
+    for r in run.requests:  # a request the gateway set no status for: how it ended
+        outcome = r.get("outcome")
+        code = r.get("code") or ("OK" if outcome in report.COMPLETED else outcome)
+        codes[code] = codes.get(code, 0) + 1
     arrived = sorted(r["arrived_ns"] for r in run.requests if r.get("arrived_ns") is not None)
     span = report.window(run)
     offered_rps = completed_rps = None
@@ -281,12 +304,16 @@ def analyse(rows: list[dict], run: report.Run, settings: dict, offered: int, mem
     for stage in report.STAGES:
         seen = [b["inbox_depth"] for b in run.beats if b["stage"] == stage and "inbox_depth" in b]
         inbox[str(stage)] = max(seen, default=None)
+    beats_inbox = [v for v in inbox.values() if v is not None]
+    # A beat adds up the inboxes of every open stream; a run with no fault has one a stage
+    inbox_ok = None if not beats_inbox else max(beats_inbox) <= settings["stage_inbox"]
     bound = settings["admission_queue"]
     queue_ok = None if bound is None or queue_peak is None else queue_peak <= bound
     credits_ok = None if in_flight_peak is None else in_flight_peak <= settings["credits"]
     # The rates alone could mislead: the completion window ends with the last request's whole
     # service time, so a short run of slow requests looks behind even when none ever waited.
-    backed_up = codes.get("RESOURCE_EXHAUSTED", 0) > 0 or (queue_peak or 0) > 0
+    # queued_max is from this run's lines; queue_peak counts from the gateway's start.
+    backed_up = codes.get("RESOURCE_EXHAUSTED", 0) > 0 or (queued_max or 0) > 0
     overloaded = (
         backed_up
         and offered_rps is not None
@@ -315,15 +342,23 @@ def analyse(rows: list[dict], run: report.Run, settings: dict, offered: int, mem
         "stage_inbox_max": inbox,
         "admission_bound_held": queue_ok,
         "credit_bound_held": credits_ok,
+        "stage_inbox_held": inbox_ok,
         "memory": memory,
     }
-    result["passed"] = (
-        len(run.requests) == offered
-        and overloaded
-        and queue_ok is not False
-        and credits_ok is True
-        and memory["within_budget"] is not False
+    checks = (
+        (len(run.requests) != offered, "not every offered request has its line"),
+        (not overloaded, "the load was not above capacity"),
+        (queue_ok is False, "the admission queue went over its bound"),
+        (credits_ok is not True, "the steps in flight are not shown to be within the credits"),
+        (inbox_ok is False, "a stage inbox went over its bound"),
+        (memory["within_budget"] is False, "Stage 0's worker went over the memory budget"),
+        (
+            memory["within_budget"] is None,
+            "Stage 0's memory is unknown: no reading, a failed last reading or a restart",
+        ),
     )
+    result["failures"] = [reason for failed, reason in checks if failed]
+    result["passed"] = not result["failures"]
     return result
 
 
@@ -372,6 +407,7 @@ COLUMNS = (
     "queue peak",
     "in flight peak",
     "Stage 0 peak MiB",
+    "peak from",
     "within budget",
     "passed",
 )
@@ -403,10 +439,36 @@ def table(loaded: list) -> list[str]:
             r["queue_peak"],
             r["in_flight_peak"],
             r["memory"]["peak_mib"],
+            r["memory"].get("peak_source"),
             r["memory"]["within_budget"],
             r["passed"],
         ]
         lines.append("| " + " | ".join(show(c) for c in cells) + " |")
+    return lines
+
+
+def p99_comparison(loaded: list) -> list[str]:
+    """For each run with the bound on: whether its end-to-end p99 is below that of the run
+    with the bound off at the same credit limit (R7.14). Percentiles are of completed
+    requests, so the refused count belongs beside the answer."""
+    runs = ordered(loaded)
+    off = {s["credits"]: r for s, r, _ in runs if s["admission_queue"] is None}
+    lines = []
+    for setting, result, _ in runs:
+        if setting["admission_queue"] is None:
+            continue
+        name = label(setting)
+        other = off.get(setting["credits"])
+        mine = result["latency"]["e2e"]["p99_ms"]
+        theirs = None if other is None else other["latency"]["e2e"]["p99_ms"]
+        if mine is None or theirs is None:
+            lines.append(f"- {name}: not compared, no bound-off p99 at these credits")
+            continue
+        verdict = "below" if mine < theirs else "NOT below"
+        lines.append(
+            f"- {name}: end-to-end p99 {mine:.2f} ms is {verdict} the bound-off "
+            f"{theirs:.2f} ms ({result['rejected']} of {result['offered']} refused)"
+        )
     return lines
 
 
@@ -433,6 +495,7 @@ def plot_depth(loaded: list, path: Path) -> None:
 def write_report(files: list[Path], folder: Path) -> list[str]:
     loaded = [read_result(path) for path in files]
     lines = table(loaded)
+    compared = p99_comparison(loaded)
     folder.mkdir(parents=True, exist_ok=True)
     first = loaded[0][0]
     text = [
@@ -444,10 +507,14 @@ def write_report(files: list[Path], folder: Path) -> list[str]:
         "",
         *lines,
         "",
+        "## p99 with the bound on against the bound off",
+        "",
+        *compared,
+        "",
     ]
     (folder / "table.md").write_text("\n".join(text), encoding="utf-8", newline="\n")
     plot_depth(loaded, folder / "queue_depth.png")
-    return lines
+    return [*lines, "", *compared]
 
 
 # ------------------------------------------------------------------ command line
@@ -526,7 +593,7 @@ def run_load(call, metrics_path: Path, args, memory_address: str, out) -> dict:
     schedule = arrivals(args.rate, args.requests, args.seed)
     with MemorySampler(memory_address) as sampler:
         outcomes, latest = offer(sender(call), schedule)
-        sampler.sample()  # the lifetime peak after the last step
+    sampler.sample()  # after the load and the polling: the lifetime peak after the last step
     rows = wait_for_requests(metrics_path, offset, args.requests)
     run = run_of(metrics_path, rows)
     result = analyse(rows, run, settings, args.requests, sampler.result(args.budget_mib))
