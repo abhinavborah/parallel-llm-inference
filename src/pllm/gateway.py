@@ -1416,6 +1416,12 @@ def main(argv: list[str] | None = None) -> None:
         help=f"record a step with no result after this long (default {STEP_TIMEOUT_SECONDS})",
     )
     args = parser.parse_args(argv)
+    if args.heartbeat_timeout >= wire.KEEPALIVE_TIMEOUT_SECONDS:
+        # a longer stall would break the stream by keepalive first and declare at once
+        parser.error(
+            f"--heartbeat-timeout must be below the keepalive timeout "
+            f"({wire.KEEPALIVE_TIMEOUT_SECONDS} s)"
+        )
     model_dir = MODELS_DIR / args.model
     try:
         hosts = config.load()

@@ -45,11 +45,12 @@ def commands(
     roles: Iterable[str],
     threads: int,
     dashboard: bool = False,
+    heartbeat_timeout: float | None = None,
     gateway_args: Sequence[str] = (),
 ) -> dict[str, list[str]]:
     """The command of each role in start order: the stages register with the gateway. With
-    dashboard, the gateway also serves the live page. gateway_args are added to the
-    gateway's command."""
+    dashboard, the gateway also serves the live page; heartbeat_timeout goes to the
+    gateway, which checks its range. gateway_args are added to the gateway's command."""
     wanted = set(roles)
     out = {}
     for role in config.ROLES:
@@ -59,6 +60,8 @@ def commands(
             out[role] = [sys.executable, "-m", "pllm.gateway", model]
             if dashboard:
                 out[role].append("--dashboard")
+            if heartbeat_timeout is not None:
+                out[role] += ["--heartbeat-timeout", str(heartbeat_timeout)]
             out[role] += gateway_args
         else:
             stage = role.removeprefix("stage")
@@ -151,11 +154,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         action="store_true",
         help="the gateway also serves the live dashboard (it can kill and freeze workers)",
     )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="passed to the gateway: no Beat for this long declares a stage dead",
+    )
     args = parser.parse_args(argv)
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
     if args.dashboard and "gateway" not in args.roles:
         parser.error("--dashboard needs the gateway role on this laptop")
+    if args.heartbeat_timeout is not None and "gateway" not in args.roles:
+        parser.error("--heartbeat-timeout needs the gateway role on this laptop")
+    if args.heartbeat_timeout is not None and not 0 < args.heartbeat_timeout < float("inf"):
+        parser.error("--heartbeat-timeout must be a positive number of seconds")
     gateway_args = []  # the gateway checks the values
     if args.admission_queue is not None:
         gateway_args += ["--admission-queue", args.admission_queue]
@@ -205,7 +218,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if power is not None and not power["plugged_in"]:
             log.warning("on battery: use the same power state for every run")
-        code = run(commands(args.model, args.roles, threads, args.dashboard, gateway_args), done)
+        rec["heartbeat_timeout_s"] = args.heartbeat_timeout
+        to_start = commands(
+            args.model,
+            args.roles,
+            threads,
+            args.dashboard,
+            heartbeat_timeout=args.heartbeat_timeout,
+            gateway_args=gateway_args,
+        )
+        code = run(to_start, done)
         if code:
             raise SystemExit(code)
 

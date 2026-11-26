@@ -669,12 +669,63 @@ The two default timeouts are provisional: the beat gaps behind the 2.0 s value w
 on one laptop only. A laptop that pauses longer, for example while paging, needs a larger
 `--heartbeat-timeout`. The `run` line of the metrics file records the values in use.
 
+Every gRPC server and every channel between the processes (registration, heartbeat, the
+gateway's stream to Stage 0 and the stream between the stages) sets keepalive
+(`pllm.wire.channel_options`): each end pings after 2 s with no traffic and closes the
+connection when the ack is 8 s late. The client's and the dashboard's channels to the
+gateway do not, so run them on the gateway's laptop. A link that goes silent without a TCP
+reset, such as a Wi-Fi stall or a laptop that left the network, breaks every keepalive
+stream on it within 10 s instead of when the operating system gives up. The
+stage's heartbeat then opens a new stream, and the gateway's stream to Stage 0 and the
+stream between the stages fail instead of hanging. A stall shorter than 8 s breaks
+nothing. The gateway refuses a `--heartbeat-timeout` of 8 s or more: a longer stall would
+break the heartbeat stream first and declare the stage at once, so the tuned timeout would
+never be the one that decides.
+
 Limits:
 
 - A stage that breaks its heartbeat stream is dead to the gateway even if the process is
   fine, so a network blip now costs a respawn and a weight reload.
 - A worker suspended and never resumed produces no registration, because its supervisor sees
   a live process. The gateway waits.
+- A worker suspended for more than about 8 s has its connections closed by keepalive, since a
+  stopped process cannot answer a ping. Outputs it held for a closed stream can then be lost
+  rather than delivered late, so a stale-output run (X6) keeps each suspension under 8 s.
+
+## Beat gaps
+
+`pllm.beatgaps` reads a gateway metrics file and prints, for each stage, the gaps between
+consecutive beats of one incarnation on the gateway's clock: count, median, p99 and maximum,
+for the idle part of the run, the loaded part (inside the request window) and both. It then
+prints the heartbeat timeout the run used, the stages the gateway declared dead, a verdict
+(pass when nothing was declared and the longest gap is below the timeout; exit code 0 only
+then) and a suggested timeout: the longest gap times `--margin` (default 1.5), rounded up to
+0.5 s. The suggestion is only a suggestion; the chosen value and its margin are stated with
+the measured numbers. Each call writes a run record.
+
+The measurement on two laptops, with no fault injected: 10 minutes idle, then about 10
+minutes of load.
+
+```
+# macOS (gateway and Stage 1)
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0
+# macOS, after 10 minutes idle; stop it with Ctrl-C after 10 more minutes
+uv run python -m pllm.x2 pipeline smollm2-135m --concurrency 4 --repeats 1 --requests 1000 --metrics runs/<gateway>.metrics.jsonl
+# macOS, after stopping the load, with both launchers still running
+uv run python -m pllm.beatgaps runs/<gateway>.metrics.jsonl
+```
+
+Run the recorder before stopping either launcher. Stopping one ends that stage's heartbeat
+stream, the gateway declares the stage dead, and the recorder counts that declaration, so a
+later call on the same file reports fail. The metrics file is written a line at a time, so
+reading it while the gateway runs is safe; the run record of that call holds the measurement.
+The recorder needs only the completed requests to place the load window, so stopping the
+load early is fine. Then stop both launchers, start the gateway again with the chosen value,
+for example `--heartbeat-timeout 3.0` on the macOS launcher, repeat the run in the same
+order, and check that the verdict is pass. The value must stay below the 8 s keepalive
+timeout.
 
 ## X1a: the split against the single process
 
@@ -942,6 +993,11 @@ one host each stage gets half; `--threads` sets it. Ctrl-C stops everything. If 
 exits by itself, the launcher stops the rest and exits with code 1 (a worker that dies is
 not such a case: its supervisor restarts it). Closing the terminal also stops everything on
 macOS. Force killing the launcher leaves its processes running.
+
+`--heartbeat-timeout SECONDS` passes the gateway's heartbeat timeout through, so it is
+accepted only with the gateway role on this laptop. The gateway checks the range (above the
+0.5 s beat interval and below the 8 s keepalive timeout); an out-of-range value makes it
+exit, and the launcher then stops the rest. See [Beat gaps](#beat-gaps) for how to choose it.
 
 Before every run, close other programs and use the same power state. The launcher logs the
 available memory and power state at the start, warns on battery, and writes a run record.
