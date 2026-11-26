@@ -19,6 +19,7 @@ recovery (R6.12).
 
 import subprocess
 import sys
+import time
 
 import pytest
 from test_gateway import IDS, WAIT, wait_for
@@ -29,6 +30,7 @@ from test_replay import take
 from pllm import faults, metrics, report
 from pllm.control import ExpectedModel
 from pllm.models import sha256_of
+from pllm.wire import KEEPALIVE_TIMEOUT_SECONDS
 
 pytestmark = pytest.mark.fault
 
@@ -147,7 +149,7 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         before = begun()
         wait_for(lambda: begun() > before, "the old process to begin its next step")
         faults.suspend(old_proc.pid)  # within its delay: the output is not sent yet
-        suspended = old_proc
+        suspended, suspended_at = old_proc, time.monotonic()
 
         wait_for(lambda: run.gateway.detector.is_dead(old), "the old epoch to be declared dead")
         events = run.gateway.detector.events()
@@ -165,8 +167,11 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         )
         tokens += take(stream, 1)
 
+        held = time.monotonic() - suspended_at
         faults.resume(old_proc.pid)
         suspended = None
+        # past keepalive the old process's connections close and its late output is lost
+        assert held < KEEPALIVE_TIMEOUT_SECONDS, f"suspended {held:.1f} s, past keepalive"
 
         def late():
             return [o for o in outputs[declared:] if o[0] == old]
