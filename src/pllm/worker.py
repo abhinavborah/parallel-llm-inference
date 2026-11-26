@@ -9,7 +9,9 @@ Nothing here depends on the operating system (R3.15). The network service that h
 worker is pllm.stage_service; --serve starts it.
 
 The layer range comes from the split point in the hosts file ([split], R3.1);
---layers overrides it for tests and split sweeps.
+--layers overrides the range for tests. For a split sweep, --split-point K with --stage
+uses K instead of the file's split point, and also works with --serve; the gateway, given
+the same K, rejects a stage whose range is not the one its own K gives.
 
 Usage (loads the stage, logs the load time and RSS, and exits):
 uv run python -m pllm.worker smollm2-135m --stage 0
@@ -95,10 +97,12 @@ class StageWorker:
         return self.stage.forward(inputs, start_pos, cache)
 
 
-def stage_layers(model_dir: Path, model: str, stage: int) -> tuple[int, int]:
-    """Layer range of stage 0 or 1 from the split point in the hosts file."""
+def stage_layers(
+    model_dir: Path, model: str, stage: int, split_point: int | None = None
+) -> tuple[int, int]:
+    """Layer range of stage 0 or 1 from split_point, or from the hosts file's without it."""
     n = ModelConfig.from_file(model_dir / "config.json").num_layers
-    k = config.split_point(model)
+    k = config.split_point(model) if split_point is None else split_point
     if not 1 <= k <= n - 1:
         raise ValueError(f"split point {k} for {model} outside 1 to {n - 1}")
     return (0, k) if stage == 0 else (k, n)
@@ -217,6 +221,9 @@ def main(argv: list[str] | None = None) -> None:
     which = parser.add_mutually_exclusive_group(required=True)
     which.add_argument("--stage", type=int, choices=(0, 1), help="layers from the hosts file")
     which.add_argument("--layers", help="START:END, layers START to END - 1, overrides it")
+    parser.add_argument(
+        "--split-point", type=int, help="with --stage: use this k, not the hosts file's"
+    )
     parser.add_argument("--step-delay", type=float, default=0.0, help="seconds slept per step")
     parser.add_argument(
         "--threads", type=int, help="torch threads for this process (fix it for equality runs)"
@@ -235,6 +242,8 @@ def main(argv: list[str] | None = None) -> None:
     model_dir = MODELS_DIR / args.model
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
+    if args.split_point is not None and args.stage is None:
+        parser.error("--split-point needs --stage")
     if args.hop_delay_control and not (args.serve and args.stage == 1):
         parser.error("--hop-delay-control needs --serve --stage 1: it delays the hop into Stage 1")
     if args.serve and args.stage is None:
@@ -243,7 +252,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.layers is not None:
             start, end = parse_layers(args.layers)
         else:
-            start, end = stage_layers(model_dir, args.model, args.stage)
+            start, end = stage_layers(model_dir, args.model, args.stage, args.split_point)
         StepDelay(args.step_delay)  # rejects a negative value
         hosts = config.load() if args.serve else None
         limits = config.flow_limits() if args.serve else None
