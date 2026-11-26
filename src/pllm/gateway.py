@@ -134,6 +134,7 @@ import collections
 import json
 import logging
 import queue
+import random
 import signal
 import sys
 import threading
@@ -170,6 +171,8 @@ RESERVED_THREADS = 2 + 2 * len(STAGES)
 MAX_RUNNING = 14  # Generate calls at once with the default pool
 MAX_QUEUED = 8  # requests waiting for a running slot; [limits] admission_queue sets it
 RECOVER = object()  # what _wait returns when a request must replay
+MAX_DEATHS = 3  # a request fails at the third stage death it lives through (R6.9)
+MAX_BACKOFF_SECONDS = 1.0  # the longest pause before a refused replay starts again
 
 
 @dataclass
@@ -189,6 +192,8 @@ class Request:
     last_token_ns: int | None = None
     step_due_ns: int | None = None  # detector clock; None once the step's record is written
     recovering: bool = False  # from a replay's start until its first new token
+    deaths: int = 0  # stage deaths declared while this request was in the table
+    restarts: int = 0  # refused replays since the last death or new token
 
     def row(self) -> dict:
         return {
@@ -369,6 +374,8 @@ class Gateway(
             with self._lock:
                 for request in self.requests.values():
                     request.attempt += 1
+                    request.deaths += 1
+                    request.restarts = 0
                 bumped = len(self.requests)
             log.warning(
                 "stage %s epoch %s declared dead: %d requests to replay",
@@ -938,6 +945,7 @@ class Gateway(
                     request.tokens.append(chosen)
                     request.expected_step += 1
                     request.recovering = False
+                    request.restarts = 0
                     self.tokens_out += 1
                 if chosen in self.eos_ids:
                     how = "end of sequence"
@@ -1004,7 +1012,16 @@ class Gateway(
     def _recover(self, request: Request, attempt: int, context) -> Link | None:
         """Start the request again from step 0 under a new attempt, once every stage is up.
         Returns the link to send on, or None if the client went away. It waits at most until
-        the request's deadline (R5.6); a recovery cap is #44."""
+        the request's deadline (R5.6). A request that has lived through MAX_DEATHS stage
+        deaths fails with UNAVAILABLE instead: a request that kills every new stage (one
+        that runs a worker out of memory, say) must not take the others down with it."""
+        with self._lock:
+            deaths = request.deaths
+        if deaths >= MAX_DEATHS:
+            context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                f"request {request.rid} gave up after {deaths} stage deaths",
+            )
         with self._lock:
             if request.attempt == attempt:  # a failure that no declaration bumped
                 request.attempt += 1
@@ -1027,6 +1044,16 @@ class Gateway(
             if self._down() is None:
                 return self._open_link()
             time.sleep(POLL_SECONDS)
+
+    @staticmethod
+    def _pause(request: Request) -> None:
+        """Wait before a replay starts again, so a retry never spins: POLL_SECONDS, doubled
+        at each refusal up to MAX_BACKOFF_SECONDS, times a random 1 to 1.5 so that requests
+        refused together do not all come back together. Never past the deadline."""
+        base = min(POLL_SECONDS * 2**request.restarts, MAX_BACKOFF_SECONDS)
+        request.restarts += 1
+        left = request.deadline - time.monotonic()
+        time.sleep(max(0.0, min(base * random.uniform(1.0, 1.5), left)))
 
     def _declared_soon(self, request: Request, attempt: int, context) -> bool:
         """After a failed stream: wait up to the heartbeat timeout, and one more watcher pass,
@@ -1083,7 +1110,7 @@ class Gateway(
                     )
                     if current and (result.reason == "GAP" or request.recovering):
                         if request.recovering:
-                            time.sleep(POLL_SECONDS)  # a refused replay never spins
+                            self._pause(request)
                         return RECOVER
                     if current:
                         context.abort(
@@ -1102,7 +1129,7 @@ class Gateway(
             why = link.failure()
             if why is not None:
                 if request.recovering or self._declared_soon(request, attempt, context):
-                    time.sleep(POLL_SECONDS)  # a retry never spins
+                    self._pause(request)
                     return RECOVER
                 if time.monotonic() >= request.deadline or not context.is_active():
                     continue  # the checks above end it as a deadline or a cancel

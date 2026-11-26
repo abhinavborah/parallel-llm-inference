@@ -532,10 +532,15 @@ goes on from the history the client has.
 
 - A GAP Nack (a stage with no cache at the step's position) replays the request too.
 - While a request replays, a failed stream or a refused step (a new stage before its route
-  update) starts it again under a newer attempt, after 0.05 s. A replay never reuses an
-  attempt, so a late result of an older one is always dropped.
+  update) starts it again under a newer attempt, after a pause: 0.05 s, doubled at each
+  refusal up to 1 s, times a random 1 to 1.5, never past the deadline. A new token or a new
+  death starts the pause at 0.05 s again. A replay never reuses an attempt, so a late
+  result of an older one is always dropped.
 - A request waits for the new stage at most until its own deadline, then fails with
   DEADLINE_EXCEEDED. `Gateway.replays` counts replays started.
+- A request that lives through 3 stage deaths (`MAX_DEATHS`) fails with UNAVAILABLE at the
+  third, instead of replaying again: a request that kills every new stage, for example by
+  running a worker out of memory, must not keep the others replaying until its deadline.
 
 ## Failure detection
 
