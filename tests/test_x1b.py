@@ -220,8 +220,8 @@ def beat(stage):
     return {"type": "beat", "t_ns": 1, "stage": stage, "epoch": 1, "busy_ns": 0, "steps": 0}
 
 
-def metrics_file(path, model="smollm2-135m", stages=(0, 1)):
-    head = {"type": "run", "model": model, "split": 15}
+def metrics_file(path, model="smollm2-135m", stages=(0, 1), revision="r1"):
+    head = {"type": "run", "model": model, "revision": revision, "split": 15}
     lines = [head, *(beat(stage) for stage in stages)]
     path.write_text("".join(json.dumps(line) + "\n" for line in lines), "utf-8")
     return path
@@ -248,7 +248,7 @@ def test_main_sends_nothing_until_both_stages_beat(tmp_path, monkeypatch):
     monkeypatch.setattr(x1b.prompts, "round_trips", lambda tokenizer, ids: True)
     ref = write(tmp_path / "a.json", record(plain_entries()))
     metrics = metrics_file(tmp_path / "g.metrics.jsonl", stages=(1,))
-    argv = ["--metrics", str(metrics), "--reference", str(ref), "--wait", "0.2"]
+    argv = ["--metrics", str(metrics), "--reference", str(ref), "--wait", "0.2", "--trial"]
     with pytest.raises(SystemExit):
         x1b.main(["smollm2-135m", *argv])
 
@@ -261,21 +261,29 @@ def test_a_record_written_by_x1a_loads_as_a_reference(tmp_path, monkeypatch, cap
     assert loaded["new_tokens"] == 4 and len(loaded["reference"]) == 3
 
 
-def test_main_refuses_before_any_request(tmp_path, monkeypatch):
+def test_main_refuses_before_any_request(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(x1b.client, "generate", lambda *a: pytest.fail("a request was sent"))
+    monkeypatch.setattr(x1b.prompts, "prompts", lambda model, length: IDS)
     good = write(tmp_path / "a.json", record(plain_entries()))
     bad = record(plain_entries())
     bad["reference"][0]["top_logits"][0] = 1.0
     bad = write(tmp_path / "b.json", bad)
+    host_b = write(tmp_path / "c.json", record(plain_entries(), "host-b"))
+    also_a = write(tmp_path / "d.json", record(plain_entries()))
     metrics = metrics_file(tmp_path / "g.metrics.jsonl")
     other = metrics_file(tmp_path / "q.metrics.jsonl", "qwen3-0.6b")
-    for argv in (
-        ["--metrics", str(other), "--reference", str(good)],
-        ["--metrics", str(metrics), "--reference", str(good), str(bad)],
-        ["--metrics", str(tmp_path / "none"), "--reference", str(good)],
+    newer = metrics_file(tmp_path / "r.metrics.jsonl", revision="r2")
+    for argv, message in (
+        (["--metrics", str(other), "--reference", str(good), "--trial"], "qwen3-0.6b"),
+        (["--metrics", str(metrics), "--reference", str(good), str(bad)], "checksum"),
+        (["--metrics", str(tmp_path / "none"), "--reference", str(good), "--trial"], "--metrics"),
+        (["--metrics", str(newer), "--reference", str(good), str(host_b)], "revision"),
+        (["--metrics", str(metrics), "--reference", str(good)], "two hosts"),
+        (["--metrics", str(metrics), "--reference", str(good), str(also_a)], "two hosts"),
     ):
         with pytest.raises(SystemExit):
             x1b.main(["smollm2-135m", *argv])
+        assert message in capsys.readouterr().err
 
 
 class Words:
@@ -283,7 +291,8 @@ class Words:
         return " ".join(map(str, ids))
 
 
-def test_main_writes_a_record_with_its_command(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("hosts, trial", [(["host-a", "host-b"], []), (["host-a"], ["--trial"])])
+def test_main_writes_a_record_with_its_command(tmp_path, monkeypatch, capsys, hosts, trial):
     entries = plain_entries()
     monkeypatch.setattr(x1b.prompts, "prompts", lambda model, length: IDS)
     monkeypatch.setattr(x1b.prompts, "load_tokenizer", lambda model: Words())
@@ -298,15 +307,18 @@ def test_main_writes_a_record_with_its_command(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(x1b.client, "generate", generate)
     monkeypatch.setattr(x1b.sys, "argv", ["x1b", "the", "command"])
-    ref = write(tmp_path / "a.json", record(entries))
+    refs = [str(write(tmp_path / f"{h}.json", record(entries, h))) for h in hosts]
     metrics = metrics_file(tmp_path / "g.metrics.jsonl")
-    assert x1b.main(["smollm2-135m", "--metrics", str(metrics), "--reference", str(ref)]) == 0
+    argv = ["smollm2-135m", "--metrics", str(metrics), "--reference", *refs, *trial]
+    assert x1b.main(argv) == 0
     (record_file,) = (tmp_path / "runs").glob("*-x1b.json")
     rec = json.loads(record_file.read_text(encoding="utf-8"))
     assert rec["status"] == "ok" and rec["argv"] == ["x1b", "the", "command"]
     assert rec["split"] == 15 and rec["metrics_file"] == metrics.name
+    assert rec["trial"] is bool(trial) and [r["host"] for r in rec["references"]] == hosts
     assert rec["references"][0]["x1a_passed"] is True
-    assert [s["token_agreement_percent"] for s in rec["summary"]] == [100.0]
+    assert [s["token_agreement_percent"] for s in rec["summary"]] == [100.0] * len(hosts)
     assert [r["tokens"] for r in rec["served"]] == [[1] * NEW] * len(IDS)
     lines = (tmp_path / "runs" / rec["results_file"]).read_text(encoding="utf-8")
-    assert lines == capsys.readouterr().out and len(lines.splitlines()) == len(IDS) + 1
+    assert lines == capsys.readouterr().out
+    assert len(lines.splitlines()) == (len(IDS) + 1) * len(hosts)

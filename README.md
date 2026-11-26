@@ -671,9 +671,10 @@ uv run python -m pllm.x1b smollm2-135m --metrics runs/<gateway>.metrics.jsonl --
 Each record is checked before any request is sent: an x1a record with status ok, its
 reference checksum recomputed over its settings, the prompt set and its entries, the same
 model, revision, length and token count in every record, and each stored prompt equal to the
-prompt set's. The length, token count and prompts come from the records. `--metrics` is the
-running gateway's file; it is read to refuse a gateway serving another model and for the
-split point, and the first request waits until both stages beat in it (up to `--wait`
+prompt set's. The records must come from two different hosts; `--trial` allows records from
+one host for a trial run, and the run record then has `trial: true`. The length, token count
+and prompts come from the records. `--metrics` is the running gateway's file; it is read to
+refuse a gateway serving another model or revision and for the split point, and the first request waits until both stages beat in it (up to `--wait`
 seconds, default 120), since a request sent earlier is refused. `--rtt-ms` puts a round-trip
 time from `pllm.netcheck` into the run record.
 
@@ -748,8 +749,9 @@ one token and its logit per step from Stage 1. So the check is on that hop, per 
 X3 refuses a metrics file that is for another model or already has requests, an end or an
 unreadable line. The run fails, with the reasons in the summary, when the file has no
 `run_end` in time, Stage 0's totals are incomplete, a line is unreadable, a request in the
-file is not this run's, or a request failed. Output: one JSON line per hop and phase, then a
-summary with the measured overhead and the check, in a `.jsonl` file next to the run record
+file is not this run's, a request failed, or a request decoded fewer than `--new-tokens`
+tokens (it stopped at end of sequence). Output: one JSON line per hop and phase, then a
+summary with the measured overhead, each request's decoded token count and the check, in a `.jsonl` file next to the run record
 in `runs/` (named in the record as `results_file`) and on stdout. The record keeps the
 command (`argv`), the settings, the hidden size and each request's output tokens. The exit
 code is 0 only when the check passes.

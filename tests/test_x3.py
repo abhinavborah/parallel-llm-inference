@@ -236,7 +236,10 @@ class Words:
         return " ".join(map(str, ids))
 
 
-def test_main_writes_the_lines_and_a_record_with_its_command(served, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("asked", [NEW, NEW + 1])
+def test_main_writes_the_lines_and_a_record_with_its_command(
+    served, tmp_path, monkeypatch, capsys, asked
+):
     done, got = served
     path = fresh(tmp_path / "run.metrics.jsonl")
     streams = iter(got)
@@ -254,19 +257,27 @@ def test_main_writes_the_lines_and_a_record_with_its_command(served, tmp_path, m
     monkeypatch.setattr(x3.prompts, "prompts", lambda model, length: IDS)
     monkeypatch.setattr(x3.prompts, "load_tokenizer", lambda model: Words())
     monkeypatch.setattr(x3.prompts, "round_trips", lambda tokenizer, ids: True)
-    monkeypatch.setattr(x3, "eos_ids", lambda model_dir: [])
+    # with one token more asked for, each stream ends early on its last token, as at end of sequence
+    monkeypatch.setattr(x3, "eos_ids", lambda model_dir: [g["tokens"][-1] for g in got])
     monkeypatch.setattr(x3.client, "generate", generate)
     monkeypatch.setattr(x3, "wait_for_end", stopped)
     monkeypatch.setattr(x3.sys, "argv", ["x3", "the", "command"])
     monkeypatch.setattr(runrecord, "RUNS_DIR", tmp_path / "runs")
     argv = [MODEL, "--length", "16", "--metrics", str(path), "--count", "2", "--new-tokens"]
-    assert x3.main([*argv, str(NEW)]) == 0
+    assert x3.main([*argv, str(asked)]) == (0 if asked == NEW else 1)
     (record_file,) = (tmp_path / "runs").glob("*-x3.json")
     rec = json.loads(record_file.read_text(encoding="utf-8"))
     assert rec["status"] == "ok" and rec["argv"] == ["x3", "the", "command"]
     assert rec["hidden_size"] == HIDDEN and rec["length"] == 16 and rec["split"] == 2
     assert [r["output_tokens"] for r in rec["requests"]] == [NEW, NEW]
-    assert rec["summary"]["passed"] and rec["summary"]["problems"] == []
+    assert rec["summary"]["decoded_tokens"] == [NEW, NEW]
+    if asked == NEW:
+        assert rec["summary"]["passed"] and rec["summary"]["problems"] == []
+    else:
+        assert not rec["summary"]["passed"]
+        assert rec["summary"]["problems"] == [
+            "2 request(s) decoded fewer tokens than asked for (end of sequence)"
+        ]
     captured = capsys.readouterr()
     assert x3.STOP_NOW in captured.err
     assert (tmp_path / "runs" / rec["results_file"]).read_text(encoding="utf-8") == captured.out

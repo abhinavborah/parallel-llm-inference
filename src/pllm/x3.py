@@ -26,10 +26,11 @@ token and its logit per step), so the check is on that hop, per phase:
 - its positions equal those the gateway sent to Stage 0 (every step forwarded once).
 
 The run fails, with the reasons in the summary, if the file has no run_end in time, Stage 0's
-totals are incomplete, a line is unreadable, a request in the file is not this run's, or a
-request failed. One
-JSON line per hop and phase, then a summary, go to a .jsonl file next to the run record in
-runs/ and to stdout. The exit code is 0 only when the check passes.
+totals are incomplete, a line is unreadable, a request in the file is not this run's, a
+request failed, or a request decoded fewer than --new-tokens tokens (it stopped at end of
+sequence). One JSON line per hop and phase, then a summary with each request's decoded
+token count, go to a .jsonl file next to the run record in runs/ and to stdout. The exit
+code is 0 only when the check passes.
 
 Usage:
 uv run python -m pllm.x3 smollm2-135m --length 128 --metrics runs/<gateway>.metrics.jsonl
@@ -115,8 +116,9 @@ def rows(run: report.Run, hops: list[dict]) -> list[dict]:
     return sorted(out, key=lambda r: (HOPS.index(r["hop"]), metrics.PHASES.index(r["phase"])))
 
 
-def problems(run: report.Run, rids: set[str], failed: int, table: list[dict], hidden: int):
-    """Why the run does not show bytes equal to hidden size x 4 B x tokens, if it does not."""
+def problems(run: report.Run, rids: set[str], failed: int, table: list[dict], hidden: int, short=0):
+    """Why the run does not show bytes equal to hidden size x 4 B x tokens, if it does not.
+    short counts the completed requests that decoded fewer tokens than asked for."""
     if run.end is None:
         return ["the metrics file has no run_end: the gateway was not stopped, or not cleanly"]
     found = []
@@ -129,6 +131,8 @@ def problems(run: report.Run, rids: set[str], failed: int, table: list[dict], hi
         found.append(f"{len(foreign)} request(s) in the file are not this run's")
     if failed:
         found.append(f"{failed} request(s) failed at the client")
+    if short:
+        found.append(f"{short} request(s) decoded fewer tokens than asked for (end of sequence)")
     done = {r["rid"] for r in run.requests if r.get("outcome") in report.COMPLETED}
     if rids - done:
         found.append(f"{len(rids - done)} request(s) did not complete at the gateway")
@@ -239,9 +243,11 @@ def main(argv: list[str] | None = None) -> int:
         run = wait_for_end(args.metrics, args.wait)
         rids = {s["rid"] for s in served if s["rid"]}
         failed = sum(s["error"] is not None for s in served)
+        decoded = [len(s["tokens"]) for s in served]
+        short = sum(s["error"] is None and len(s["tokens"]) < args.new_tokens for s in served)
         table = rows(run, x2.read_hops(args.metrics, rids))
-        summary = summary_line(table, problems(run, rids, failed, table, hidden), hidden)
-        summary.update(length=args.length, requests=len(served))
+        summary = summary_line(table, problems(run, rids, failed, table, hidden, short), hidden)
+        summary.update(length=args.length, requests=len(served), decoded_tokens=decoded)
         with lines_path.open("w", encoding="utf-8") as out:
             for line in [*table, summary]:
                 text = json.dumps(line, allow_nan=False)

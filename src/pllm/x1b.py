@@ -3,8 +3,10 @@
 The references are X1a run records, one per host (R2.12); Host B's is copied into runs/ on
 Host A. Each record is checked before any request is sent: script x1a with status ok, its
 reference checksum recomputed over the model, revision, length, token count, thread count,
-prompt set and entries, the same settings in every record, and each stored prompt hash equal
-to the prompt set's ids. Length, token count and prompts come from the records.
+prompt set and entries, the same settings in every record, the gateway's model and revision,
+and each stored prompt hash equal to the prompt set's ids. The records must come from two
+different hosts; --trial allows one host and the run record says trial. Length, token count
+and prompts come from the records.
 
 Each prompt goes through a running gateway once, one request at a time, for the records'
 token count. The first is sent once both stages beat in the gateway's metrics file. Per
@@ -224,6 +226,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=120.0, help="seconds per request")
     parser.add_argument("--wait", type=float, default=WAIT_S, help="seconds for both stages")
     parser.add_argument("--rtt-ms", type=float, help="round-trip time from pllm.netcheck")
+    parser.add_argument(
+        "--trial", action="store_true", help="allow references from one host; the record says so"
+    )
     args = parser.parse_args(argv)
     if args.timeout <= 0 or args.wait <= 0:
         parser.error("--timeout and --wait must be positive")
@@ -236,6 +241,11 @@ def main(argv: list[str] | None = None) -> int:
         records = [load_reference(path) for path in args.reference]
         if records[0]["model"] != args.model:
             raise BadReference(f"the references are for {records[0]['model']}, not {args.model}")
+        if records[0]["revision"] != info.get("revision"):
+            raise BadReference(
+                f"the references are for revision {records[0]['revision']}, "
+                f"the gateway serves {info.get('revision')}"
+            )
         prompt_ids = prompts.prompts(args.model, records[0]["length"])
         check_references(records, prompt_ids)
     except (BadReference, ValueError) as err:
@@ -243,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     names = [path.name for path in args.reference]
     if len(set(names)) != len(names):
         parser.error("two references have the same file name")
+    if len({r["host"] for r in records}) < 2 and not args.trial:
+        parser.error("the references must come from two hosts; --trial allows one")
     first = records[0]
     tokenizer = prompts.load_tokenizer(args.model)
     for entry in first["reference"]:
@@ -263,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         rec["argv"] = sys.argv
         rec.update(length=first["length"], new_tokens=first["new_tokens"])
         rec["metrics_file"] = args.metrics.name
+        rec["trial"] = args.trial
         rec["references"] = [
             {
                 "file": name,
