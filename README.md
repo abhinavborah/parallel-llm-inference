@@ -309,6 +309,33 @@ logits equal the single-process reference (tested with small random models).
     the next hop, may hold at a stage. A full inbox stops the stage reading, so gRPC flow
     control slows the sender; on a healthy stream nothing is dropped. A stream that ends
     (a route change, a failed next hop) discards what it held, as before.
+  - KV admission (R5.3), from `host_b_budget_gib` (0.7) and `host_b_runtime_mib` (196).
+    Stage 0 runs on Host B, whose worker budget is 0.7 GiB of peak RSS for the whole process
+    (R1.7). The gateway subtracts the runtime (the RSS of a fresh process after importing
+    torch and the model code, measured on Host B) and the fp32 size of Stage 0's layers at
+    the split in use, read from the shapes in `model.safetensors`. The mapped embedding is
+    read with file reads, so it adds nothing. What is left is the KV budget. Each request
+    reserves (prompt tokens + `max_tokens`) x Stage 0 KV bytes per position (layers x 2 x
+    kv heads x head dim x 4) before it may queue. One that does not fit beside the
+    reservations already held is refused at once with RESOURCE_EXHAUSTED and counted in
+    `Gateway.kv_rejected` as well as the `rejected` outcome. Queued requests hold their
+    reservation, and every way a request ends gives it back. The gateway logs the budget at
+    start and writes `kv_budget_bytes` and `kv_bytes_per_position` to the metrics file.
+    - SmolLM2 (k = 15): 202.6 MiB of weights leave 318.2 MiB, 23,040 bytes per position,
+      14,483 positions. At the committed limits (22 requests of at most 528 positions) it
+      does not bind; it binds once `max_tokens` is large, for example 7 requests of 2,000.
+    - Qwen3-0.6B (k = 14): 840.1 MiB of Stage 0 weights alone exceed 0.7 GiB, so no KV
+      budget is left. The gateway warns with the numbers and runs with KV admission off.
+    - Limits. It reserves each request's maximum, not measured use (R5.10 tunes it). An
+      append copies one layer of one request, so a step briefly holds one more layer (about
+      12 MiB at 8,192 positions for SmolLM2). Prefill activations and gRPC buffers are not
+      counted either; the 0.5 GiB headroom above the budget covers them. The gateway gives a
+      reservation back when the request ends, but Stage 0 frees the cache only when the
+      `Free` arrives on its heartbeat stream (every 0.5 s), so requests admitted in that gap
+      can briefly overlap the freed caches by up to their prompts.
+    - `uv run pytest tests/test_kv_admission.py` checks requests at exactly the budget and
+      one byte over, a queued request holding its bytes, and that each way a request ends
+      gives its reservation back.
   - `Gateway.queue_peak`, `Gateway.in_flight_peak` and each stage's `inbox_peak` record the
     deepest each has been; `tests/test_backpressure.py` checks them against the bounds
     under overload.
@@ -328,7 +355,7 @@ logits equal the single-process reference (tested with small random models).
   model's context length (8192 positions for SmolLM2) is refused with INVALID_ARGUMENT.
   This bounds each request, not Host B's memory: with an even split, one request at the
   cap holds about 180 MiB of Stage 0 cache for SmolLM2 but about 4.4 GiB for Qwen3-0.6B
-  (40960 positions), more than Host B has. Admission by Host B's KV budget (R5.3) is #34.
+  (40960 positions), more than Host B has; KV admission (below) bounds the sum.
   One long prefill delays the other requests' next steps at that stage.
 - Text is decoded per token, holding back a token that ends inside a character until the
   next one completes it (up to four tokens), so a `Token` can carry empty text.
