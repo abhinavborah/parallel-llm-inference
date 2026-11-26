@@ -227,6 +227,12 @@ range that does not match the split point, and otherwise returns a new epoch.
 Epochs come from one counter in the gateway, so a stage that registers again always gets
 a higher epoch. `pllm.control.register` is the stage side.
 
+Protocol note: a stage may also send its weight load time with Register, as gRPC metadata
+`pllm-load-ns`, an integer of nanoseconds on the stage's own clock. The field is optional,
+outside the protobuf schema and backward compatible: a gateway that does not know it ignores
+it, and a missing or malformed value is logged as null. The gateway uses it only as a
+duration, to split recovery time (see [Recovery time](#recovery-time)).
+
 ## Gateway
 
 `pllm.gateway` serves `Control.Register`, `Control.Heartbeat`, `Frontend.Generate` and
@@ -396,7 +402,7 @@ uv run python -m pllm.report --out DIR        # default runs/report
 ```
 
 It writes `runs.csv` and `index.md` with one row per run, and a folder per run with
-`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `latency_cdf.png` and, when the
+`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `recovery.csv`, `latency_cdf.png` and, when the
 stages sent beats, `utilisation.png`. The report is built beside the output folder and
 then replaces it whole, so a failed build leaves the old one. The command refuses a folder
 it did not make, a file, and a folder that holds a log; anything added to a folder it made
@@ -421,6 +427,15 @@ Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
   heartbeat that reconnected or beats that stopped, and `summary.md` warns when it is over
   1 s. Utilisation is busy time over the window; two streams working at once on one stage
   can push it above 1.
+- Recoveries: one row per `recovery` line (see [Recovery time](#recovery-time)), times in
+  ms. `stale_discarded` is counted here only: the request's results the gateway dropped
+  (`hop` lines with `accepted` false) at an attempt from the previous recovery's attempt of
+  that request (1 for the first) up to, not including, this recovery's, over the whole run.
+  So a late result of a resumed old stage counts even when it arrives after the recovery
+  line, and a request that recovers twice counts each result once. Nacks have no `hop` line
+  and are not counted (the gateway's `stale_nack` count has them), nor is a result accepted
+  on arrival and dropped only when its request took it, after a bump (`Gateway.discards`
+  has it).
 
 Plots for each experiment (X2 to X9) are added here by that experiment.
 
@@ -544,6 +559,66 @@ goes on from the history the client has.
   third, instead of replaying again: a request that kills every new stage, for example by
   running a worker out of memory, must not keep the others replaying until its deadline.
 
+## Recovery time
+
+Each replay is one recovery (R6.12). When it ends, at the request's first new token or when
+the request ends while still replaying, the gateway writes one `recovery` line to the
+metrics file. All times are on the gateway's clock except the weight load, which the new
+stage reports as a duration (see [Stage registration](#stage-registration)).
+
+| Field | Meaning |
+|---|---|
+| `rid`, `attempt`, `recovered`, `outcome` | the request, the attempt that recovered, false (with the outcome) if it ended first |
+| `stage`, `old_epoch`, `new_epoch`, `path` | the death that bumped the request; null for a replay with no death (a GAP Nack) |
+| `detection_ns` | declaration minus the dead epoch's last beat: an upper bound on fault to detection, since the gateway cannot see the fault itself |
+| `respawn_ns` | declaration to the new registration, minus the weight load: noticing the exit, starting the process, hashing the weights, registering |
+| `weight_load_ns` | the new stage's own load time; null if it sent none (an older worker, or a stage started inside a test) |
+| `overlap` | true when the restart ran while detection was still pending (always for `replaced`); `respawn_ns` is then 0 and the parts add up to more than the restart |
+| `replay_prefill_ns` | the replayed prompt's send to its result |
+| `recomputed_tokens`, `divergences` | replayed steps compared with the history, and those that differed |
+| `total_ns` | the dead epoch's last beat to the first new token; null if not recovered |
+
+The four parts do not add up to `total_ns`: the rest is recomputing the tokens sent before
+and any pause before a refused replay. Stale outputs discarded are counted by the report from
+the metrics file (see [Report](#report)), so the late results of a resumed old stage count
+too. If both stages die during one replay, the line names the later death. A request that
+fails at a death before replaying, such as at `MAX_DEATHS`, still gets a line, with
+`recovered` false.
+
+## Fault suite
+
+Every failure-handling claim of Epic E6 has a test that injects the fault (R6.13). The tests
+carry the pytest mark `fault`, so one command runs them all on either laptop:
+
+```
+uv run python -m pllm.models smollm2-135m   # once, for the real-weights test
+uv run pytest -m fault -rs
+```
+
+`-rs` lists every skipped test with its reason, so no test skips unseen. Only
+`test_a_real_worker_killed_by_the_fault_injector_is_back_and_registered` can skip: it needs
+the downloaded SmolLM2-135M weights and 1.5 GiB of free memory. On Host B (0.7 GiB budget)
+that skip is expected: the respawn claim is still tested there with stand-in worker scripts
+and with real stage processes of a small random model, and the real-weights respawn runs on
+Host A. Every other fault test uses stand-in scripts or that small model, so the suite needs
+no downloaded weights. The suite uses only 127.0.0.1.
+
+| Claim | Fault injected | Tests |
+|---|---|---|
+| R6.1 kill, suspend and resume, per-step sleep | kill and suspend of real process trees; a step delay | `test_faults.py`; `test_supervisor.py::test_kill_suspend_and_resume_are_applied_through_the_fault_injector`, `::test_the_control_port_applies_kill_suspend_and_resume` |
+| R6.2 the supervisor respawns, respawn time logged | kill of the worker; a worker that exits or crashes | `test_supervisor.py::test_a_worker_killed_by_the_fault_injector_is_respawned`, `::test_the_respawn_time_is_logged`, `::test_a_crash_loop_backs_off_and_never_gives_up`, `::test_a_killed_worker_comes_back_and_registers_again` |
+| R6.3 detection by stream break, heartbeat timeout, step deadline | kill, suspend, a slow step | `test_detection.py::test_a_killed_stage_is_detected_by_its_stream_break`, `::test_a_suspended_stage_is_detected_by_its_heartbeat_timeout`, `::test_a_slow_step_is_recorded_without_declaring_the_stage_and_the_request_completes`, `::test_a_step_held_by_a_suspended_stage_names_it_then_its_timeout_declares_it`; `test_detection_cross.py` |
+| R6.4 dead epoch, new registration, route update | a stopped or resumed stage | `test_detection.py::test_a_dead_epoch_waits_for_a_new_registration_and_a_route_update`, `::test_a_stage_resumed_with_no_replacement_is_told_and_exits`, `::test_a_resumed_stage_is_replaced_by_its_supervisor_with_no_manual_step`; `test_detection_cross.py` |
+| R6.5 idle requests holding KV are bumped | a stopped stage while one request waits for a credit | `test_replay.py::test_an_idle_request_holding_kv_is_bumped_at_the_declaration_and_both_finish`; `test_replay_cross.py` |
+| R6.6 chunked replay through both stages | a stopped stage; a GAP Nack | `test_replay.py::test_the_replay_resends_the_original_messages_with_the_replay_flag`, `::test_a_gap_nack_replays_the_request`; `test_replay_cross.py` |
+| R6.7 replay verified, output equals a fault-free run | kill of a real stage process (each stage); a forced mismatch | `test_replay.py::test_a_killed_stage_process_is_replaced_and_the_request_finishes_unchanged`, `::test_a_replayed_token_that_differs_from_the_history_is_logged_and_not_sent`; `test_replay_cross.py` |
+| R6.8 late outputs of a resumed stage rejected | suspend past the timeout, resume after the replacement (each stage) | `test_stale_after_suspend.py::test_a_resumed_old_stage_has_every_late_output_rejected` |
+| R6.9 attempts, MAX_DEATHS, growing pause, deadline | repeated stage deaths; a refused replay; no replacement | `test_fail_cleanly.py::test_each_declared_death_raises_every_attempt_by_exactly_one`, `::test_a_request_that_lives_through_max_deaths_fails_with_unavailable`, `::test_a_refused_replay_waits_longer_each_time`; `test_replay.py::test_with_no_replacement_the_request_fails_at_its_deadline`; `test_replay_cross.py` |
+| R6.10 a slow worker fails cleanly at the deadline, bounds hold | a step delay on each stage; a suspended worker | `test_fail_cleanly.py::test_a_worker_slower_than_the_step_timeout_fails_requests_at_their_deadline_within_bounds`; `test_deadlines.py::test_with_a_suspended_worker_every_request_ends_by_its_deadline` |
+| R6.11 a delayed or lost hop | none yet | open: #50, on the hop wrapper of #49 |
+| R6.12 recovery time in four parts | kill of a real stage process (each stage); a stopped stage; suspend and resume | `test_recovery.py`; `test_stale_after_suspend.py` (stale outputs counted) |
+| R6.14 both stages at once | none yet | open: #52 |
+
 ## Failure detection
 
 The gateway watches each stage incarnation by its epoch (`pllm.detection`, read with
@@ -576,7 +651,8 @@ Detection records:
   `since_last_beat_ns`, `rid`, `step`, `detail` (`stage` and `epoch` are the suspect or null
   for a step deadline).
 - `registered`: `stage`, `old_epoch`, `new_epoch`, `t_ns`, `time`, `waited_ns` (from the
-  declaration), `route_queued_ns` (null if the neighbour had no stream).
+  declaration), `route_queued_ns` (null if the neighbour had no stream), `load_ns` (the
+  weight load time the new stage reported, or null).
 
 The two default timeouts are provisional: the beat gaps behind the 2.0 s value were measured
 on one laptop only. A laptop that pauses longer, for example while paging, needs a larger

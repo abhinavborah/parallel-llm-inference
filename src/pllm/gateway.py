@@ -73,6 +73,15 @@ death). While a request replays, a failed stream or a refused step starts it aga
 newer attempt: a replay never reuses an attempt, so a late result of an older one is
 dropped as stale_attempt.
 
+Recovery time (R6.12). Each replay is one recovery. When it ends, at the request's first new
+token or when the request ends still replaying, one recovery line goes to the metrics file:
+the death that bumped the request (stage, old and new epoch, path), its four parts and
+recomputed_tokens (see recovery_parts and _recovery_line), divergences and total_ns, from
+the dead epoch's last beat to the first new token. The parts do not sum to total_ns: the
+rest is recomputing the tokens sent before and any pause before a refused replay. Stale
+outputs discarded are counted from the metrics file by pllm.report, so late results of a
+resumed old stage count too.
+
 Many requests in flight (R4.5): every request goes to Stage 0 on the one stream, so the
 stages see the requests' steps interleaved in whatever order they arrive, and Stage 0 works
 on one request while Stage 1 works on another. Each request sends its next step only after
@@ -148,7 +157,7 @@ from pathlib import Path
 import grpc
 
 from pllm import config, metrics, prompts, runrecord, wire
-from pllm.control import Registration, Registry, expected_model
+from pllm.control import Registration, Registry, expected_model, load_ns_of
 from pllm.detection import HEARTBEAT_TIMEOUT_SECONDS, STEP_TIMEOUT_SECONDS, Detector
 from pllm.heartbeat import HEARTBEAT_SECONDS
 from pllm.model import ModelConfig
@@ -194,6 +203,11 @@ class Request:
     recovering: bool = False  # from a replay's start until its first new token
     deaths: int = 0  # stage deaths declared while this request was in the table
     restarts: int = 0  # refused replays since the last death or new token
+    death: dict | None = None  # the declaration that last bumped it, until its recovery line
+    replay_sent_ns: int | None = None  # recorder clock: the replayed prompt's send
+    prefill_ns: int | None = None  # the replayed prompt's send to its result
+    recomputed: int = 0  # replayed steps compared with the history in this attempt
+    replay_divergences: int = 0  # of those, the ones that differed
 
     def row(self) -> dict:
         return {
@@ -324,6 +338,7 @@ class Gateway(
         )
         self.replays = 0  # replays started, all requests together
         self.divergences = 0  # replayed tokens that differed from the stored history
+        self._registrations: dict[tuple[int, int | None], dict] = {}  # (stage, old epoch)
         self._stopping = threading.Event()
         self._watcher: threading.Thread | None = None
         self._retired: list[Link] = []  # half-closed, waiting for stage 0's counters
@@ -370,12 +385,16 @@ class Gateway(
         the table (R6.5). Every request has, or is about to have, KV state on both stages,
         idle ones waiting for a credit included, so the dead stage's are all of them."""
         self.recorder.event(record)
+        if record["event"] == "registered":
+            with self._lock:
+                self._registrations[(record["stage"], record["old_epoch"])] = record
         if record["event"] == "detected" and record["declared"]:
             with self._lock:
                 for request in self.requests.values():
                     request.attempt += 1
                     request.deaths += 1
                     request.restarts = 0
+                    request.death = record
                 bumped = len(self.requests)
             log.warning(
                 "stage %s epoch %s declared dead: %d requests to replay",
@@ -426,7 +445,8 @@ class Gateway(
                 other.outbox.put(self._route(entry))
                 queued = self.detector.now()
             old_epoch = previous.epoch if previous is not None else None
-            self.detector.registered(entry.stage, old_epoch, entry.epoch, queued)
+            load = load_ns_of(context.invocation_metadata())
+            self.detector.registered(entry.stage, old_epoch, entry.epoch, queued, load)
         return protocol_pb2.RegisterResp(epoch=entry.epoch)
 
     @staticmethod
@@ -920,6 +940,8 @@ class Gateway(
                 )
                 # Before the put, so that a fast result cannot appear to precede its send.
                 self.recorder.hop(metrics.GATEWAY_STAGE0, message)
+                if step == 0 and request.recovering:
+                    request.replay_sent_ns = self.recorder.now()
                 link.outbox.put(message)
                 try:
                     result = self._wait(request, link, context, attempt)
@@ -931,16 +953,22 @@ class Gateway(
                         how = "cancelled by the client"
                         return
                     attempt = request.attempt
+                    request.prefill_ns = request.replay_sent_ns = None
+                    request.recomputed = request.replay_divergences = 0
                     continue
                 if result is None:
                     how = "cancelled by the client"
                     return
                 chosen = result.token
+                if step == 0 and request.replay_sent_ns is not None:
+                    request.prefill_ns = self.recorder.now() - request.replay_sent_ns
                 if replay:  # the client has this token already: compare, never resend
                     self._check_replayed(request, step, chosen)
                     with self._lock:
                         request.expected_step += 1
                     continue
+                if request.recovering:
+                    self._recovery_line(request, recovered=True)
                 with self._lock:
                     request.tokens.append(chosen)
                     request.expected_step += 1
@@ -972,6 +1000,9 @@ class Gateway(
                 how = "cancelled by the client"
             raise
         finally:
+            # a death that bumped it and was never replayed, such as the MAX_DEATHS one
+            if request.recovering or (request.death is not None and how == "failed"):
+                self._recovery_line(request, recovered=False, outcome=how)
             self._end(request, how, context.code())
 
     def _text(self, ids: list[int], final: bool) -> str | None:
@@ -985,8 +1016,10 @@ class Gateway(
     def _check_replayed(self, request: Request, step: int, token: int) -> None:
         """Compare a replayed step's token with the one the client was sent (R6.7)."""
         sent = request.tokens[step]
+        request.recomputed += 1
         if token == sent:
             return
+        request.replay_divergences += 1
         with self._lock:
             self.divergences += 1
         log.warning(
@@ -1008,6 +1041,33 @@ class Gateway(
                 "history_token": sent,
             }
         )
+
+    def _recovery_line(self, request: Request, recovered: bool, outcome: str | None = None):
+        """Write the line of the recovery that ends now (R6.12), once per replay."""
+        now = self.recorder.now()
+        death = request.death
+        with self._lock:
+            registration = None
+            if death is not None:
+                registration = self._registrations.get((death["stage"], death["epoch"]))
+        last_beat = None if death is None else death["last_beat_ns"]
+        self.recorder.event(
+            {
+                "event": "recovery",
+                "t_ns": now,
+                "rid": request.rid,
+                "attempt": request.attempt,
+                "recovered": recovered,
+                "outcome": outcome,
+                **recovery_parts(death, registration),
+                "replay_prefill_ns": request.prefill_ns,
+                "recomputed_tokens": request.recomputed,
+                "divergences": request.replay_divergences,
+                "total_ns": now - last_beat if recovered and last_beat is not None else None,
+            }
+        )
+        request.death = None
+        request.recovering = False
 
     def _recover(self, request: Request, attempt: int, context) -> Link | None:
         """Start the request again from step 0 under a new attempt, once every stage is up.
@@ -1134,6 +1194,47 @@ class Gateway(
                 if time.monotonic() >= request.deadline or not context.is_active():
                     continue  # the checks above end it as a deadline or a cancel
                 context.abort(grpc.StatusCode.UNAVAILABLE, f"stage 0 stream failed: {why}")
+
+
+def recovery_parts(death: dict | None, registration: dict | None) -> dict:
+    """Split a stage's restart into detection, respawn and weight load (R6.12).
+
+    On the gateway clock, L is the dead epoch's last beat, D its declaration and G the new
+    incarnation's registration; W is the weight load time the new stage reported, a duration
+    on its own clock. detection is D - L. respawn is the rest of the restart after detection
+    apart from the weight load, G - D - W: noticing the exit, starting the process, hashing
+    the weights and registering. Subtracting W from a gateway interval combines two
+    durations, never two clocks. When G - D < W, the supervisor restarted the worker before
+    the gateway declared it dead (always so for path "replaced"): respawn is 0 and overlap
+    true, and the parts then add up to more than G - L. With no death, no registration yet or
+    no reported load, the parts that need it are None.
+    """
+    out = {
+        "stage": None,
+        "old_epoch": None,
+        "new_epoch": None,
+        "path": None,
+        "detection_ns": None,
+        "respawn_ns": None,
+        "weight_load_ns": None,
+        "overlap": None,
+    }
+    if death is None:
+        return out
+    out.update(
+        stage=death["stage"],
+        old_epoch=death["epoch"],
+        path=death["path"],
+        detection_ns=death["since_last_beat_ns"],
+    )
+    if registration is None:
+        return out
+    load = registration.get("load_ns")
+    out.update(new_epoch=registration["new_epoch"], weight_load_ns=load)
+    if load is not None:
+        left = registration["t_ns"] - death["t_ns"]
+        out.update(respawn_ns=max(0, left - load), overlap=left < load)
+    return out
 
 
 def serve(

@@ -56,3 +56,8 @@ extend-exclude = ["src/pllm/proto/*_pb2*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+markers = [
+    "fault: injects a fault to test a failure-handling claim of Epic E6 (uv run pytest -m fault)",
+]
