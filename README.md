@@ -755,6 +755,161 @@ for example `--heartbeat-timeout 3.0` on the macOS launcher, repeat the run in t
 order, and check that the verdict is pass. The value must stay below the 8 s keepalive
 timeout.
 
+## X5 and X6: crash recovery and stale outputs
+
+`pllm.x5` kills a stage with requests in flight (R7.12). `pllm.x6` suspends a stage past
+the heartbeat timeout, lets a replacement serve, then resumes the old process (R7.13,
+R6.8). Each does it to Stage 1 and to Stage 0 in every repeat (`--stages`, default `1 0`),
+5 repeats. Both are clients of a running system, run on the gateway's laptop, read the
+gateway's metrics file, and send faults to the supervisor of the stage's laptop.
+
+One repeat sends 4 requests of 64 tokens together (`--length` 128 prompts) and injects the
+fault once every one has 20 tokens and none has ended.
+
+Reference: before any fault, prompts of the prompt set run one at a time, in order, and the
+first 4 that give all 64 tokens are kept. This is the fault-free output of the same running
+system. When every address in the hosts file is the runner's laptop (one host, fp32, batch
+1), tokens and top logits must match it bit for bit. Across two laptops the tokens must
+match, and no bit-exact claim is made.
+
+### Setup on two laptops
+
+Set `PLLM_CONFIG` on both to a hosts file with this session's addresses (see
+[Hosts and ports](#hosts-and-ports)). In both files `[supervisor0]` must hold the Windows
+laptop's address and `[supervisor1]` the Mac's, or delete both tables to use the stages'
+addresses. A copy of `config/hosts.toml` keeps `127.0.0.1` there, and then no fault from
+the other laptop arrives. Use the same commit on both laptops.
+
+Each run records the round trip. Measure it before starting the system, since the probe's
+echo server uses the stage's port. Stop the echo server afterwards.
+
+```
+# Windows, then stop it with Ctrl-C once the probe is done
+uv run python -m pllm.netcheck serve --roles stage0
+# macOS
+uv run python -m pllm.netcheck probe --roles stage0
+```
+
+Then start the system. For X6, name each stage's thread count here, since the standby needs
+the same one (the launcher writes it to its run record only when it stops):
+
+```
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0 --threads <Windows n>
+# macOS terminal 1 (gateway and Stage 1)
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1 --threads <Mac n>
+```
+
+X5 needs nothing more:
+
+```
+# macOS terminal 2
+uv run python -m pllm.x5 smollm2-135m --metrics runs/<gateway>.metrics.jsonl --rtt-ms <ms>
+```
+
+X6 also needs a standby on each laptop whose stage it suspends. A supervisor never restarts
+a suspended worker, which is still running and still holds its port, so `pllm.standby`
+starts the replacement when the runner asks: a second supervised worker of that stage on
+the stage's port plus 100 (50151 or 50152), asked for on the supervisor's port plus 100
+(50161 or 50162). It loads no weights while idle. Its `--threads` must be the number given
+to that laptop's launcher.
+
+```
+# Windows, second terminal
+uv run python -m pllm.standby smollm2-135m --stage 0 --threads <Windows n>
+# macOS terminal 3
+uv run python -m pllm.standby smollm2-135m --stage 1 --threads <Mac n>
+# macOS terminal 2
+uv run python -m pllm.x6 smollm2-135m --metrics runs/<gateway>.metrics.jsonl --rtt-ms <ms>
+```
+
+With the Windows firewall on, the Stage 0 rule under [Windows setup](#windows-setup) must
+also allow the replacement's two ports: `-LocalPort 50051,50061,50151,50161`. The standby,
+like the supervisor, has no authentication.
+
+**Host B memory.** From the suspend until the repeat is restored, X6 on Stage 0 holds two
+Stage 0 workers on the Windows laptop, the suspended one and its replacement. Each is held
+to the 0.7 GiB worker budget (R1.7), so the budget for these repeats is 1.4 GiB, plus the
+standby process (36 MiB for its Python process, measured on Windows 11 with
+`uv run python -c "import psutil, pllm.standby; print(psutil.Process().memory_info().rss)"`).
+That is more than the 0.7 GiB budget and more than the lowest available memory in the first
+R1.7 measurement, 1.28 GiB, so close other programs first. Each X6 line has the stage
+laptop's available memory before the fault and with both workers loaded
+(`stage_free_ram_bytes`). X5 and X6 on Stage 1 keep Host B at one worker.
+
+### One laptop
+
+```
+uv run python -m pllm.launch smollm2-135m --threads <n>
+uv run python -m pllm.x5 smollm2-135m --metrics runs/<gateway>.metrics.jsonl
+# for X6, one more terminal each, with the same thread count
+uv run python -m pllm.standby smollm2-135m --stage 0 --threads <n>
+uv run python -m pllm.standby smollm2-135m --stage 1 --threads <n>
+uv run python -m pllm.x6 smollm2-135m --metrics runs/<gateway>.metrics.jsonl
+```
+
+### What is reported
+
+Output: one JSON line per reference request, one per repeat, one aggregate per stage with n,
+mean, stdev, min and max over its passed repeats, and a summary, in a `.jsonl` file next to
+the run record in `runs/` (named in the record as `results_file`) and on stdout. The record
+has the network, `--rtt-ms` (required across two laptops), the gateway's commit and its
+heartbeat timeout.
+
+- **Recovery times** are the gateway's recovery parts (see [Recovery time](#recovery-time)):
+  `detection_ms`, `respawn_ms`, `weight_load_ms`, and per request `replay_prefill_ms` and
+  `total_ms` (a repeat's value is their mean, with `total_ms_max`). Detection runs from the
+  dead epoch's last beat, so it is an upper bound on fault to detection. The weight load is
+  the new worker's own duration; no times of two clocks are subtracted. X5 also gives
+  `supervisor_respawn_s`, the supervisor's own time from noticing the exit to the new
+  worker listening, weight load included; it overlaps the parts. In X6, `respawn_ms` runs
+  to the replacement's registration, so it includes the runner's reaction and the
+  standby's start.
+- **Stale outputs.** `discards_by_reason` counts every drop in the repeat's lines.
+  `late_by_reason` (X6) counts the resumed process's outputs among those written after
+  the resume was sent: for Stage 1, results carrying its old epoch; for Stage 0, Stage 1's
+  refusals (`stale_nack:BAD_SENDER`) of steps from before the fault. Per request,
+  `stale_discarded` is the report's count, which sees dropped results only, not Nacks.
+- **Duplicate tokens at the client** are counted per request and summed.
+- `held_s` (X6) is the time from sending the suspend to sending the resume, on the
+  runner's clock.
+
+A repeat fails, and lists why, when a check fails or cannot be made: the fault did not take
+effect (a request ended before it, no declared death, no new epoch, a request that did not
+replay from at least token 20), another death or request in the repeat, a missing recovery
+line or time, a divergence, a duplicate or missing token, output unlike the reference, or a
+dropped result with no `discard` line. X6 also fails a repeat when the death was not found
+by the heartbeat timeout, the replacement did not serve, the old process was gone, no late
+output arrived, one was accepted (or Stage 1 ran a late step of the old Stage 0), the
+stage was suspended for 8 s or more (see "Limits" under
+[Failure detection](#failure-detection)), or the system could not be restored. The exit
+code is 0 only when every planned repeat of every stage ran and passed. Fewer than 5
+repeats, or another load (`--requests`, `--new-tokens`, `--fault-at`), needs `--trial`,
+which the record keeps.
+
+**A late output is not certain.** A suspended Stage 0 holds the steps the gateway goes on
+sending it, and sends them on when resumed. A suspended Stage 1 loses what it has not yet
+read once Stage 0 moves its route to the replacement and closes the old connection, so it
+sends a late result only if it was suspended with a step in hand. A repeat in which it held
+none shows nothing about rejection and fails. `--extra-attempts N` (default 0) runs such a
+repeat again, at most N times per stage, only when that is its one failure. The earlier
+attempt stays in the output marked `replaced` and is listed in the summary. Report how many
+there were.
+
+The replacement must load and serve before the 8 s are up, 2 s of which pass before the
+heartbeat timeout. If repeats fail on that, free memory on the stage's laptop. Detection
+also needs the gateway's `--heartbeat-timeout` to stay well below 8 s.
+
+**Restoring.** After each X6 repeat the runner kills the old worker through its supervisor,
+which starts a new one that takes over from the replacement, and then stops the
+replacement. The suspended worker is resumed on every way out of the runner, errors and
+Ctrl-C included. A runner that is killed outright cannot do that: resume the stage by hand
+(`curl -X POST -H "Content-Type: application/json" http://<laptop>:50062/resume`, 50061
+for Stage 0), kill it the same way with `/kill`, and restart its standby.
+
+`uv run pytest tests/test_x5.py tests/test_x6.py` runs both experiments against real
+supervised worker processes of a small random model, with no downloaded weights.
+
 ## X1a: the split against the single process
 
 `pllm.x1a` runs the 50 prompts of one length through the single-process model and through
