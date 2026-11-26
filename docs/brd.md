@@ -334,7 +334,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R8.10 | Single-host mode: all processes start on one laptop with the same entry points, for tests and X1a. | Must | W2 | A (unconfirmed) | Proposal special requirements |
 | R8.11 | Run discipline: other programs closed, same power state for every run, available memory logged at the start of each run. | Should | W2 | A and B (unconfirmed) | Proposal evaluation setup |
 | R8.12 | Stretch: Qwen3-1.7B with the stage role swap and about 6 layers on Host B, only if measured Host B memory allows. | Could | W6 | B (unconfirmed) | D1; Proposal goals |
-| R8.13 | Decision D12: role of the spare Linux MacBook (gateway and dashboard host, warm spare worker, or unused). Pending since before W2. | Could | W2 | A and B (unconfirmed) | D12 |
+| R8.13 | Decision D12: role of the spare Linux MacBook (gateway and dashboard host, warm spare worker, or unused). Status: decided 2026-11-26 (#63): unused; the system runs on the two laptops only. | Could | W2 | A and B (unconfirmed) | D12 |
 
 ### Epic E9. Dashboard, discovery and pairing (stretch)
 
@@ -397,7 +397,7 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 | D6 | Replay scope: full replay or partial replay (X10). | Default full. Decided 2026-11-07 (#51): full replay | R6.15, R6.17 |
 | D7 | Micro-batching depth: decode only or prefill too. | Default decode only. Decided 2026-11-07 (#41): decode only | R5.11 |
 | D11 | Dashboard, discovery and pairing: scheduled W3 to W5 or stretch. | Unconfirmed; owners unassigned | R9.1 |
-| D12 | Role of the spare Linux MacBook. | Pending since before W2 | R8.13 |
+| D12 | Role of the spare Linux MacBook. | Decided 2026-11-26 (#63): unused | R8.13 |
 | D2, D3, D8, D9, D10 | Deployment (gateway and Stage 1 on macOS, Stage 0 on Windows); CPU fp32; hardware confirmed; Host B runs Stage 0; even split of work. | Decided. D10 owners are still marked unconfirmed in this document. | none |
 | TA1 | Is the model ours to choose or supplied? | Decided 2026-11-01: ours (#8) | R1.11 |
 | TA2 | Is a gateway process acceptable alongside the two workers? | Decided 2026-11-01: separate gateway process (#10) | R1.13 |
