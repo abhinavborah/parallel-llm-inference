@@ -698,6 +698,62 @@ The record keeps the command (`argv`), each reference's file, host and checksum,
 pipeline's tokens and top logits per prompt, so a later comparison needs no rerun. The exit
 code is 0 when every request completed; agreement is reported, not asserted.
 
+## X3: bytes per hop
+
+`pllm.x3` measures the serialized bytes per message on each hop for one prompt length. It
+sends `--count` prompts (default 5) of `--length` tokens (16, 128 or 512) one at a time with
+`--new-tokens` (default 128; decoding stops earlier at end of sequence), then waits for the
+gateway to stop and reads its metrics file.
+
+Stage 0 to Stage 1 never passes the gateway: Stage 0 returns its byte counts when its stream
+ends, and the gateway writes the totals for the whole run when it stops. So one gateway run
+gives one length, and its file must hold this run's requests only. A restarted gateway is not
+rejoined by the stages, so start both laptops again for each length. Run the gateway in its
+own terminal and stop it first, while the stages are up: the launcher stops Stage 1 before the
+gateway when both run under one launcher, which can lose Stage 0's counts.
+
+For each length (16, 128, 512), on a freshly started system:
+
+```
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0
+# macOS terminal 1 (gateway)
+uv run python -m pllm.launch smollm2-135m --roles gateway
+# macOS terminal 2 (Stage 1)
+uv run python -m pllm.launch smollm2-135m --roles stage1
+# macOS terminal 3
+uv run python -m pllm.x3 smollm2-135m --length 16 --metrics runs/<gateway>.metrics.jsonl
+```
+
+X3 sends its first request once both stages beat in the gateway's file, since a request sent
+earlier is refused and its line would fail the run. When X3 prints "stop the gateway now",
+press Ctrl-C in terminal 1. X3 waits up to `--wait` seconds (default 600, also the limit for
+the stages) for the file's `run_end` line, writes its results, and exits. Then stop
+Stage 1 and Stage 0. `--rtt-ms` puts a round-trip time from `pllm.netcheck` into the run record.
+
+Per hop and phase it gives messages, bytes, payload bytes, positions, bytes per position and
+bytes per message, and the overhead per message (bytes minus payload over messages): the mean,
+and for the gateway's two hops, which have one line per message, also the largest. Bytes are
+the protobuf serialized size; gRPC's 5 bytes per message and HTTP/2 framing are not included.
+
+Only Stage 0 to Stage 1 carries activations: the gateway sends token ids to Stage 0 and gets
+one token and its logit per step from Stage 1. So the check is on that hop, per phase:
+
+- payload bytes equal positions x hidden size x 4 B exactly (hidden size from the model's
+  `config.json`, 576 for smollm2-135m);
+- the mean overhead per message is at most 128 B (45 to 49 B measured on loopback with the
+  test model; only the shape and position fields grow with the length, by a few bytes);
+- its positions equal those the gateway sent to Stage 0, so no step was lost or added.
+
+X3 refuses a metrics file that is for another model or already has requests, an end or an
+unreadable line. The run fails, with the reasons in the summary, when the file has no
+`run_end` in time, Stage 0's totals are incomplete, a line is unreadable, a request in the
+file is not this run's, or a request failed. Output: one JSON line per hop and phase, then a
+summary with the measured overhead and the check, in a `.jsonl` file next to the run record
+in `runs/` (named in the record as `results_file`) and on stdout. The record keeps the
+command (`argv`), the settings, the hidden size and each request's output tokens. The exit
+code is 0 only when the check passes.
+
 ## Starting the system
 
 `pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway
