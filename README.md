@@ -603,6 +603,36 @@ Limits:
   stopped process cannot answer a ping. Outputs it held for a closed stream can then be lost
   rather than delivered late, so a stale-output run (X6) keeps each suspension under 8 s.
 
+## Beat gaps
+
+`pllm.beatgaps` reads a gateway metrics file and prints, for each stage, the gaps between
+consecutive beats of one incarnation on the gateway's clock: count, median, p99 and maximum,
+for the idle part of the run, the loaded part (inside the request window) and both. It then
+prints the heartbeat timeout the run used, the stages the gateway declared dead, a verdict
+(pass when nothing was declared and the longest gap is below the timeout; exit code 0 only
+then) and a suggested timeout: the longest gap times `--margin` (default 1.5), rounded up to
+0.5 s. The suggestion is only a suggestion; the chosen value and its margin are stated with
+the measured numbers. Each call writes a run record.
+
+The measurement on two laptops, with no fault injected: 10 minutes idle, then about 10
+minutes of load.
+
+```
+# macOS (gateway and Stage 1)
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0
+# macOS, after 10 minutes idle; stop it with Ctrl-C after 10 more minutes
+uv run python -m pllm.x2 pipeline smollm2-135m --concurrency 4 --repeats 1 --requests 1000 --metrics runs/<gateway>.metrics.jsonl
+# macOS, after stopping both launchers
+uv run python -m pllm.beatgaps runs/<gateway>.metrics.jsonl
+```
+
+The recorder needs only the completed requests to place the load window, so stopping the
+load early is fine. Then start the gateway again with the chosen value, for example
+`--heartbeat-timeout 3.0` on the macOS launcher, repeat the run, and check that the verdict
+is pass. The value must stay below the 8 s keepalive timeout.
+
 ## X1a: the split against the single process
 
 `pllm.x1a` runs the 50 prompts of one length through the single-process model and through
