@@ -146,11 +146,21 @@ def reference(model_dir, k, ids, n):
 
 def test_each_stage_beats_its_stage_epoch_and_cached_count_at_the_interval(beating):
     run = beating(interval=0.1)
-    counts = count_beats(run.gateway)
-    wait_for(lambda: set(run.gateway.beats()) == {0, 1}, "a beat from both stages")
-    time.sleep(1.0)
+    arrived = {0: [], 1: []}  # when the gateway recorded each stage's beats
+    real = run.gateway._record
+
+    def spy(session, message):
+        if message.WhichOneof("msg") == "beat":
+            arrived[session.stage].append(time.monotonic())
+        real(session, message)
+
+    run.gateway._record = spy
+    wait_for(lambda: all(len(times) >= 11 for times in arrived.values()), "eleven beats each")
     for stage, servicer in ((0, run.servicer0), (1, run.servicer1)):
-        assert 6 <= counts[stage] <= 14, counts  # about ten beats a second at 0.1 s
+        # ten intervals of 0.1 s: never much less, and a slow runner may take longer, though
+        # not as long as at the default 0.5 s
+        took = arrived[stage][10] - arrived[stage][0]
+        assert 0.8 <= took < 3.0, (stage, took)
         latest = run.gateway.beats()[stage]
         assert latest["epoch"] == servicer.own_epoch == run.registry.stages[stage].epoch
         assert latest["cached_requests"] == 0 and latest["inbox_depth"] == 0

@@ -2,16 +2,19 @@
 is harmless (R6.8).
 
 The stage runs as a real process. It is suspended inside a step, so it holds an output it
-has not sent yet. Its epoch is declared dead by the heartbeat timeout, a new process takes
-its place, and only then is the old one resumed. It is told it was superseded and keeps
-serving, as a worker does, so it sends that late output:
+has not sent yet: the process marks a file as each step begins, and is suspended only after
+a new mark, so a slow runner cannot suspend it before the step has reached it. Its epoch is
+declared dead by the heartbeat timeout, a new process takes its place, and only then is the
+old one resumed. It is told it was superseded and keeps serving, as a worker does, so it
+sends that late output:
 
 - an old Stage 1 pushes its result to the gateway, whose result filter drops it;
 - an old Stage 0 forwards its hidden states to Stage 1 with its old sender epoch, and Stage 1
   refuses them with BAD_SENDER. The Nack names an old attempt, so it fails nothing.
 
 The client sees each step once and the fault-free tokens. Equality is on one host, fp32,
-batch 1.
+batch 1. For Stage 1, the report counts each late result as a stale output of the request's
+recovery (R6.12).
 """
 
 import subprocess
@@ -24,16 +27,18 @@ from test_heartbeat import Beating, reference
 from test_model import tiny_reference
 from test_replay import take
 
-from pllm import faults, metrics
+from pllm import faults, metrics, report
 from pllm.control import ExpectedModel
 from pllm.models import sha256_of
+from pllm.wire import KEEPALIVE_TIMEOUT_SECONDS
+
+pytestmark = pytest.mark.fault
 
 LAYERS = 4
 K = 2
 BEAT = 0.05
 TIMEOUT = 1.0  # heartbeat timeout: 20 beats, so a slow runner does not declare a live stage
 OLD_DELAY = 0.4  # each step of the old process, so the suspend lands inside one
-INTO_STEP = 0.15  # after a token, when the next step is inside the old process's delay
 N = 32  # tokens, enough that the request still runs when the old process resumes
 
 CHILD = """
@@ -41,12 +46,23 @@ import sys, threading
 from pathlib import Path
 from pllm.stage_service import serve
 from pllm.worker import StageWorker, WorkerConfig, join_gateway
-model_dir, stage, k, n, gateway, neighbour, interval, delay = sys.argv[1:9]
+model_dir, stage, k, n, gateway, neighbour, interval, delay, marks = sys.argv[1:10]
 stage, k, n = int(stage), int(k), int(n)
 layers = (0, k) if stage == 0 else (k, n)
 where = {"next_address": neighbour} if stage == 0 else {"results_address": gateway}
 config = WorkerConfig(Path(model_dir), *layers, float(delay))
-server, servicer, port = serve(StageWorker(config), "127.0.0.1:0", **where)
+worker = StageWorker(config)
+sleep = worker.delay
+
+
+def delay_after_a_mark():  # a step has reached this process and its delay begins
+    with open(marks, "a") as file:
+        file.write(".")
+    sleep()
+
+
+worker.delay = delay_after_a_mark
+server, servicer, port = serve(worker, "127.0.0.1:0", **where)
 join_gateway(gateway, stage, layers, "tiny", Path(model_dir), f"127.0.0.1:{port}", servicer,
              threading.Event(), interval=float(interval))
 server.wait_for_termination()  # superseded: no more beats, but it serves on, as main does
@@ -101,18 +117,26 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
     real = bytes.fromhex(sha256_of(tmp_path / "model.safetensors"))
     run.registry.expected = ExpectedModel(real, LAYERS, K)
     neighbour = "" if stage == 1 else f"127.0.0.1:{run.ports[1]}"
+    metrics_file = tmp_path / "gateway.metrics.jsonl"
+    run.gateway.recorder = metrics.Recorder(metrics_file)
     outputs = outputs_of(run, stage)
 
-    def spawn(delay):
+    def spawn(delay, marks):
         args = [str(tmp_path), str(stage), str(K), str(LAYERS), run.address, neighbour]
-        return subprocess.Popen([sys.executable, "-c", CHILD, *args, str(BEAT), str(delay)])
+        rest = [str(BEAT), str(delay), str(marks)]
+        return subprocess.Popen([sys.executable, "-c", CHILD, *args, *rest])
+
+    old_marks = tmp_path / "old.marks"
+
+    def begun():  # steps the old process has begun
+        return old_marks.stat().st_size if old_marks.exists() else 0
 
     def routed(epoch):  # the neighbour in this process has the stage's route update
         if stage == 1:
             return run.servicer0.next_epoch == epoch
         return run.servicer1.upstream_epoch == epoch
 
-    children, suspended = [spawn(OLD_DELAY)], None
+    children, suspended = [spawn(OLD_DELAY, old_marks)], None
     old_proc = children[0]
     try:
         stages = run.registry.stages
@@ -122,9 +146,10 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         expected = reference(tmp_path, K, IDS, N)[0]
         stream = run.call(max_tokens=N)
         tokens = take(stream, 2)
-        time.sleep(INTO_STEP)
-        faults.suspend(old_proc.pid)
-        suspended = old_proc
+        before = begun()
+        wait_for(lambda: begun() > before, "the old process to begin its next step")
+        faults.suspend(old_proc.pid)  # within its delay: the output is not sent yet
+        suspended, suspended_at = old_proc, time.monotonic()
 
         wait_for(lambda: run.gateway.detector.is_dead(old), "the old epoch to be declared dead")
         events = run.gateway.detector.events()
@@ -132,7 +157,7 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         assert death["path"] == "heartbeat_timeout" and death["declared"]
         declared = len(outputs)  # the old process sends nothing from here until it resumes
 
-        children.append(spawn(0.0))
+        children.append(spawn(0.0, tmp_path / "new.marks"))
         wait_for(lambda: stages[stage].epoch > old, "the replacement's registration")
         new = stages[stage].epoch
         wait_for(lambda: routed(new), "the route update to the replacement")
@@ -142,8 +167,11 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         )
         tokens += take(stream, 1)
 
+        held = time.monotonic() - suspended_at
         faults.resume(old_proc.pid)
         suspended = None
+        # past keepalive the old process's connections close and its late output is lost
+        assert held < KEEPALIVE_TIMEOUT_SECONDS, f"suspended {held:.1f} s, past keepalive"
 
         def late():
             return [o for o in outputs[declared:] if o[0] == old]
@@ -167,6 +195,12 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         assert [t.token for t in tokens] == expected
         assert run.gateway.replays >= 1 and run.gateway.divergences == 0
         assert stages[stage].epoch == new
+        if stage == 1:  # every dropped result of an older attempt, the late ones included
+            header = report.RECOVERY_HEADER
+            rows = report.recovery_rows(report.load(metrics_file))
+            [row] = [dict(zip(header, r, strict=True)) for r in rows if r[0] == tokens[0].rid]
+            dropped = [o for o in outputs if o[3] and o[1] < row["attempt"]]
+            assert row["stale_discarded"] == len(dropped) >= len(late()) >= 1
     finally:
         if suspended is not None:
             faults.resume(suspended.pid)

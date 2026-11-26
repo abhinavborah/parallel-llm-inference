@@ -35,6 +35,8 @@ from pllm import metrics
 from pllm.proto import protocol_pb2
 from pllm.stage_service import StageServicer
 
+pytestmark = pytest.mark.fault
+
 LAYERS = 4
 K = 2
 BEAT = 0.05

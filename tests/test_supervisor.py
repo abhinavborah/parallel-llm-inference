@@ -29,6 +29,8 @@ from pllm.proto import protocol_pb2_grpc
 from pllm.supervisor import NoWorker, Supervisor, serve_control, worker_command
 from pllm.worker import exit_when_parent_gone, register_with_gateway
 
+pytestmark = pytest.mark.fault
+
 WAIT = 30.0
 
 LISTENER = """

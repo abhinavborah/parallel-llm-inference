@@ -46,10 +46,12 @@ def commands(
     threads: int,
     dashboard: bool = False,
     hop_delay_control: bool = False,
+    heartbeat_timeout: float | None = None,
 ) -> dict[str, list[str]]:
     """The command of each role in start order: the stages register with the gateway. With
     dashboard, the gateway also serves the live page. With hop_delay_control, the gateway
-    and Stage 1 take the X4 hop delay from runs/hop_delay_ms (pllm.x4)."""
+    and Stage 1 take the X4 hop delay from runs/hop_delay_ms (pllm.x4). heartbeat_timeout
+    goes to the gateway, which checks its range."""
     wanted = set(roles)
     out = {}
     for role in config.ROLES:
@@ -61,6 +63,8 @@ def commands(
                 out[role].append("--dashboard")
             if hop_delay_control:
                 out[role].append("--hop-delay-control")
+            if heartbeat_timeout is not None:
+                out[role] += ["--heartbeat-timeout", str(heartbeat_timeout)]
         else:
             stage = role.removeprefix("stage")
             out[role] = [
@@ -157,6 +161,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         action="store_true",
         help="X4: the gateway and Stage 1 take their hop delay from runs/hop_delay_ms",
     )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="passed to the gateway: no Beat for this long declares a stage dead",
+    )
     args = parser.parse_args(argv)
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
@@ -164,6 +174,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--hop-delay-control needs the gateway and stage1 roles on this laptop")
     if args.dashboard and "gateway" not in args.roles:
         parser.error("--dashboard needs the gateway role on this laptop")
+    if args.heartbeat_timeout is not None and "gateway" not in args.roles:
+        parser.error("--heartbeat-timeout needs the gateway role on this laptop")
+    if args.heartbeat_timeout is not None and not 0 < args.heartbeat_timeout < float("inf"):
+        parser.error("--heartbeat-timeout must be a positive number of seconds")
     try:
         hosts = config.load()
         split = config.split_point(args.model)
@@ -212,10 +226,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if power is not None and not power["plugged_in"]:
             log.warning("on battery: use the same power state for every run")
-        code = run(
-            commands(args.model, args.roles, threads, args.dashboard, args.hop_delay_control),
-            done,
+        rec["heartbeat_timeout_s"] = args.heartbeat_timeout
+        to_start = commands(
+            args.model,
+            args.roles,
+            threads,
+            args.dashboard,
+            hop_delay_control=args.hop_delay_control,
+            heartbeat_timeout=args.heartbeat_timeout,
         )
+        code = run(to_start, done)
         if code:
             raise SystemExit(code)
 
