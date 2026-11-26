@@ -212,7 +212,8 @@ supervisor listens on that host; without the tables it is the stage's host on po
 50061. A fault request from the other laptop needs that port reachable; with the Windows
 firewall on, as on the college Wi-Fi, it needs an inbound rule (see "Windows setup").
 
-There is no authentication, so keep it on the lab network. `status` reports a worker
+There is no authentication, so use it only on a network you trust, or limit who can reach it
+(see "Network"). `status` reports a worker
 as suspended from the moment a suspend is applied until it is resumed or replaced; a suspend
 that lands as the worker exits can briefly mislabel its replacement.
 
@@ -464,7 +465,8 @@ counts tokens sent and requests ended by outcome (`Gateway.state()`).
 Safety, as for the supervisor's control port: a POST needs `Content-Type: application/json`,
 a Host the server answers to and no foreign Origin, no response has a CORS header and OPTIONS
 is not answered, so a page on another site cannot press the buttons from a browser. There is no
-authentication beyond that: keep it on the lab network. Open event streams (16), requests
+authentication beyond that: use it only on a network you trust (see "Network"). Open event
+streams (16), requests
 started from the page (64 at once), each client's backlog and request bodies are bounded. A
 viewer that vanishes without closing its connection keeps its place until a write to it
 fails, and a viewer that reads slowly loses its oldest events, so a card can miss its first
@@ -723,6 +725,9 @@ New-NetFirewallRule -DisplayName "pllm stage0" -Direction Inbound -Protocol TCP 
   other path.
 - If the other laptop's address changes, update the rule. Its address on the hotspot is
   different, so with the firewall on there, the rule needs that address.
+- If it still cannot connect, look for an inbound Block rule for the same `python.exe`,
+  which `netcheck firewall` lists. Cancelling the Windows prompt for Python, or leaving a
+  network type unticked there, can create one, and a Block rule wins over an Allow rule.
 
 ### macOS setup
 
@@ -738,7 +743,16 @@ Addresses can change between sessions: set each host to that session's address f
 laptop and `network` to the network's name (for example `college-wifi`), and with the
 firewall on, update the address in the inbound rule. Before any timed run, repeat the
 network probe three times in each direction with both laptops plugged in. If the p95
-round-trip spread stays high, report it with each timed result or use the hotspot.
+round-trip spread stays high, report it with each timed result or use the hotspot. No level
+for "high" is set yet; it is to be agreed on #123.
+
+No port here has authentication, and the college Wi-Fi is shared. The rule under "Windows
+setup" limits only the Windows laptop's Stage 0 and supervisor ports. Nothing in this
+README limits the ports on the Mac, so any device on that Wi-Fi that can reach it can use
+them: the gateway (50050), Stage 1 (50052), its supervisor (50062), which takes kill and
+suspend requests, and the dashboard (50080) if it is bound to the LAN address. Keep the
+dashboard on 127.0.0.1, as the committed hosts file does, unless the other laptop needs it,
+and stop the processes when a run ends.
 
 ## Hosts and ports
 
@@ -794,8 +808,22 @@ With the Windows firewall off on a profile (as on the phone hotspot for now, agr
 2026-11-09), the check reports every port as allowed there. With it on (as on the college
 Wi-Fi), the check reads the inbound rules for the profile in use, which needs an
 administrator shell (without one it gives no
-verdict), and prints a rule to add for that profile and the interpreter. With several
-network adapters, pass `--interface <this laptop's IP>` to the multicast commands.
+verdict), and prints a rule to add for that profile and the interpreter. The printed rule
+has no address limit, so on the college Wi-Fi use the form under "Windows setup" instead.
+The check also does not read a rule's remote addresses: it reports a port as allowed
+whether or not the rule is limited. With several network adapters, pass
+`--interface <this laptop's IP>` to the multicast commands.
+
+With the Windows firewall on, the Stage 0 rule covers TCP only, so a multicast listen on
+the Windows laptop needs its own rule for UDP 50059; without it, hearing nothing says
+nothing about the network. Add it from an administrator PowerShell for the test and remove
+it afterwards, or run the multicast test on the hotspot with the firewall off:
+
+```
+New-NetFirewallRule -DisplayName "pllm multicast test" -Direction Inbound -Protocol UDP -LocalPort 50059 -Program "<python.exe path>" -RemoteAddress <other laptop IP> -Profile <profile in use> -Action Allow
+Remove-NetFirewallRule -DisplayName "pllm multicast test"
+```
+
 On a new session, check the addresses again (see "Network" above). Every
 probe, listen and firewall run writes a run record.
 
