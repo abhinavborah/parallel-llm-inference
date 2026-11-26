@@ -261,7 +261,8 @@ is greedy, and on one host, in fp32, at batch 1 and one thread count the tokens 
 logits equal the single-process reference (tested with small random models).
 
 - The gateway runs on the Mac and loads only the tokenizer and `config.json`, not the
-  weights.
+  weights. For KV admission it reads the tensor shapes in `model.safetensors`, not the
+  tensors, so the file must be there; without it the gateway does not start.
 - A prompt whose prefill would exceed the receive limit from `[limits]` is rejected with
   INVALID_ARGUMENT before anything is sent to Stage 0 (for SmolLM2 at the committed limits,
   more than 512 tokens). A prompt whose request message is itself larger than the limit in
@@ -325,6 +326,43 @@ logits equal the single-process reference (tested with small random models).
     bound, so nothing is refused. `--credits` stays within `stage_inbox`. The metrics
     file's `run` line records the values in use (`admission_queue` is null when off).
     The running slots are not changed.
+  - KV admission (R5.3), from `host_b_budget_gib` (0.7), `host_b_runtime_mib` (196) and
+    `host_b_margin_mib` (64). Stage 0 runs on Host B, whose worker budget is 0.7 GiB of peak
+    RSS for the whole process (R1.7). The gateway subtracts the runtime (the RSS of a fresh
+    process after importing torch and the model code, measured on Host B), the margin, and
+    the fp32 size of Stage 0's layers at the split in use, read from the shapes in
+    `model.safetensors`. The mapped embedding is read with file reads, so it adds nothing.
+    What is left is the KV budget. The margin is a proposed figure, not a measurement, for
+    the worker memory that runtime plus weights leave out, all inside the 0.7 GiB: a serving
+    Stage 0 for SmolLM2 read about 415 MiB idle, about 16 MiB above them (a check on Host B
+    on 2026-11-26, not a recorded run), one appended layer (below), the attention scores of
+    a 512 token prefill (about 18 MiB) and gRPC message copies. Each request
+    reserves (prompt tokens + `max_tokens`) x Stage 0 KV bytes per position (layers x 2 x
+    kv heads x head dim x 4) before it may queue. One that does not fit beside the
+    reservations already held is refused at once with RESOURCE_EXHAUSTED (its message says
+    when it is over the whole budget, so a retry cannot help) and counted in
+    `Gateway.kv_rejected` as well as the `rejected` outcome. Queued requests hold their
+    reservation, and every way a request ends gives it back. The gateway logs the budget at
+    start and writes `kv_budget_bytes` and `kv_bytes_per_position` to the metrics file.
+    - SmolLM2 (k = 15): 202.6 MiB of weights leave 254.2 MiB, 23,040 bytes per position,
+      11,570 positions. At the committed limits (22 requests of at most 528 positions) 21
+      fit, so it binds only when nearly all 22 are that long; with
+      longer requests it binds sooner, for example 5 requests of 2,000 positions.
+    - Qwen3-0.6B (k = 14): 840.1 MiB of Stage 0 weights alone exceed 0.7 GiB, so no KV
+      budget is left. The gateway refuses to start with the numbers; `--no-kv-admission`
+      (on the gateway or the launcher) runs it without the check, and the run record then
+      has `kv_budget_bytes` null.
+    - Limits. It reserves each request's maximum, not measured use (R5.10 tunes it). An
+      append copies one layer of one request, so a step briefly holds one more layer (about
+      12 MiB at 8,192 positions for SmolLM2). That layer, prefill activations and gRPC
+      buffers are worker memory, so they come out of the margin, not the 0.5 GiB headroom
+      above the budget (R1.7 keeps that for other programs). The gateway gives a
+      reservation back when the request ends, but Stage 0 frees the cache only when the
+      `Free` arrives on its heartbeat stream (every 0.5 s), so requests admitted in that gap
+      can briefly overlap the freed caches by up to what they cache in that gap.
+    - `uv run pytest tests/test_kv_admission.py` checks requests at exactly the budget and
+      one byte over, a queued request holding its bytes, and that each way a request ends
+      gives its reservation back.
   - `Gateway.queue_peak`, `Gateway.in_flight_peak` and each stage's `inbox_peak` record the
     deepest each has been; `tests/test_backpressure.py` checks them against the bounds
     under overload.
@@ -344,7 +382,7 @@ logits equal the single-process reference (tested with small random models).
   model's context length (8192 positions for SmolLM2) is refused with INVALID_ARGUMENT.
   This bounds each request, not Host B's memory: with an even split, one request at the
   cap holds about 180 MiB of Stage 0 cache for SmolLM2 but about 4.4 GiB for Qwen3-0.6B
-  (40960 positions), more than Host B has. Admission by Host B's KV budget (R5.3) is #34.
+  (40960 positions), more than Host B has; KV admission (below) bounds the sum.
   One long prefill delays the other requests' next steps at that stage.
 - Text is decoded per token, holding back a token that ends inside a character until the
   next one completes it (up to four tokens), so a `Token` can carry empty text.
@@ -1064,8 +1102,14 @@ accepted only with the gateway role on this laptop. The gateway checks the range
 0.5 s beat interval and below the 8 s keepalive timeout); an out-of-range value makes it
 exit, and the launcher then stops the rest. See [Beat gaps](#beat-gaps) for how to choose it.
 
+`--no-kv-admission` passes the gateway's flag through (gateway role only): requests are then
+admitted without Host B's KV budget (R5.3). The gateway refuses to start without it when the
+model's Stage 0 leaves no KV budget, as Qwen3-0.6B does.
+
 Before every run, close other programs and use the same power state. The launcher logs the
 available memory and power state at the start, warns on battery, and writes a run record.
+For a two-laptop run it also logs a short round trip to each of the other laptop's roles once
+their ports answer (see "Run records").
 
 ### Windows setup
 
@@ -1147,6 +1191,29 @@ $env:PLLM_CONFIG = "config/hosts.local.toml"
 Every script writes a JSON record to `runs/` (ignored by git) with the commit, model and
 revision, split point, thread count, host, OS, network, round-trip time, available memory,
 power state and dates.
+
+In the launch record, `rtt_ms` is the median of every timed TCP connect to the other
+laptop's roles, five per role once its port answers, and `probe` holds the figures per role. It is a
+connect time, not the echo round trip of `pllm.netcheck probe`. It is null in single-host
+mode, and a role that never answered before the run stopped is recorded with its error.
+The launch record of a session holds the network name and this round trip for every run in
+that session, so the records of scripts run during it leave `rtt_ms` null unless given one.
+
+## Session checklist
+
+At the start of every two-laptop session, on the college Wi-Fi or the phone hotspot fallback,
+in order. Steps 2 to 4 stay set, so check them once per laptop.
+
+1. Both laptops on the charger; Windows on the best performance power mode.
+2. Windows: Power Options, "Wireless Adapter Settings", "Power Saving Mode" set to Maximum Performance.
+3. Windows: Device Manager, Wi-Fi adapter, Power Management, untick "Allow the computer to turn off this device to save power".
+4. macOS has no Wi-Fi power saving switch: in Battery, Options, Low Power Mode off and "Prevent automatic sleeping on power adapter when the display is off" on.
+5. Hotspot fallback only: phone on its charger, hotspot kept on (idle auto-off disabled), updates and sync paused on both laptops.
+6. Read both addresses: `ipconfig getifaddr en0` on macOS, `ipconfig` on Windows (Wi-Fi IPv4 address).
+7. On both laptops set each host and `network` (`college-wifi` or the hotspot name) in `config/hosts.local.toml`, and `PLLM_CONFIG` (see "Hosts and ports").
+8. College Wi-Fi or any network other than our own hotspot: Windows firewall on with the TCP 50051 and 50061 rules under "Windows setup" (limiting them to the Mac's address is optional); check with `uv run python -m pllm.netcheck firewall --roles stage0` as administrator.
+9. Run the two-way TCP probe under "Host checks"; both directions pass before any run.
+10. Start both launchers (see "Starting the system"); each launch record holds the network name and the short round trip.
 
 ## Host checks
 

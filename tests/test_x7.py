@@ -568,7 +568,10 @@ def test_the_report_says_per_credit_limit_whether_the_bound_keeps_p99_down(tmp_p
 
 @pytest.mark.parametrize(
     ("flags", "queue", "credits"),
-    [([], 8, 8), (["--admission-queue", "off", "--credits", "2"], None, 2)],
+    [
+        ([], 8, 8),
+        (["--admission-queue", "off", "--credits", "2", "--no-kv-admission"], None, 2),
+    ],
 )
 def test_the_gateway_command_applies_the_flags_and_records_them(
     tmp_path, monkeypatch, flags, queue, credits
@@ -581,6 +584,8 @@ def test_the_gateway_command_applies_the_flags_and_records_them(
     monkeypatch.setattr(gateway, "Tokenizer", lambda *a: Words())
     monkeypatch.setattr(gateway, "eos_ids", lambda *a: [])
     monkeypatch.setattr(gateway, "max_positions", lambda *a: None)
+    monkeypatch.setattr(gateway, "stage_weight_bytes", lambda *a: 0)
+    monkeypatch.setattr(gateway, "bytes_per_position", lambda *a: 1000)
     monkeypatch.setattr(gateway, "stop_event", threading.Event)
     monkeypatch.setattr(gateway, "serve", lambda built, *a: (None, 0))
 
@@ -595,6 +600,7 @@ def test_the_gateway_command_applies_the_flags_and_records_them(
     assert (settings["admission_queue"], settings["credits"]) == (queue, credits)
     assert settings["stage_inbox"] == 16 and settings["max_running"] == gateway.MAX_RUNNING
     assert seen["gateway"].credits == credits
+    assert (seen["gateway"].kv_budget is None) == ("--no-kv-admission" in flags)
     assert seen["gateway"].max_queued == (gateway.UNBOUNDED_QUEUE if queue is None else queue)
 
 
