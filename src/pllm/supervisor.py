@@ -191,6 +191,8 @@ class Supervisor:
             "last_respawn_seconds": self.last_respawn_seconds,
             # this laptop's memory, for the dashboard (R9.4)
             "free_ram_bytes": psutil.virtual_memory().available,
+            # the worker's own, for the Host B budget (R1.7, R7.14)
+            **worker_memory(pid),
         }
 
     # ------------------------------------------------------------------ the loop
@@ -301,6 +303,27 @@ class Supervisor:
 
 
 # ---------------------------------------------------------------------- control port
+
+
+def worker_memory(pid: int | None) -> dict:
+    """The worker's memory over its process tree (on Windows a venv's python.exe is a small
+    launcher with the real interpreter as its child). worker_rss_bytes is the resident set
+    now. worker_peak_rss_bytes is the sum of each process's own lifetime peak, which Windows
+    reports and other systems do not through psutil: there it is null. Both are null with
+    no worker, or when one cannot be read."""
+    unknown = {"worker_rss_bytes": None, "worker_peak_rss_bytes": None}
+    if pid is None:
+        return unknown
+    try:
+        root = psutil.Process(pid)
+        infos = [p.memory_info() for p in (root, *root.children(recursive=True))]
+    except psutil.Error:
+        return unknown
+    peaks = [getattr(info, "peak_wset", None) for info in infos]
+    return {
+        "worker_rss_bytes": sum(info.rss for info in infos),
+        "worker_peak_rss_bytes": None if None in peaks else sum(peaks),
+    }
 
 
 def serve_control(supervisor: Supervisor, bind: tuple[str, int]) -> ThreadingHTTPServer:

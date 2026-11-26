@@ -212,6 +212,11 @@ supervisor listens on that host; without the tables it is the stage's host on po
 50061. A fault request from the other laptop needs that port reachable; with the Windows
 firewall on, as on the college Wi-Fi, it needs an inbound rule (see "Windows setup").
 
+`status` also gives the laptop's free memory (`free_ram_bytes`) and the worker's own over
+its process tree: `worker_rss_bytes` now, and `worker_peak_rss_bytes`, the sum of each
+process's lifetime peak, which includes loading the model. Windows reports the peak; macOS
+and Linux give null for it. Both are null with no worker.
+
 There is no authentication, so use it only on a network you trust, or limit who can reach it
 (see "Network"). `status` reports a worker
 as suspended from the moment a suspend is applied until it is resumed or replaced; a suspend
@@ -316,6 +321,11 @@ logits equal the single-process reference (tested with small random models).
     the next hop, may hold at a stage. A full inbox stops the stage reading, so gRPC flow
     control slows the sender; on a healthy stream nothing is dropped. A stream that ends
     (a route change, a failed next hop) discards what it held, as before.
+  - `--admission-queue N|off` and `--credits N` on the gateway (and on `pllm.launch`, which
+    passes them on) change the two gateway bounds for one run; `off` removes the admission
+    bound, so nothing is refused. `--credits` stays within `stage_inbox`. The metrics
+    file's `run` line records the values in use (`admission_queue` is null when off).
+    The running slots are not changed.
   - KV admission (R5.3), from `host_b_budget_gib` (0.7), `host_b_runtime_mib` (196) and
     `host_b_margin_mib` (64). Stage 0 runs on Host B, whose worker budget is 0.7 GiB of peak
     RSS for the whole process (R1.7). The gateway subtracts the runtime (the RSS of a fresh
@@ -391,7 +401,8 @@ time from another machine is subtracted. `wall_time` on the first line is a labe
 |---|---|---|
 | `run` | Start | `clock`, `start_ns`, `wall_time`, `commit`, `model`, `revision`, `split`, `network`, `host`, `os`, `python`, `available_memory_bytes`, `power`, `heartbeat_timeout_s`, `step_timeout_s`, `argv` |
 | `hop` | Each message the gateway sends or receives | `t_ns`, `hop`, `msg`, `phase`, `rid`, `attempt`, `step`, `bytes`, `payload_bytes`, `positions`, `accepted` |
-| `beat` | Each heartbeat of a live epoch (every 0.5 s); one from an epoch declared dead is not logged | `t_ns`, `stage`, `epoch`, `busy_ns`, `steps` |
+| `beat` | Each heartbeat of a live epoch (every 0.5 s); one from an epoch declared dead is not logged | `t_ns`, `stage`, `epoch`, `busy_ns`, `steps`, `inbox_depth` |
+| `depth` | When the gateway's queue depths have changed, checked every 0.05 s | `t_ns`, `running`, `queued`, `in_flight`, `queue_peak`, `in_flight_peak` (the peaks since the gateway started, which also count a spike between two checks) |
 | `request` | Each request's end | `t_ns`, `rid`, `attempt`, `outcome`, `code`, `prompt_tokens`, `max_tokens`, `output_tokens`, `arrived_ns`, `first_token_ns`, `last_token_ns` |
 | `bytes` | Run end, per hop, message type and phase | `hop`, `msg`, `phase`, `messages`, `bytes`, `payload_bytes`, `positions`, `source` |
 | `detected` | Each failure detection | as in [Failure detection](#failure-detection) |
@@ -987,6 +998,76 @@ one request at the largest delay, and the runner refuses less. The gateway's ste
 (default 10 s) is far above the 2 x (d + 4.5) ms plus compute a step needs at d = 50.
 
 Not done here: the optional toxiproxy cross-check.
+
+## X7: overload with bounds on and off
+
+`pllm.x7` offers requests to a running gateway faster than it can serve them, to show what
+the bounds do (R7.14). It is open loop: requests arrive on a Poisson schedule whether or not
+earlier ones have been answered, so a gateway that falls behind builds a queue instead of
+slowing the load. The schedule comes from a seed, and every setting is offered the same one.
+
+The setting under test is the gateway's, set when it starts. Start a fresh system for each
+one. A restarted gateway does not take back the old stages, so restart both laptops. For
+example, on the laptop with the gateway and Stage 1, then on the Windows laptop:
+
+```
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1 --admission-queue 8 --credits 8
+uv run python -m pllm.launch smollm2-135m --roles stage0
+```
+
+On both laptops the hosts file named by `PLLM_CONFIG` needs `[supervisor0]` set to the
+Windows laptop's address on the network in use. A copy of `config/hosts.toml` keeps
+`127.0.0.1` there: Stage 0's supervisor then listens only on its own laptop, every memory
+sample from the other one fails, and the run does not pass. Delete the table to use Stage
+0's address, or set it. The supervisor's port (50061) must be reachable.
+
+The settings are the bound on and off, `--admission-queue 8` and `--admission-queue off`,
+both with `--credits 8`, then the bound on with `--credits` 1, 2 and 4.
+
+Start the bound-off setting with `--no-kv-admission` as well. KV admission (R5.3) also
+reserves for waiting requests, so with it on the queue is still bounded: at the committed
+budget, 72 requests of 128 prompt and 32 new tokens. Only running requests hold a cache on
+Stage 0, at most the running slots, so turning it off does not let waiting requests use
+Host B memory. A bound-off run with any refusal does not pass. At 22 requests of that size
+(8 waiting and 14 running), KV admission does not bind in the bound-on settings.
+
+With the first setting running, measure the capacity once and choose a rate well above it.
+Use that rate for every setting:
+
+```
+uv run python -m pllm.x7 capacity smollm2-135m --metrics runs/<gateway>.metrics.jsonl
+uv run python -m pllm.x7 run smollm2-135m --metrics runs/<gateway>.metrics.jsonl --rate <requests per second>
+uv run python -m pllm.x7 report runs/<first>-x7.jsonl runs/<second>-x7.jsonl --out runs/x7-report
+```
+
+- `run` sends `--requests` requests (default 120) of the prompt set's passages of
+  `--length` tokens (default 128) with `--new-tokens` (default 32) and a `--timeout` of
+  120 s each. The runner runs on the gateway's laptop, since it reads the metrics file.
+- It reads Stage 0's memory every 0.5 s from `[supervisor0]` in the hosts file, so that
+  table, if there is one, must name an address of the Windows laptop that this laptop can
+  reach. The peak is compared with `--budget-mib` (default 716.8, the 0.7 GiB worker budget
+  of R1.7): the worker's lifetime peak, which includes loading the model, or the largest
+  sample where there is no lifetime peak (`peak_source` says which; samples can miss a
+  spike between two of them). A reading over the budget is over it. Otherwise memory is
+  unknown when nothing could be read, when the reading taken after the load failed, or
+  when the worker was restarted during the load.
+- Each run writes a `.jsonl` file next to its run record in `runs/`: the setting, the
+  admission queue's depth over time, and one result with the counts of completed, refused
+  (RESOURCE_EXHAUSTED), late (DEADLINE_EXCEEDED) and otherwise failed requests, p50, p95
+  and p99 of TTFT, TPOT and end-to-end latency, and the queue and in-flight peaks. The
+  percentiles are those of `pllm.report`, over completed requests only: with the bound on,
+  read them beside the refused count.
+- A run passes (exit code 0) when every offered request has its line, the load was above
+  capacity (the offered rate was more than 1.1 times the completion rate, and at least one
+  request of this run had to wait or was refused), the admission queue and the steps in
+  flight stayed within their bounds, no beat showed a stage inbox over `stage_inbox`, and
+  the worker was read as within the budget. Unknown memory does not pass. `failures` in
+  the result says why a run did not. A beat adds up the inboxes of a stage's open streams,
+  one in a run with no fault, and samples them every 0.5 s.
+- `report` writes `table.md`, one row per setting, and `queue_depth.png`. For each run
+  with the bound on it says whether the end-to-end p99 is below that of the bound-off run
+  with the same credits, with the refused count beside it; a setting with no bound-off run
+  is not compared. It refuses runs that were offered different loads.
 
 ## Starting the system
 

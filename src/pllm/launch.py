@@ -47,13 +47,14 @@ def commands(
     dashboard: bool = False,
     hop_delay_control: bool = False,
     heartbeat_timeout: float | None = None,
+    gateway_args: Sequence[str] = (),
     no_kv_admission: bool = False,
 ) -> dict[str, list[str]]:
     """The command of each role in start order: the stages register with the gateway. With
     dashboard, the gateway also serves the live page. With hop_delay_control, the gateway
     and Stage 1 take the X4 hop delay from runs/hop_delay_ms (pllm.x4). heartbeat_timeout
     goes to the gateway, which checks its range. no_kv_admission turns the gateway's Host B
-    KV admission off (R5.3)."""
+    KV admission off (R5.3). gateway_args are added to the gateway's command."""
     wanted = set(roles)
     out = {}
     for role in config.ROLES:
@@ -69,6 +70,7 @@ def commands(
                 out[role] += ["--heartbeat-timeout", str(heartbeat_timeout)]
             if no_kv_admission:
                 out[role].append("--no-kv-admission")
+            out[role] += gateway_args
         else:
             stage = role.removeprefix("stage")
             out[role] = [
@@ -155,6 +157,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="what runs on this laptop (default: everything, single-host mode)",
     )
     parser.add_argument("--threads", type=int, help="torch threads per stage")
+    parser.add_argument("--admission-queue", metavar="N|off", help="passed to the gateway")
+    parser.add_argument("--credits", type=int, help="passed to the gateway")
     parser.add_argument(
         "--dashboard",
         action="store_true",
@@ -189,6 +193,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--no-kv-admission needs the gateway role on this laptop")
     if args.heartbeat_timeout is not None and not 0 < args.heartbeat_timeout < float("inf"):
         parser.error("--heartbeat-timeout must be a positive number of seconds")
+    gateway_args = []  # the gateway checks the values
+    if args.admission_queue is not None:
+        gateway_args += ["--admission-queue", args.admission_queue]
+    if args.credits is not None:
+        gateway_args += ["--credits", str(args.credits)]
+    if gateway_args and "gateway" not in args.roles:
+        parser.error("--admission-queue and --credits need the gateway role on this laptop")
     try:
         hosts = config.load()
         split = config.split_point(args.model)
@@ -251,6 +262,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.dashboard,
             hop_delay_control=args.hop_delay_control,
             heartbeat_timeout=args.heartbeat_timeout,
+            gateway_args=gateway_args,
             no_kv_admission=args.no_kv_admission,
         )
         try:

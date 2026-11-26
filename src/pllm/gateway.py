@@ -160,7 +160,7 @@ import threading
 import time
 import uuid
 from concurrent import futures
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -191,6 +191,8 @@ STAGES = (0, 1)
 RESERVED_THREADS = 2 + 2 * len(STAGES)
 MAX_RUNNING = 14  # Generate calls at once with the default pool
 MAX_QUEUED = 8  # requests waiting for a running slot; [limits] admission_queue sets it
+# --admission-queue off: far more places than any run offers, so nothing is refused
+UNBOUNDED_QUEUE = 100_000
 RECOVER = object()  # what _wait returns when a request must replay
 MAX_DEATHS = 3  # a request fails at the third stage death it lives through (R6.9)
 MAX_BACKOFF_SECONDS = 1.0  # the longest pause before a refused replay starts again
@@ -382,6 +384,7 @@ class Gateway(
         self._registrations: dict[tuple[int, int | None], dict] = {}  # (stage, old epoch)
         self._stopping = threading.Event()
         self._watcher: threading.Thread | None = None
+        self._depth: tuple | None = None  # the last depth line written
         self._retired: list[Link] = []  # half-closed, waiting for stage 0's counters
 
     # ------------------------------------------------------------------ table and frees
@@ -691,9 +694,26 @@ class Gateway(
         def run():
             while not self._stopping.wait(POLL_SECONDS):
                 self.detector.expire()
+                self.sample_depth()
 
         self._watcher = threading.Thread(target=run, name="failure-detector", daemon=True)
         self._watcher.start()
+
+    def sample_depth(self) -> None:
+        """Write the queue depths to the metrics file when they have changed (R7.14). The
+        watcher calls this every POLL_SECONDS, so a shorter spike is seen only in the
+        peaks, which are kept since the gateway started."""
+        with self._lock:
+            depth = (
+                self._running,
+                len(self._waiting),
+                self._in_flight,
+                self.queue_peak,
+                self.in_flight_peak,
+            )
+        if depth != self._depth:
+            self._depth = depth
+            self.recorder.depth(*depth)
 
     # ------------------------------------------------------------------ Stage 0 link
 
@@ -1415,6 +1435,33 @@ def seconds_above(low: float):
     return parse
 
 
+def admission_places(text: str) -> int:
+    """--admission-queue: a whole number of places, or "off" for no bound."""
+    if text == "off":
+        return UNBOUNDED_QUEUE
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if not 0 <= value < UNBOUNDED_QUEUE:
+        raise argparse.ArgumentTypeError(
+            f"must be off or a whole number below {UNBOUNDED_QUEUE}, got {text}"
+        )
+    return value
+
+
+def flow_settings(limits, admission_queue: int | None, credits: int | None):
+    """[limits] with this run's overrides. The stages read stage_inbox from the committed
+    file, so credits must stay within it, as in config.flow_limits."""
+    if credits is not None and not 1 <= credits <= limits.stage_inbox:
+        raise ValueError(f"--credits must be from 1 to stage_inbox ({limits.stage_inbox})")
+    return replace(
+        limits,
+        admission_queue=limits.admission_queue if admission_queue is None else admission_queue,
+        credits=limits.credits if credits is None else credits,
+    )
+
+
 def kv_budget_of(host_b: config.HostBBudget, stage0_weights: int, k: int, off: bool) -> int | None:
     """The Stage 0 KV bytes the gateway admits by (R5.3): Host B's worker budget less its
     runtime, the margin and the weights of layers 0 to k - 1. None when off. Raises
@@ -1439,6 +1486,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("model", choices=sorted(PINNED))
     parser.add_argument("--split-point", type=int, help="override the committed split point")
     parser.add_argument("--metrics", type=Path, help="metrics file (default: a new one in runs/)")
+    parser.add_argument(
+        "--admission-queue",
+        type=admission_places,
+        metavar="N|off",
+        help="places in the admission queue, or off for no bound (default: [limits])",
+    )
+    parser.add_argument(
+        "--credits", type=int, help="steps in flight in the pipeline (default: [limits])"
+    )
     parser.add_argument(
         "--dashboard",
         action="store_true",
@@ -1482,7 +1538,7 @@ def main(argv: list[str] | None = None) -> None:
         model_config = ModelConfig.from_file(model_dir / "config.json")
         hidden = model_config.hidden_size
         tokenizer = Tokenizer(args.model)
-        limits = config.flow_limits()
+        limits = flow_settings(config.flow_limits(), args.admission_queue, args.credits)
         k = expected.split_point
         kv_budget = kv_budget_of(
             config.host_b_budget(), stage_weight_bytes(model_dir, 0, k), k, args.no_kv_admission
@@ -1501,6 +1557,13 @@ def main(argv: list[str] | None = None) -> None:
                 **runrecord.machine(),
                 "heartbeat_timeout_s": args.heartbeat_timeout,
                 "step_timeout_s": args.step_timeout,
+                # null: the admission bound is off
+                "admission_queue": None
+                if limits.admission_queue == UNBOUNDED_QUEUE
+                else limits.admission_queue,
+                "credits": limits.credits,
+                "stage_inbox": limits.stage_inbox,
+                "max_running": MAX_RUNNING,
                 "kv_budget_bytes": kv_budget,
                 "kv_bytes_per_position": kv_per_position,
                 "hop_delay_control": args.hop_delay_control,

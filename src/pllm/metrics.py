@@ -187,6 +187,26 @@ class Recorder:
                     "epoch": beat.epoch,
                     "busy_ns": beat.busy_ns,
                     "steps": beat.steps,
+                    "inbox_depth": beat.inbox_depth,
+                }
+            )
+
+    def depth(
+        self, running: int, queued: int, in_flight: int, queue_peak: int, in_flight_peak: int
+    ) -> None:
+        """The gateway's queue depths now, with the deepest each has been since it started."""
+        if self._file is None:
+            return
+        with self._lock:
+            self._write(
+                {
+                    "type": "depth",
+                    "t_ns": self.clock(),
+                    "running": running,
+                    "queued": queued,
+                    "in_flight": in_flight,
+                    "queue_peak": queue_peak,
+                    "in_flight_peak": in_flight_peak,
                 }
             )
 

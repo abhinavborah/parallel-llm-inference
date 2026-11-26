@@ -26,7 +26,13 @@ from pllm import config, control, faults, wire
 from pllm.control import ControlService, ExpectedModel, Registry
 from pllm.models import MODELS_DIR, sha256_of
 from pllm.proto import protocol_pb2_grpc
-from pllm.supervisor import NoWorker, Supervisor, serve_control, worker_command
+from pllm.supervisor import (
+    NoWorker,
+    Supervisor,
+    serve_control,
+    worker_command,
+    worker_memory,
+)
 from pllm.worker import exit_when_parent_gone, register_with_gateway
 
 pytestmark = pytest.mark.fault
@@ -303,6 +309,36 @@ def call(port, method, path, json_type=True):
         return err.code, json.load(err)
 
 
+def test_worker_memory_counts_the_whole_process_tree():
+    """A worker's memory is its process tree's: a child that holds 40 MiB is counted."""
+    child = "import sys, time; held = b'x' * (40 * 1024 * 1024); print(flush=True); time.sleep(60)"
+    parent = textwrap.dedent(
+        f"""
+        import subprocess, sys, time
+        process = subprocess.Popen([sys.executable, "-c", {child!r}], stdout=subprocess.PIPE)
+        process.stdout.readline()
+        print(flush=True)
+        time.sleep(60)
+        """
+    )
+    proc = subprocess.Popen([sys.executable, "-c", parent], stdout=subprocess.PIPE)
+    try:
+        proc.stdout.readline()
+        alone = psutil.Process(proc.pid).memory_info().rss
+        assert worker_memory(proc.pid)["worker_rss_bytes"] >= alone + 35 * 1024 * 1024
+    finally:
+        faults.kill(proc.pid)
+        proc.wait(WAIT)
+
+
+def test_worker_memory_is_unknown_with_no_worker():
+    unknown = {"worker_rss_bytes": None, "worker_peak_rss_bytes": None}
+    assert worker_memory(None) == unknown
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait(WAIT)
+    assert worker_memory(gone.pid) == unknown
+
+
 def test_the_control_port_applies_kill_suspend_and_resume(tmp_path, running):
     sup = running(make(tmp_path, script(tmp_path), free_port()))
     server = serve_control(sup, ("127.0.0.1", 0))
@@ -311,6 +347,13 @@ def test_the_control_port_applies_kill_suspend_and_resume(tmp_path, running):
         pid = sup.pid
         assert call(port, "GET", "/status")[1]["state"] == "running"
         assert call(port, "GET", "/status")[1]["free_ram_bytes"] > 0  # for the dashboard
+        memory = call(port, "GET", "/status")[1]
+        assert memory["worker_rss_bytes"] > 0  # the worker's own, for the Host B budget
+        if sys.platform == "win32":  # the Host B budget is read from this lifetime peak
+            assert memory["worker_peak_rss_bytes"] is not None
+            assert memory["worker_peak_rss_bytes"] >= memory["worker_rss_bytes"]
+        else:
+            assert memory["worker_peak_rss_bytes"] is None
         assert call(port, "POST", "/suspend") == (
             200,
             {"ok": True, "action": "suspend", "pid": pid},
