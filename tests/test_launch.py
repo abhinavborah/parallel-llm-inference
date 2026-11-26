@@ -155,7 +155,7 @@ launch.MODELS_DIR = tmp
 runrecord.RUNS_DIR = tmp / "runs"
 child = "import os, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));"
 child += "time.sleep(120)"
-launch.commands = lambda *_: {"gateway": [sys.executable, "-c", child, str(tmp / "pid")]}
+launch.commands = lambda *_, **__: {"gateway": [sys.executable, "-c", child, str(tmp / "pid")]}
 launch.main(["smollm2-135m"])
 """
 
@@ -209,6 +209,21 @@ def test_main_refuses_a_partial_download(tmp_path, monkeypatch, capsys):
 
 def test_main_rejects_zero_threads(capsys):
     assert run_main(["smollm2-135m", "--threads", "0"]) == 2
+
+
+def test_the_hop_delay_control_goes_to_the_gateway_and_stage_1_only():
+    roles = ["gateway", "stage0", "stage1"]
+    out = launch.commands("smollm2-135m", roles, 3, hop_delay_control=True)
+    flagged = {role for role, cmd in out.items() if "--hop-delay-control" in cmd}
+    assert flagged == {"gateway", "stage1"}
+    plain = launch.commands("smollm2-135m", roles, 3)
+    assert not any("--hop-delay-control" in cmd for cmd in plain.values())
+
+
+@pytest.mark.parametrize("roles", [["gateway"], ["stage1"], ["stage0"], ["gateway", "stage0"]])
+def test_main_refuses_the_hop_delay_control_without_both_delaying_roles(roles, capsys):
+    assert run_main(["smollm2-135m", "--roles", *roles, "--hop-delay-control"]) == 2
+    assert "needs the gateway and stage1 roles" in capsys.readouterr().err
 
 
 def test_the_heartbeat_timeout_goes_to_the_gateway_only():

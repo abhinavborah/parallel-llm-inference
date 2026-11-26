@@ -37,7 +37,7 @@ import torch
 
 from pllm import config, wire
 from pllm.control import register
-from pllm.faults import StepDelay
+from pllm.faults import HopDelayControl, StepDelay
 from pllm.heartbeat import HEARTBEAT_SECONDS, Heartbeat
 from pllm.model import KVCache, ModelConfig
 from pllm.models import MODELS_DIR, PINNED, sha256_of
@@ -226,10 +226,17 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="serve Stage.Steps on this stage's port (needs --stage)",
     )
+    parser.add_argument(
+        "--hop-delay-control",
+        action="store_true",
+        help="Stage 1 only: delay each step received by the ms in runs/hop_delay_ms (pllm.x4)",
+    )
     args = parser.parse_args(argv)
     model_dir = MODELS_DIR / args.model
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
+    if args.hop_delay_control and not (args.serve and args.stage == 1):
+        parser.error("--hop-delay-control needs --serve --stage 1: it delays the hop into Stage 1")
     if args.serve and args.stage is None:
         parser.error("--serve needs --stage, which names this process's port and next hop")
     try:
@@ -260,6 +267,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     log.info("serving, rss %.0f MiB; Ctrl-C to stop", rss_mib())
     stop = threading.Event()
+    if args.hop_delay_control:
+        HopDelayControl("stage1", lambda hold: setattr(servicer, "hop_delay", hold)).start(stop)
     failure: list[BaseException] = []
     if os.environ.get(PARENT_ENV, "").isdigit():
         exit_when_parent_gone(int(os.environ[PARENT_ENV]))

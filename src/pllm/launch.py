@@ -45,11 +45,13 @@ def commands(
     roles: Iterable[str],
     threads: int,
     dashboard: bool = False,
+    hop_delay_control: bool = False,
     heartbeat_timeout: float | None = None,
 ) -> dict[str, list[str]]:
     """The command of each role in start order: the stages register with the gateway. With
-    dashboard, the gateway also serves the live page; heartbeat_timeout goes to the
-    gateway, which checks its range."""
+    dashboard, the gateway also serves the live page. With hop_delay_control, the gateway
+    and Stage 1 take the X4 hop delay from runs/hop_delay_ms (pllm.x4). heartbeat_timeout
+    goes to the gateway, which checks its range."""
     wanted = set(roles)
     out = {}
     for role in config.ROLES:
@@ -59,6 +61,8 @@ def commands(
             out[role] = [sys.executable, "-m", "pllm.gateway", model]
             if dashboard:
                 out[role].append("--dashboard")
+            if hop_delay_control:
+                out[role].append("--hop-delay-control")
             if heartbeat_timeout is not None:
                 out[role] += ["--heartbeat-timeout", str(heartbeat_timeout)]
         else:
@@ -73,6 +77,8 @@ def commands(
                 "--threads",
                 str(threads),
             ]
+            if hop_delay_control and stage == "1":
+                out[role].append("--hop-delay-control")
     return out
 
 
@@ -151,6 +157,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="the gateway also serves the live dashboard (it can kill and freeze workers)",
     )
     parser.add_argument(
+        "--hop-delay-control",
+        action="store_true",
+        help="X4: the gateway and Stage 1 take their hop delay from runs/hop_delay_ms",
+    )
+    parser.add_argument(
         "--heartbeat-timeout",
         type=float,
         metavar="SECONDS",
@@ -159,6 +170,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be at least 1")
+    if args.hop_delay_control and not {"gateway", "stage1"} <= set(args.roles):
+        parser.error("--hop-delay-control needs the gateway and stage1 roles on this laptop")
     if args.dashboard and "gateway" not in args.roles:
         parser.error("--dashboard needs the gateway role on this laptop")
     if args.heartbeat_timeout is not None and "gateway" not in args.roles:
@@ -198,6 +211,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         threads=threads,
     ) as rec:
         rec["roles"] = list(args.roles)
+        rec["hop_delay_control"] = args.hop_delay_control
+        if args.hop_delay_control:  # start at 0 ms: a file left by an earlier run is removed
+            control = faults.HOP_DELAY_FILE
+            held = [faults.held_path(control, name) for name in faults.CONTROLLED]
+            for path in (control, *faults.ack_paths(control), *held):
+                path.unlink(missing_ok=True)
         power = rec["power"]
         log.info(
             "network %s, available memory %.2f GiB, power %s",
@@ -208,7 +227,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         if power is not None and not power["plugged_in"]:
             log.warning("on battery: use the same power state for every run")
         rec["heartbeat_timeout_s"] = args.heartbeat_timeout
-        to_start = commands(args.model, args.roles, threads, args.dashboard, args.heartbeat_timeout)
+        to_start = commands(
+            args.model,
+            args.roles,
+            threads,
+            args.dashboard,
+            hop_delay_control=args.hop_delay_control,
+            heartbeat_timeout=args.heartbeat_timeout,
+        )
         code = run(to_start, done)
         if code:
             raise SystemExit(code)

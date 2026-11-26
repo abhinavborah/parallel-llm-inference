@@ -739,3 +739,13 @@ def test_the_committed_hosts_file_has_distinct_supervisor_ports():
         hosts.stage1.port,
         hosts.gateway.port,
     }
+
+
+def test_the_hop_delay_control_is_passed_to_a_stage_1_worker_only(capsys):
+    assert worker_command("m", 1, None, hop_delay_control=True)[-1] == "--hop-delay-control"
+    assert "--hop-delay-control" not in worker_command("m", 1, 2)
+    from pllm.supervisor import main
+
+    with pytest.raises(SystemExit):
+        main(["smollm2-135m", "--stage", "0", "--hop-delay-control"])
+    assert "--stage 1 only" in capsys.readouterr().err

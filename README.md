@@ -885,6 +885,71 @@ in `runs/` (named in the record as `results_file`) and on stdout. The record kee
 command (`argv`), the settings, the hidden size and each request's output tokens. The exit
 code is 0 only when the check passes.
 
+## X4: latency against injected hop delay
+
+X4 adds a delay d to every message of the two hops that cross the LAN: gateway to Stage 0
+(held at the gateway's send) and Stage 0 to Stage 1 (held at Stage 1's receive). Both are on
+Host A, so one machine and one clock inject it. The Stage 1 to gateway hop stays on Host A
+and is not delayed. The delay is pipelined: each message is released d after it entered the
+hop, so messages that enter together leave together. It counts as transit: no budget is
+reduced by it, and Stage 1 sets a step's deadline from its release.
+
+Expectation, stated before any result: about 2 x d is added per token (2, 10, 40 and 100 ms
+for d = 1, 5, 20 and 50 ms) at concurrency 1, so the slope of per-token latency (TPOT)
+against d is 2.0 there. At concurrency 4, queueing at small d hides part of the delay, so a
+lower slope is expected; it is reported, not checked. The runner writes this as the first
+line of its output. Throughput is about
+min(c / T, 1 / slowest stage time) with T = compute + base + 2 x d per token, so X4 runs at
+concurrency 1 and 4.
+
+The delay is set while the system runs, so Host B starts once. `--hop-delay-control` makes
+the gateway and Stage 1 read d in ms from `runs/hop_delay_ms` every 0.2 s; each writes the
+value it applied to `runs/hop_delay_ms.gateway` or `runs/hop_delay_ms.stage1`, and the
+gateway writes a `hop_delay` line to its metrics file for each change. Without the flag
+nothing reads the file, and the launcher removes it at start, so it starts at 0 ms.
+
+Two laptops, Host B first:
+
+```
+uv run python -m pllm.launch smollm2-135m --roles stage0
+```
+
+Host A:
+
+```
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1 --hop-delay-control
+uv run python -m pllm.x4 smollm2-135m --metrics runs/<gateway>.metrics.jsonl
+```
+
+On one host, `uv run python -m pllm.launch smollm2-135m --hop-delay-control` and the same
+`pllm.x4` command. The flag needs both the gateway and Stage 1 on the laptop.
+
+Before each cell the runner writes d and waits for both acks, so each cell's delay is
+confirmed. Defaults: delays 0, 1, 5, 20 and 50 ms (`--delays`), concurrency 1 and 4, 5
+repeats, 16 requests per cell, 32 new tokens, prompts of 128 tokens. Delays are interleaved
+inside each repeat in an order rotated per repeat, so slow drift of the network spreads over
+every delay. Each cell is an X2 pipeline cell with its `delay_ms`. Then one aggregate per
+delay and concurrency (throughput, TPOT and TTFT mean and p50, each with n, mean, stdev, min
+and max over the repeats), one fit per concurrency (least-squares slope of the per-cell TPOT
+mean against d with a 95% confidence interval, whether it holds 2.0, and whether that
+concurrency is the checked one) and the X2 summary.
+
+A sleep can wake late, so a message can be held longer than d. The gateway and Stage 1 each
+note every message's real hold on their own clock and append it to
+`runs/hop_delay_ms.gateway.held.jsonl` or `runs/hop_delay_ms.stage1.held.jsonl`. Each cell
+line has, per hop, n, p50, p99 and min of the hold and how many holds were below d (should be
+0), and `achieved_delay_ms`, the mean hold over both hops. A second fit per concurrency, of
+TPOT mean against `achieved_delay_ms`, sits beside the checked one and is never checked. If
+the two slopes differ, late wake-ups account for the difference, not the pipeline.
+The fits state; they assert nothing. The file goes to `runs/` next to the run record. At the
+end the delay is set back to 0.
+
+Timeouts: `--timeout` (per request, default 300 s) must be at least twice the network time of
+one request at the largest delay, and the runner refuses less. The gateway's step timeout
+(default 10 s) is far above the 2 x (d + 4.5) ms plus compute a step needs at d = 50.
+
+Not done here: the optional toxiproxy cross-check.
+
 ## Starting the system
 
 `pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway

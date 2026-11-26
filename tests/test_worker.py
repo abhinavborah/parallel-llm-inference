@@ -360,3 +360,12 @@ def test_a_mapped_embedding_rejects_a_truncated_file(tmp_path):
     assert mapped[torch.tensor([0, 47])].shape == (2, 8)
     with pytest.raises(ValueError, match="ends inside the embedding"):
         mapped[torch.tensor([63])]
+
+
+@pytest.mark.parametrize(
+    "argv", [["--stage", "0", "--serve"], ["--stage", "1"], ["--layers", "15:30", "--serve"]]
+)
+def test_the_hop_delay_control_is_for_a_serving_stage_1_only(argv, capsys):
+    with pytest.raises(SystemExit):
+        main(["smollm2-135m", *argv, "--hop-delay-control"])
+    assert "--hop-delay-control needs --serve --stage 1" in capsys.readouterr().err
