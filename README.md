@@ -781,6 +781,22 @@ laptop's roles, five per role once its port answers, and `probe` holds the figur
 connect time, not the echo round trip of `pllm.netcheck probe`. It is null in single-host
 mode, and a role that never answered before the run stopped is recorded with its error.
 
+## Session checklist
+
+At the start of every two-laptop session, on the college Wi-Fi or the phone hotspot fallback,
+in order. Steps 2 to 4 stay set, so check them once per laptop.
+
+1. Both laptops on the charger; Windows on the best performance power mode.
+2. Windows: Power Options, "Wireless Adapter Settings", "Power Saving Mode" set to Maximum Performance.
+3. Windows: Device Manager, Wi-Fi adapter, Power Management, untick "Allow the computer to turn off this device to save power".
+4. macOS has no Wi-Fi power saving switch: in Battery, Options, Low Power Mode off and "Prevent automatic sleeping on power adapter when the display is off" on.
+5. Hotspot fallback only: phone on its charger, hotspot kept on (idle auto-off disabled), updates and sync paused on both laptops.
+6. Read both addresses: `ipconfig getifaddr en0` on macOS, `ipconfig` on Windows (Wi-Fi IPv4 address).
+7. On both laptops set each host and `network` (`college-wifi` or the hotspot name) in `config/hosts.local.toml`, and `PLLM_CONFIG` (see "Hosts and ports").
+8. College Wi-Fi or any network other than our own hotspot: Windows firewall on with the TCP 50051 and 50061 rules under "Windows setup" (limiting them to the Mac's address is optional); check with `uv run python -m pllm.netcheck firewall --roles stage0` as administrator.
+9. Run the two-way TCP probe under "Host checks"; both directions pass before any run.
+10. Start both launchers (see "Starting the system"); each launch record holds the network name and the short round trip.
+
 ## Host checks
 
 Host B memory, with every other program closed and the charger in. Also note Task Manager's
