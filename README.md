@@ -542,6 +542,8 @@ installed, run the page's own script against a stand-in for the DOM, fed a real 
 (`tests/dashboard_page_check.js`). No test drives a real browser. Reported numbers come from
 the scripts that read the metrics files, never from this page.
 
+The live demo script, with each segment's commands and fallbacks, is in [docs/demo.md](docs/demo.md).
+
 ## Heartbeat
 
 A serving worker registers, then keeps one `Control.Heartbeat` stream to the gateway
