@@ -950,6 +950,134 @@ one request at the largest delay, and the runner refuses less. The gateway's ste
 
 Not done here: the optional toxiproxy cross-check.
 
+## X9: capacity-aware layer split
+
+`pllm.capacity.choose_split` picks the split point k from two straight lines per host (memory,
+and time of one decode step, against the number of layers) and each host's free memory
+(requirement R8.6). It allows a k only if Host B gets fewer layers than an even split
+(k below half) and both stages fit their free memory, and takes the one whose slower stage is
+fastest (on a tie, the smaller k). If no k is allowed it says why and returns none. It is a
+pure function with no defaults: every number comes from `pllm.hostmem` and `pllm.x9 probe`.
+When speed and memory alone would give Host B half the layers or more, the result says
+`forced_below_even`: then the rule chose k, not the measurements.
+
+`pllm.x9` has four steps: `probe` (each laptop measures its own stage), `choose` (macOS),
+`run` (macOS, once per split point) and `summary` (macOS). The definitions are at the top of
+`src/pllm/x9.py`.
+
+The split point of a sweep is set with `--split-point K` on `pllm.launch` (also on
+`pllm.supervisor` and, with `--stage`, on `pllm.worker`), so no file changes and the committed
+`[split]` stays as it is. Give both laptops the same K. The gateway accepts a stage only with
+the layer range of its own K: a laptop started with another one is rejected and restarted
+every few seconds, no request runs, and `run` gives up after `--wait`. The override is for
+this sweep: the run records of other experiments name the committed split point.
+
+Use the same commit on both laptops with no uncommitted changes, set `PLLM_CONFIG` on both,
+keep the chargers in and close other programs. In the commands, `TB` and `TA` are the torch
+thread counts of Host B (Windows) and Host A (macOS); use the same ones in `probe` and
+`pllm.launch`.
+
+1. Measure each laptop, with no pllm process running:
+
+```
+# Windows
+uv run python -m pllm.hostmem
+uv run python -m pllm.x9 probe smollm2-135m --stage 0 --threads TB
+# macOS
+uv run python -m pllm.hostmem
+uv run python -m pllm.x9 probe smollm2-135m --stage 1 --threads TA
+```
+
+2. Copy the two Windows records (`runs/<utc>-host-memory.json` and `runs/<utc>-x9-probe.json`)
+   into `runs/` on the Mac and choose k there. 716.8 MiB is the stated Host B budget of
+   0.7 GiB (R1.7); the smaller of it and the budget `hostmem` measured is used. Each layer
+   also reserves KV cache for `--requests` (4) requests of `--positions` (160). The command
+   prints k and the sweep: up to four split points from the even one (15) down to k. It
+   exits 1 if there is no split.
+
+```
+uv run python -m pllm.x9 choose smollm2-135m --budget-b-mib 716.8 --hostmem-b runs/<B>-host-memory.json --probe-b runs/<B>-x9-probe.json --hostmem-a runs/<A>-host-memory.json --probe-a runs/<A>-x9-probe.json
+```
+
+3. Measure the round trip once (see "Host checks"), with no launcher running:
+
+```
+# Windows
+uv run python -m pllm.netcheck serve --roles stage0
+# macOS; note the median
+uv run python -m pllm.netcheck probe --roles stage0
+```
+
+4. Start the monitor on Windows in its own terminal and leave it running for the whole sweep.
+   It listens on stage 0's address, port 50071. With the Windows firewall on, add 50071 to
+   the `-LocalPort` list of the rule under "Windows setup". It only reads, and has no
+   authentication.
+
+```
+# Windows
+uv run python -m pllm.x9monitor
+```
+
+5. For each K of the sweep, start both laptops afresh, run, and stop both launchers with
+   Ctrl-C before the next K. Send no other request in between: the load peak counts only if
+   the worker has served nothing yet. `run` refuses before the first request if
+   that or anything else it can already see (the commits, the worker's arguments, the
+   counters) would spoil the record.
+
+```
+# Windows
+uv run python -m pllm.launch smollm2-135m --roles stage0 --threads TB --split-point K
+# macOS, terminal 1
+uv run python -m pllm.launch smollm2-135m --roles gateway stage1 --threads TA --split-point K
+# macOS, terminal 2; <gateway> is the metrics file that this launch made in runs/
+uv run python -m pllm.x9 run smollm2-135m --metrics runs/<gateway>.metrics.jsonl --budget-mib 716.8 --rtt-ms <median from step 3>
+```
+
+   Each run has 5 repeats at concurrency 1 and 4, with 16 requests of 128 prompt and 32 new
+   tokens per cell. It exits 0 when the record is a complete measurement, whatever the
+   result for Host B.
+
+6. Compare the run records on the Mac, naming one for each K:
+
+```
+uv run python -m pllm.x9 summary --choice runs/<A>-x9-choice.json runs/<run 1>-x9.json runs/<run 2>-x9.json
+```
+
+It writes a markdown table next to its record: per split, tokens per second and each stage's
+busy time (mean, spread and n over the repeats) from the gateway's clock; per deployment,
+Host B's load peak, lifetime peak, sampled decode maximum and fault counts. It exits 0 only
+if the chosen k is below the even split, every split of the sweep has a valid record, and
+every record of the chosen k is within budget with no disk fault in its cells. A split may
+be run again in a new deployment; give all its records and each value is shown. The weights
+load once per deployment, so one deployment gives one load peak.
+
+`--trial` on `choose` and `run` allows a rehearsal on one machine; a trial never passes.
+
+What the memory numbers mean:
+
+- Host B's numbers cover the whole worker process tree (on Windows the venv `python.exe` is a
+  launcher with the interpreter as its child). A tree peak is the sum of each process's own
+  lifetime peak, so it can only overstate the largest size at one moment.
+- The load peak is the lifetime peak before any request. If the lifetime peak grows later,
+  decoding set it. If it does not, decoding stayed at or below the load peak, and the largest
+  sample taken during decoding (every 50 ms) is a lower bound for the decode peak.
+- The ordinary page fault count on Windows (`num_page_faults` in psutil) includes soft
+  faults, which need no disk, so it cannot show paging. It is reported and not judged. The
+  judged counter is the per-process `HardFaultCount` that `NtQuerySystemInformation`
+  returns, which counts faults that read from disk. Microsoft does not document that field,
+  so it is used only when the documented fields after it match psutil; otherwise it is
+  unknown.
+- No disk fault in the cells means that this counter saw the worker read no page from disk
+  while they ran. It does not show pages that were written out and never read back, or
+  paging by other processes. A count above 0 does not say whether the page file or a mapped
+  file (a program library or the weights) was read, so the criterion is then not shown.
+  Faults during the load and the warm-ups are reported and not judged.
+- An unknown value stays unknown and never passes. macOS gives no peak RSS for another
+  process, so a budget verdict needs Host B to run Windows (or Linux).
+- The monitor is a second process on Host B during X9, outside the worker's budget; its
+  resident set is in each record (`monitor_rss_bytes`). X9 adds nothing to what the worker
+  holds in memory, so the worker budget stays 0.7 GiB.
+
 ## Starting the system
 
 `pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway
