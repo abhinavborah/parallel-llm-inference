@@ -655,6 +655,109 @@ and max over the repeats, and a summary, in a `.jsonl` file next to the run reco
 sha256 of every prompt's tokens, so on one host the two modes can be compared. The exit
 code is 0 only with zero ordering violations and no failed request.
 
+## X1b: agreement across the laptops
+
+`pllm.x1b` sends each prompt of an X1a run through the two-laptop pipeline once, one request
+at a time, and compares the tokens with each host's single-process reference (the X1a run
+records). Across hosts the result is agreement, never exact equality.
+
+First run X1a on each laptop with the same length and token count. Host B's record comes from
+issue #17's run; copy its `runs/<utc>-x1a.json` into `runs/` on Host A. Then start the system
+(see "Starting the system": Stage 0 on Host B, the gateway and Stage 1 on Host A) and run, on
+Host A:
+
+```
+uv run python -m pllm.x1b smollm2-135m --metrics runs/<gateway>.metrics.jsonl --reference runs/<host A>-x1a.json runs/<host B>-x1a.json
+```
+
+Each record is checked before any request is sent: an x1a record with status ok, its
+reference checksum recomputed over its settings, the prompt set and its entries, the same
+model, revision, length and token count in every record, and each stored prompt equal to the
+prompt set's. The records must come from two different hosts; `--trial` allows records from
+one host for a trial run, and the run record then has `trial: true`. The length, token count
+and prompts come from the records. `--metrics` is the running gateway's file; it is read to
+refuse a gateway serving another model or revision and for the split point, and the first request waits until both stages beat in it (up to `--wait`
+seconds, default 120), since a request sent earlier is refused. `--rtt-ms` puts a round-trip
+time from `pllm.netcheck` into the run record.
+
+Per prompt and reference:
+
+- `first_divergence`: the first step whose token differs, `null` if none.
+- `agreed_tokens`: the steps before it (all if none), out of `compared_tokens`, the tokens
+  streamed.
+- `max_logit_diff`: the largest difference of the chosen token's logit over the steps up to
+  and including the first divergence. The wire and the X1a record carry only that logit, so
+  this is not the full-vocabulary difference of X1a.
+
+The gateway stops at end of sequence and the reference does not. A stop on the token the
+reference also chose agrees; a stop on another token diverges there. Per reference, the
+summary gives sequence agreement (the percent of prompts whose tokens all agree), token
+agreement (agreed over compared tokens), the smallest and median first divergence, and the
+largest logit difference.
+
+Output: one JSON line per prompt and reference, then one summary per reference, in a `.jsonl`
+file next to the run record in `runs/` (named in the record as `results_file`) and on stdout.
+The record keeps the command (`argv`), each reference's file, host and checksum, and the
+pipeline's tokens and top logits per prompt, so a later comparison needs no rerun. The exit
+code is 0 when every request completed; agreement is reported, not asserted.
+
+## X3: bytes per hop
+
+`pllm.x3` measures the serialized bytes per message on each hop for one prompt length. It
+sends `--count` prompts (default 5) of `--length` tokens (16, 128 or 512) one at a time with
+`--new-tokens` (default 128; decoding stops earlier at end of sequence), then waits for the
+gateway to stop and reads its metrics file.
+
+Stage 0 to Stage 1 never passes the gateway: Stage 0 returns its byte counts when its stream
+ends, and the gateway writes the totals for the whole run when it stops. So one gateway run
+gives one length, and its file must hold this run's requests only. A restarted gateway is not
+rejoined by the stages, so start both laptops again for each length. Run the gateway in its
+own terminal and stop it first, while the stages are up: the launcher stops Stage 1 before the
+gateway when both run under one launcher, which can lose Stage 0's counts.
+
+For each length (16, 128, 512), on a freshly started system:
+
+```
+# Windows (Stage 0)
+uv run python -m pllm.launch smollm2-135m --roles stage0
+# macOS terminal 1 (gateway)
+uv run python -m pllm.launch smollm2-135m --roles gateway
+# macOS terminal 2 (Stage 1)
+uv run python -m pllm.launch smollm2-135m --roles stage1
+# macOS terminal 3
+uv run python -m pllm.x3 smollm2-135m --length 16 --metrics runs/<gateway>.metrics.jsonl
+```
+
+X3 sends its first request once both stages beat in the gateway's file, since a request sent
+earlier is refused and its line would fail the run. When X3 prints "stop the gateway now",
+press Ctrl-C in terminal 1. X3 waits up to `--wait` seconds (default 600, also the limit for
+the stages) for the file's `run_end` line, writes its results, and exits. Then stop
+Stage 1 and Stage 0. `--rtt-ms` puts a round-trip time from `pllm.netcheck` into the run record.
+
+Per hop and phase it gives messages, bytes, payload bytes, positions, bytes per position and
+bytes per message, and the overhead per message (bytes minus payload over messages): the mean,
+and for the gateway's two hops, which have one line per message, also the largest. Bytes are
+the protobuf serialized size; gRPC's 5 bytes per message and HTTP/2 framing are not included.
+
+Only Stage 0 to Stage 1 carries activations: the gateway sends token ids to Stage 0 and gets
+one token and its logit per step from Stage 1. So the check is on that hop, per phase:
+
+- payload bytes equal positions x hidden size x 4 B exactly (hidden size from the model's
+  `config.json`, 576 for smollm2-135m);
+- the mean overhead per message is at most 128 B (45 to 49 B measured on loopback with the
+  test model; only the shape and position fields grow with the length, by a few bytes);
+- its positions equal those the gateway sent to Stage 0, so no step was lost or added.
+
+X3 refuses a metrics file that is for another model or already has requests, an end or an
+unreadable line. The run fails, with the reasons in the summary, when the file has no
+`run_end` in time, Stage 0's totals are incomplete, a line is unreadable, a request in the
+file is not this run's, a request failed, or a request decoded fewer than `--new-tokens`
+tokens (it stopped at end of sequence). Output: one JSON line per hop and phase, then a
+summary with the measured overhead, each request's decoded token count and the check, in a `.jsonl` file next to the run record
+in `runs/` (named in the record as `results_file`) and on stdout. The record keeps the
+command (`argv`), the settings, the hidden size and each request's output tokens. The exit
+code is 0 only when the check passes.
+
 ## Starting the system
 
 `pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway
