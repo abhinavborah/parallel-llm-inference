@@ -11,7 +11,8 @@ serving, as a worker does, so it sends that late output:
   refuses them with BAD_SENDER. The Nack names an old attempt, so it fails nothing.
 
 The client sees each step once and the fault-free tokens. Equality is on one host, fp32,
-batch 1.
+batch 1. For Stage 1, the report counts each late result as a stale output of the request's
+recovery (R6.12).
 """
 
 import subprocess
@@ -24,7 +25,7 @@ from test_heartbeat import Beating, reference
 from test_model import tiny_reference
 from test_replay import take
 
-from pllm import faults, metrics
+from pllm import faults, metrics, report
 from pllm.control import ExpectedModel
 from pllm.models import sha256_of
 
@@ -101,6 +102,8 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
     real = bytes.fromhex(sha256_of(tmp_path / "model.safetensors"))
     run.registry.expected = ExpectedModel(real, LAYERS, K)
     neighbour = "" if stage == 1 else f"127.0.0.1:{run.ports[1]}"
+    metrics_file = tmp_path / "gateway.metrics.jsonl"
+    run.gateway.recorder = metrics.Recorder(metrics_file)
     outputs = outputs_of(run, stage)
 
     def spawn(delay):
@@ -167,6 +170,12 @@ def test_a_resumed_old_stage_has_every_late_output_rejected(beating, tmp_path, s
         assert [t.token for t in tokens] == expected
         assert run.gateway.replays >= 1 and run.gateway.divergences == 0
         assert stages[stage].epoch == new
+        if stage == 1:  # every dropped result of an older attempt, the late ones included
+            header = report.RECOVERY_HEADER
+            rows = report.recovery_rows(report.load(metrics_file))
+            [row] = [dict(zip(header, r, strict=True)) for r in rows if r[0] == tokens[0].rid]
+            dropped = [o for o in outputs if o[3] and o[1] < row["attempt"]]
+            assert row["stale_discarded"] == len(dropped) >= len(late()) >= 1
     finally:
         if suspended is not None:
             faults.resume(suspended.pid)

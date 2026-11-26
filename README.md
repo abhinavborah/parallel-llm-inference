@@ -401,7 +401,7 @@ uv run python -m pllm.report --out DIR        # default runs/report
 ```
 
 It writes `runs.csv` and `index.md` with one row per run, and a folder per run with
-`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `latency_cdf.png` and, when the
+`summary.md`, `latency.csv`, `stages.csv`, `bytes.csv`, `recovery.csv`, `latency_cdf.png` and, when the
 stages sent beats, `utilisation.png`. The report is built beside the output folder and
 then replaces it whole, so a failed build leaves the old one. The command refuses a folder
 it did not make, a file, and a folder that holds a log; anything added to a folder it made
@@ -426,6 +426,15 @@ Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
   heartbeat that reconnected or beats that stopped, and `summary.md` warns when it is over
   1 s. Utilisation is busy time over the window; two streams working at once on one stage
   can push it above 1.
+- Recoveries: one row per `recovery` line (see [Recovery time](#recovery-time)), times in
+  ms. `stale_discarded` is counted here only: the request's results the gateway dropped
+  (`hop` lines with `accepted` false) at an attempt from the previous recovery's attempt of
+  that request (1 for the first) up to, not including, this recovery's, over the whole run.
+  So a late result of a resumed old stage counts even when it arrives after the recovery
+  line, and a request that recovers twice counts each result once. Nacks have no `hop` line
+  and are not counted (the gateway's `stale_nack` count has them), nor is a result accepted
+  on arrival and dropped only when its request took it, after a bump (`Gateway.discards`
+  has it).
 
 Plots for each experiment (X2 to X9) are added here by that experiment.
 
