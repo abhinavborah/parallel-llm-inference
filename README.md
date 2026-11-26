@@ -1080,6 +1080,8 @@ In the launch record, `rtt_ms` is the median of every timed TCP connect to the o
 laptop's roles, five per role once its port answers, and `probe` holds the figures per role. It is a
 connect time, not the echo round trip of `pllm.netcheck probe`. It is null in single-host
 mode, and a role that never answered before the run stopped is recorded with its error.
+The launch record of a session holds the network name and this round trip for every run in
+that session, so the records of scripts run during it leave `rtt_ms` null unless given one.
 
 ## Session checklist
 
