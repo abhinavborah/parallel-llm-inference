@@ -1,6 +1,7 @@
 """X4 runner (R7.11): the fit, the aggregates, the argument checks, setting the delay through
 the control file, and the sweep on a real chain on loopback."""
 
+import json
 import threading
 
 import pytest
@@ -40,16 +41,41 @@ def cell(d, c, tpot, throughput=10.0):
         "ttft_p50_ms": 2 * tpot,
         "throughput_tok_s": throughput,
         "failed_requests": 0,
+        "achieved_delay_ms": d + 1,  # every hold 1 ms late
     }
 
 
 def test_one_fit_per_concurrency_says_whether_it_holds_two():
     cells = [cell(d, 1, 9 + 2 * d + e) for d in (0, 5, 20) for e in (-0.5, 0.5)]
     cells += [cell(d, 4, 9 + d + e) for d in (0, 5, 20) for e in (-0.5, 0.5)]
-    fits = {line["concurrency"]: line for line in x4.fit_lines(cells)}
-    assert fits[1]["checked"] and fits[1]["holds_expected"] is True
-    assert not fits[4]["checked"]  # reported only: queueing hides part of the delay
-    assert fits[4]["holds_expected"] is False  # a slope of 1
+    fits = {(line["concurrency"], line["x"]): line for line in x4.fit_lines(cells)}
+    assert fits[1, "delay_ms"]["checked"] and fits[1, "delay_ms"]["holds_expected"] is True
+    assert not fits[4, "delay_ms"]["checked"]  # reported only: queueing hides part of the delay
+    assert fits[4, "delay_ms"]["holds_expected"] is False  # a slope of 1
+    real = fits[1, "achieved_delay_ms"]
+    assert not real["checked"]  # reported beside the checked fit, never checked
+    assert real["slope"] == pytest.approx(2.0)
+    assert real["intercept"] == pytest.approx(fits[1, "delay_ms"]["intercept"] - 2.0)
+
+
+def test_the_held_files_give_each_hop_its_real_hold(tmp_path):
+    control = tmp_path / "hop_delay_ms"
+    rows = {
+        "gateway": [("a", 5, 5.2), ("a", 5, 6.0), ("other", 5, 50.0)],
+        "stage1": [("a", 5, 5.1), ("a", 5, 4.0)],  # one released early: counted, not hidden
+    }
+    for name, held in rows.items():
+        lines = [
+            json.dumps({"rid": r, "attempt": 0, "step": 0, "ms": m, "held_ms": h})
+            for r, m, h in held
+        ]
+        faults.held_path(control, name).write_text("\n".join(lines) + '\n{"rid": "a", "ms"')
+    out = x4.held_fields(control, {"a"})  # the half written last line is skipped
+    assert out["held_gateway"]["n"] == 2 and out["held_gateway"]["below_requested"] == 0
+    assert out["held_gateway"]["p50_ms"] == pytest.approx(5.6)
+    assert out["held_stage1"]["min_ms"] == 4.0 and out["held_stage1"]["below_requested"] == 1
+    assert out["achieved_delay_ms"] == pytest.approx((5.2 + 6.0 + 5.1 + 4.0) / 4)
+    assert x4.held_fields(tmp_path / "none", {"a"})["achieved_delay_ms"] is None
 
 
 def test_aggregates_group_by_delay_and_concurrency():
@@ -177,7 +203,14 @@ def test_the_x4_sweep_states_the_expectation_first_and_finds_the_slope(system, t
     assert lines[0]["expected_slope"] == 2.0
     assert sorted({c["delay_ms"] for c in cells}) == [0, 10, 20]
     assert all(c["tpot_p50_ms"] is not None for c in cells)
-    (fit1,) = [line for line in lines if line["type"] == "fit" and line["concurrency"] == 1]
-    assert fit1["n"] == 3 and 1.2 < fit1["slope"] < 3.5
+    fits = {(line["concurrency"], line["x"]): line for line in lines if line["type"] == "fit"}
+    fit1, real1 = fits[1, "delay_ms"], fits[1, "achieved_delay_ms"]
+    # A sleep that wakes late only adds, so the requested-d slope has a floor and no
+    # ceiling here; the slope against the hold each message really got is close to 2.
+    assert fit1["n"] == 3 and fit1["checked"] and fit1["slope"] > 1.2
+    assert real1["n"] == 3 and not real1["checked"] and 1.2 < real1["slope"] < 3.5
+    for c in cells:
+        for name in faults.CONTROLLED:
+            assert c[f"held_{name}"]["n"] > 0 and c[f"held_{name}"]["below_requested"] == 0
     assert lines[-1]["type"] == "summary" and lines[-1]["passed"]
     assert faults.read_delay_ms(path) == 0  # set back at the end

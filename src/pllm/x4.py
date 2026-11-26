@@ -21,6 +21,14 @@ concurrency (ordinary least squares of the per-cell TPOT mean against d, slope w
 confidence interval, and whether it holds 2.0; stated, not asserted; the expectation is
 checked at concurrency 1 only, since queueing at higher concurrency hides part of a small
 delay) and the x2 summary.
+
+A sleep can wake late, so the delay a message really got can exceed d. Both processes note
+each message's real hold on their own clock (pllm.faults.HopDelay.held) in their held
+files. Each cell line carries, per hop, n, p50, p99 and min of the hold and how many were
+below d (none should be), and achieved_delay_ms, the mean hold of the cell's messages over
+both hops. A second fit per concurrency, of TPOT mean against achieved_delay_ms, is
+reported beside the checked one and is not checked: where the two slopes differ, late
+wake-ups, not the pipeline, account for the difference.
 The exit code is 0 only with zero ordering violations and no failed request. The control
 file is set back to 0 at the end.
 
@@ -54,6 +62,7 @@ METRICS = (
     "tpot_p50_ms",
     "ttft_mean_ms",
     "ttft_p50_ms",
+    "achieved_delay_ms",
 )
 # Student t at 0.975 by degrees of freedom (the default sweep has 23 per concurrency).
 # shortcut: above 30 df it uses 1.96, which narrows the interval by under 4%; compute the
@@ -76,6 +85,8 @@ def expectation(delays: list[float], concurrency: list[int]) -> dict:
         "added_per_token_ms": {str(d): 2 * d for d in delays},
         "expected_slope": EXPECTED_SLOPE,
         "check": "95% CI of the OLS slope of per-cell TPOT mean against d holds 2.0",
+        "also_reported": "the same fit against achieved_delay_ms, the mean real hold per "
+        "delayed message on each process's clock; not checked",
         "checked_concurrency": 1,
         "above_concurrency_1": "queueing at small d hides part of the delay, so a slope "
         "below 2.0 is expected there; it is reported, not checked",
@@ -101,26 +112,69 @@ def fit(xs: list[float], ys: list[float]) -> dict:
 
 
 def fit_lines(cells: list[dict]) -> list[dict]:
-    """One fit per concurrency of TPOT mean (ms) against delay (ms)."""
+    """Per concurrency, a fit of TPOT mean (ms) against the requested delay (ms), checked at
+    concurrency 1, and one against the achieved delay, never checked."""
     out = []
     for c in sorted({line["concurrency"] for line in cells}):
-        rows = [
-            line for line in cells if line["concurrency"] == c and line["tpot_mean_ms"] is not None
-        ]
-        result = fit([r["delay_ms"] for r in rows], [r["tpot_mean_ms"] for r in rows])
-        ci = result["ci95"]
-        out.append(
-            {
-                "type": "fit",
-                "concurrency": c,
-                "x": "delay_ms",
-                "y": "tpot_mean_ms",
-                **result,
-                "expected_slope": EXPECTED_SLOPE,
-                "checked": c == 1,  # the expectation of #48 is for concurrency 1
-                "holds_expected": None if ci is None else ci[0] <= EXPECTED_SLOPE <= ci[1],
-            }
-        )
+        for x in ("delay_ms", "achieved_delay_ms"):
+            rows = [
+                line
+                for line in cells
+                if line["concurrency"] == c
+                and line["tpot_mean_ms"] is not None
+                and line.get(x) is not None
+            ]
+            result = fit([r[x] for r in rows], [r["tpot_mean_ms"] for r in rows])
+            ci = result["ci95"]
+            out.append(
+                {
+                    "type": "fit",
+                    "concurrency": c,
+                    "x": x,
+                    "y": "tpot_mean_ms",
+                    **result,
+                    "expected_slope": EXPECTED_SLOPE,
+                    # the expectation of #48 is for the requested d at concurrency 1
+                    "checked": c == 1 and x == "delay_ms",
+                    "holds_expected": None if ci is None else ci[0] <= EXPECTED_SLOPE <= ci[1],
+                }
+            )
+    return out
+
+
+def held_rows(path: Path, rids: set[str]) -> list[dict]:
+    """The lines of a held file for these requests. The file is appended to while it is
+    read, so a line that does not parse (the last, half written) is skipped."""
+    rows = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return rows
+    for raw in text.splitlines():
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("rid") in rids:
+            rows.append(row)
+    return rows
+
+
+def held_fields(control: Path, rids: set[str]) -> dict:
+    """Per hop, the real holds of these requests' messages, and their mean over both hops."""
+    out, every = {}, []
+    for name in faults.CONTROLLED:
+        rows = held_rows(faults.held_path(control, name), rids)
+        held = [r["held_ms"] for r in rows]
+        every += held
+        out[f"held_{name}"] = {
+            "n": len(held),
+            "p50_ms": report.percentile(held, 50) if held else None,
+            "p99_ms": report.percentile(held, 99) if held else None,
+            "min_ms": min(held, default=None),
+            "below_requested": sum(r["held_ms"] < r["ms"] - 1e-6 for r in rows),
+        }
+    out["achieved_delay_ms"] = statistics.fmean(every) if every else None
     return out
 
 
@@ -135,7 +189,7 @@ def aggregate(cells: list[dict]) -> list[dict]:
             "delay_ms": d,
             "concurrency": c,
             "repeats": len(lines),
-            **{name: x2.spread([line[name] for line in lines]) for name in METRICS},
+            **{name: x2.spread([line.get(name) for line in lines]) for name in METRICS},
             "failed_requests": sum(line["failed_requests"] for line in lines),
         }
         for (d, c), lines in sorted(groups.items())
@@ -178,9 +232,12 @@ def sweep(call, metrics_path: Path, args, prompt_ids, emit, control: Path) -> li
                     cell = x2.jobs(prompt_ids, args.requests)
                     x2.serve_pipeline(call, cell, c)
                     time.sleep(args.settle)
-                    run, missing = x2.cell_run(metrics_path, {j.rid for j in cell if j.rid})
+                    rids = {j.rid for j in cell if j.rid}
+                    run, missing = x2.cell_run(metrics_path, rids)
                     line = x2.cell_line("pipeline", c, repeat, cell, run, missing)
-                    cells.append({"type": "cell", "delay_ms": d, **line})
+                    cells.append(
+                        {"type": "cell", "delay_ms": d, **line, **held_fields(control, rids)}
+                    )
                     emit(cells[-1])
     finally:
         faults.write_atomic(control, "0\n")  # back to no delay; acks follow by themselves

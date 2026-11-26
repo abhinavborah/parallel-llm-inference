@@ -226,15 +226,17 @@ class Link:
     def send(self, message, hold: faults.HopDelay | None = None) -> None:
         if self.delayed:
             now = time.monotonic()
-            message = (now if hold is None else hold.release(message, now), message)
+            message = (hold, now, now if hold is None else hold.release(message, now), message)
         self.outbox.put(message)
 
     def _released(self):
         """The outbox in order, each message once its release time has come."""
         while (item := self.outbox.get()) is not _DONE:
-            release, message = item
+            hold, entered, release, message = item
             if not faults.sleep_until(release, self.call.done):
                 return
+            if hold is not None:
+                hold.held(message, entered, time.monotonic())
             yield message
 
     def failure(self) -> str | None:

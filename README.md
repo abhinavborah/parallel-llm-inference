@@ -701,7 +701,15 @@ delay and concurrency (throughput, TPOT and TTFT mean and p50, each with n, mean
 and max over the repeats), one fit per concurrency (least-squares slope of the per-cell TPOT
 mean against d with a 95% confidence interval, whether it holds 2.0, and whether that
 concurrency is the checked one) and the X2 summary.
-The fit states; it asserts nothing. The file goes to `runs/` next to the run record. At the
+
+A sleep can wake late, so a message can be held longer than d. The gateway and Stage 1 each
+note every message's real hold on their own clock and append it to
+`runs/hop_delay_ms.gateway.held.jsonl` or `runs/hop_delay_ms.stage1.held.jsonl`. Each cell
+line has, per hop, n, p50, p99 and min of the hold and how many holds were below d (should be
+0), and `achieved_delay_ms`, the mean hold over both hops. A second fit per concurrency, of
+TPOT mean against `achieved_delay_ms`, sits beside the checked one and is never checked. If
+the two slopes differ, late wake-ups account for the difference, not the pipeline.
+The fits state; they assert nothing. The file goes to `runs/` next to the run record. At the
 end the delay is set back to 0.
 
 Timeouts: `--timeout` (per request, default 300 s) must be at least twice the network time of

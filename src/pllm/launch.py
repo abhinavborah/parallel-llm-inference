@@ -199,7 +199,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         rec["roles"] = list(args.roles)
         rec["hop_delay_control"] = args.hop_delay_control
         if args.hop_delay_control:  # start at 0 ms: a file left by an earlier run is removed
-            for path in (faults.HOP_DELAY_FILE, *faults.ack_paths(faults.HOP_DELAY_FILE)):
+            control = faults.HOP_DELAY_FILE
+            held = [faults.held_path(control, name) for name in faults.CONTROLLED]
+            for path in (control, *faults.ack_paths(control), *held):
                 path.unlink(missing_ok=True)
         power = rec["power"]
         log.info(

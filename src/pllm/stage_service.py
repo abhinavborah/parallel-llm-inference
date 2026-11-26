@@ -317,7 +317,7 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                     now, hold = time.monotonic(), self.hop_delay
                     release = None if hold is None else hold.release(request, now)
                     arrived = now if release is None else release
-                    item = (request, due(request.budget_ms, arrived), release)
+                    item = (request, due(request.budget_ms, arrived), hold, now, release)
                     if not _offer(inbox, item, ended.is_set):
                         return
                     depth = inbox.qsize()
@@ -346,9 +346,11 @@ class StageServicer(protocol_pb2_grpc.StageServicer):
                     continue
                 if request is _DONE:
                     break
-                request, deadline, release = request
-                if release is not None and not sleep_until(release, gone, POLL_SECONDS):
-                    continue  # the stream is ending; the loop's checks say how
+                request, deadline, hold, entered, release = request
+                if release is not None:
+                    if not sleep_until(release, gone, POLL_SECONDS):
+                        continue  # the stream is ending; the loop's checks say how
+                    hold.held(request, entered, time.monotonic())
                 self.order.check(request.rid, request.attempt, request.step)
                 if deadline is not None and time.monotonic() >= deadline:
                     self._expire(request)

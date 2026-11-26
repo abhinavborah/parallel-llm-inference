@@ -8,11 +8,13 @@ python.exe is a launcher that runs the real interpreter as a child, and
 suspending only the launcher leaves the worker running.
 """
 
+import json
 import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import psutil
@@ -104,6 +106,7 @@ class HopDelay:
     """
 
     seconds: float = 0.0
+    log: deque | None = field(default=None, compare=False, repr=False)  # where held() notes
 
     def __post_init__(self) -> None:
         if not 0 <= self.seconds < float("inf"):
@@ -112,6 +115,14 @@ class HopDelay:
     def release(self, message, now: float) -> float:
         """When a message that entered the hop at now (monotonic seconds) may leave it."""
         return now + self.seconds
+
+    def held(self, message, entered: float, left: float) -> None:
+        """Note how long a message was really held, on this process's clock: a late wake-up
+        makes it longer than seconds, and pllm.x4 reports it next to the requested delay.
+        A log entry is (rid, attempt, step, requested seconds, held seconds, entered)."""
+        if self.log is not None:
+            entry = (message.rid, message.attempt, message.step, self.seconds, left - entered)
+            self.log.append((*entry, entered))
 
 
 def sleep_until(release: float, give_up=None, poll: float = 0.05) -> bool:
@@ -138,6 +149,11 @@ def ack_path(path: Path, name: str) -> Path:
 
 def ack_paths(path: Path) -> list[Path]:
     return [ack_path(path, name) for name in CONTROLLED]
+
+
+def held_path(path: Path, name: str) -> Path:
+    """Where the process called name appends one JSON line per message it held."""
+    return path.with_name(f"{path.name}.{name}.held.jsonl")
 
 
 def read_delay_ms(path: Path) -> float | None:
@@ -179,12 +195,14 @@ class HopDelayControl:
     delays a normal run. Every interval it reads the file (a number of ms; no file is 0);
     on a change it calls apply(HopDelay) and then writes the value it applied to its ack
     file, which pllm.x4 waits for. A file it cannot read or parse leaves the delay as it
-    is and is logged once.
+    is and is logged once. Every delay it applies notes each message's real hold in one log,
+    which each interval appends to its held file (held_path) for pllm.x4 to read.
     """
 
     def __init__(self, name: str, apply, path: Path = HOP_DELAY_FILE, interval=CONTROL_SECONDS):
         self.name, self.apply, self.path, self.interval = name, apply, Path(path), interval
         self.applied_ms: float | None = None
+        self.log: deque = deque()  # appended by the hop's threads, emptied by flush()
         self._warned = False  # log a bad file once, not every poll
 
     def poll(self) -> None:
@@ -198,10 +216,21 @@ class HopDelayControl:
         self._warned = False
         if value == self.applied_ms:
             return
-        self.apply(HopDelay(value / 1000))
+        self.apply(HopDelay(value / 1000, self.log))
         self.applied_ms = value
         log.info("%s: hop delay now %g ms", self.name, value)
         write_atomic(ack_path(self.path, self.name), f"{value!r}\n")
+
+    def flush(self) -> None:
+        """Append the holds noted since the last flush to the held file, one line each."""
+        lines = []
+        while self.log:
+            rid, attempt, step, seconds, held, _ = self.log.popleft()
+            row = {"rid": rid, "attempt": attempt, "step": step, "ms": seconds * 1e3}
+            lines.append(json.dumps({**row, "held_ms": held * 1e3}) + "\n")
+        if lines:
+            with held_path(self.path, self.name).open("a", encoding="utf-8") as out:
+                out.writelines(lines)
 
     def start(self, stop: threading.Event) -> threading.Thread:
         """Apply the file now, then poll it on a daemon thread until stop is set."""
@@ -212,6 +241,7 @@ class HopDelayControl:
             while not stop.wait(self.interval):
                 try:
                     self.poll()
+                    self.flush()
                 except OSError as err:  # an ack not written this time is written next time
                     log.warning("hop delay control: %s", err)
 

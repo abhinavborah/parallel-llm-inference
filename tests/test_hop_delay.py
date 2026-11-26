@@ -1,13 +1,15 @@
 """Hop delay for X4 (R7.7, decision #48): the gateway to Stage 0 hop is delayed at the
 gateway's send, the Stage 0 to Stage 1 hop at Stage 1's receive. Pipelined, counted as
 transit, set at run time from a file (pllm.faults.HopDelayControl). Real gateway and stages
-on loopback; timing bounds are loose, since CI runs on Windows and the tests share a laptop.
+on loopback. A sleep can wake late, so no bound assumes a hold of exactly d: upper bounds
+come from the hold each message really got (HopDelay.held), on the same clock.
 """
 
 import logging
 import statistics
 import threading
 import time
+from collections import deque
 
 import grpc
 import pytest
@@ -51,11 +53,13 @@ def per_token(run, tokens=12) -> float:
 
 
 def spy(servicer, seen):
-    """Record (budget_ms, local deadline, monotonic time) of each step the stage handles."""
+    """Record (budget_ms, local deadline, monotonic time, (rid, attempt, step)) of each step
+    the stage handles."""
     real = servicer._handle
 
     def handle(request, context, next_epoch, deadline=None):
-        seen.append((request.budget_ms, deadline, time.monotonic()))
+        key = (request.rid, request.attempt, request.step)
+        seen.append((request.budget_ms, deadline, time.monotonic(), key))
         return real(request, context, next_epoch, deadline)
 
     servicer._handle = handle
@@ -85,22 +89,30 @@ def test_sleep_until_gives_up_when_asked():
 @pytest.mark.parametrize(
     "gateway_hop, stage1_hop, hops", [(True, False, 1), (False, True, 1), (True, True, 2)]
 )
-def test_each_delayed_hop_adds_its_delay_to_every_token(system, gateway_hop, stage1_hop, hops):
+def test_each_delayed_hop_adds_its_hold_to_every_token(system, gateway_hop, stage1_hop, hops):
+    """Every message is held at least D, and each delayed hop adds about its real hold to
+    every token: no more, so no message waits for another's delay."""
     run = controllable(system())
     base = per_token(run)
+    at_gateway, at_stage1 = deque(), deque()
     if gateway_hop:
-        run.gateway.hop_delay = HopDelay(D)
+        run.gateway.hop_delay = HopDelay(D, at_gateway)
     if stage1_hop:
-        run.servicer1.hop_delay = HopDelay(D)
+        run.servicer1.hop_delay = HopDelay(D, at_stage1)
     added = per_token(run) - base
-    assert 0.8 * hops * D <= added <= hops * D + 0.04
+    logs = [log for log, on in ((at_gateway, gateway_hop), (at_stage1, stage1_hop)) if on]
+    holds = [[entry[4] for entry in log] for log in logs]
+    assert all(held and min(held) >= D - 1e-9 for held in holds)
+    real = sum(statistics.median(held) for held in holds)
+    assert 0.8 * hops * D <= added <= real + 0.04
 
 
 def test_a_delay_is_pipelined_not_one_message_at_a_time(system):
     """Eight requests at once, 4 tokens each, 50 ms on both hops: one message at a time
     would take 8 x 4 x 2 x 50 ms = 3.2 s; pipelined it is about 4 x 100 ms."""
     run = controllable(system())
-    run.gateway.hop_delay = run.servicer1.hop_delay = HopDelay(0.05)
+    log = deque()
+    run.gateway.hop_delay = run.servicer1.hop_delay = HopDelay(0.05, log)
     errors = []
 
     def one():
@@ -117,24 +129,30 @@ def test_a_delay_is_pipelined_not_one_message_at_a_time(system):
         thread.join(WAIT)
     elapsed = time.monotonic() - start
     assert not errors
-    assert 0.4 <= elapsed < 1.6
+    serial = sum(entry[4] for entry in log)  # one at a time: every real hold in turn
+    assert serial >= 8 * 4 * 2 * 0.05 - 1e-6
+    assert 0.4 <= elapsed < serial / 2
 
 
 def test_the_delay_counts_as_transit_and_leaves_budgets_alone(system):
     """Stage 1 sets a step's deadline from its release, not from when it was read, and
-    the delay at the gateway's send is not taken off the budget."""
+    the delay at the gateway's send is not taken off the budget. The release is checked
+    against the arrival stamp, so a late wake-up cannot make the check pass or fail."""
     run = controllable(system())
-    at0, at1 = [], []
+    at0, at1, log = [], [], deque()
     spy(run.servicer0, at0)
     spy(run.servicer1, at1)
     run.gateway.hop_delay = HopDelay(0.2)
-    run.servicer1.hop_delay = HopDelay(0.05)
+    run.servicer1.hop_delay = HopDelay(0.05, log)
     timeout_ms = 20_000
     assert len(run.tokens(max_tokens=3, timeout_ms=timeout_ms)) == 3
     assert timeout_ms - at0[0][0] < 100  # stamped before the 200 ms at the gateway
-    for budget, deadline, handled in at1:
+    entered = {entry[:3]: entry[5] for entry in log}
+    assert len(entered) == len(at1) > 0
+    for budget, deadline, handled, key in at1:
         released = deadline - budget / 1000
-        assert 0 <= handled - released < 0.03  # from the release, not 50 ms before it
+        assert released == pytest.approx(entered[key] + 0.05, abs=1e-6)  # not the arrival
+        assert handled >= released
     for (b0, *_), (b1, *_) in zip(at0, at1, strict=True):
         assert b0 - 50 < b1 <= b0  # Stage 1's 50 ms is not taken off either
 
