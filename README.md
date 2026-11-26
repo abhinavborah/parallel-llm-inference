@@ -704,6 +704,11 @@ exits by itself, the launcher stops the rest and exits with code 1 (a worker tha
 not such a case: its supervisor restarts it). Closing the terminal also stops everything on
 macOS. Force killing the launcher leaves its processes running.
 
+`--heartbeat-timeout SECONDS` passes the gateway's heartbeat timeout through, so it is
+accepted only with the gateway role on this laptop. The gateway checks the range (above the
+0.5 s beat interval and below the 8 s keepalive timeout); an out-of-range value makes it
+exit, and the launcher then stops the rest. See [Beat gaps](#beat-gaps) for how to choose it.
+
 Before every run, close other programs and use the same power state. The launcher logs the
 available memory and power state at the start, warns on battery, and writes a run record.
 

@@ -209,3 +209,42 @@ def test_main_refuses_a_partial_download(tmp_path, monkeypatch, capsys):
 
 def test_main_rejects_zero_threads(capsys):
     assert run_main(["smollm2-135m", "--threads", "0"]) == 2
+
+
+def test_the_heartbeat_timeout_goes_to_the_gateway_only():
+    plain = launch.commands("smollm2-135m", ["gateway", "stage1"], 3)
+    tuned = launch.commands("smollm2-135m", ["gateway", "stage1"], 3, heartbeat_timeout=3.5)
+    assert tuned["gateway"] == [*plain["gateway"], "--heartbeat-timeout", "3.5"]
+    assert tuned["stage1"] == plain["stage1"]
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (["--roles", "stage0", "--heartbeat-timeout", "3"], "needs the gateway role"),
+        (["--heartbeat-timeout", "0"], "positive number"),
+        (["--heartbeat-timeout", "nan"], "positive number"),
+        (["--heartbeat-timeout", "inf"], "positive number"),
+    ],
+)
+def test_main_refuses_a_heartbeat_timeout_it_cannot_pass(args, message, capsys):
+    assert run_main(["smollm2-135m", *args]) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_main_passes_the_heartbeat_timeout_to_the_gateway(tmp_path, monkeypatch):
+    from pllm import runrecord
+    from pllm.models import PINNED
+
+    for name in PINNED["smollm2-135m"].files:
+        path = tmp_path / "smollm2-135m" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    monkeypatch.setattr(launch, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(runrecord, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(launch.signal, "signal", lambda *_: None)  # keep pytest's handlers
+    started = {}
+    monkeypatch.setattr(launch, "run", lambda to_start, done: started.update(to_start) or 0)
+    launch.main(["smollm2-135m", "--roles", "gateway", "stage1", "--heartbeat-timeout", "4"])
+    assert started["gateway"][-2:] == ["--heartbeat-timeout", "4.0"]
+    assert "--heartbeat-timeout" not in started["stage1"]
