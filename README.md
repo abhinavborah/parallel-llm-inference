@@ -611,6 +611,48 @@ and report agreement. The summary line also gives the inter-op
 thread count. The stored logit summary is the top logit per step, not the full logits. `--length` is 16, 128 (the default)
 or 512; `--count` limits the run to the first prompts.
 
+## X2: throughput against concurrency
+
+`pllm.x2` serves the same requests at concurrency 1, 2, 4, 8 and 16, either through the
+pipeline or in one process round-robin without batching. Both modes run a closed loop: c
+requests are outstanding, and a finished one is replaced by the next at once. Each cell has
+`--requests` requests (default 32, at least twice the concurrency) over the prompt set's
+passages of `--length` tokens (default 128), with `--new-tokens` (default 64), after one
+untimed warm-up request. Cells run repeat by repeat (`--repeats`, default 5).
+
+Pipeline mode is a client of a running system. Start it with `pllm.launch`, then pass the
+gateway's metrics file (the newest `runs/*.metrics.jsonl`):
+
+```
+uv run python -m pllm.launch smollm2-135m
+uv run python -m pllm.x2 pipeline smollm2-135m --metrics runs/<gateway>.metrics.jsonl
+```
+
+Single mode loads the whole model in its own process, serves at most 14 requests at a time
+like the gateway (the rest wait in arrival order), and writes its own metrics file:
+
+```
+uv run python -m pllm.x2 single smollm2-135m
+```
+
+`--threads` sets its torch threads (default: the physical cores). The run record keeps the
+process's lifetime peak RSS after load and at the end, its RSS just after load, and the
+largest RSS sampled while serving, so a load peak and the settled size are told apart.
+`--budget-mib` names the budget they are read against; the record states it and makes no
+claim about a breach.
+
+Throughput, TTFT, TPOT and stage utilisation are computed by `pllm.report` from the metrics
+file, so they use the gateway's clock and the definitions given there. In pipeline mode the
+runner also counts ordering violations: steps that do not rise per request and attempt on the
+gateway's two hops, and client streams whose steps are not 0 to n - 1. The stages' own
+ordering counters are not exported, so they are not part of this count.
+
+Output: one JSON line per cell, one line per mode and concurrency with n, mean, stdev, min
+and max over the repeats, and a summary, in a `.jsonl` file next to the run record in
+`runs/` (named in the record as `results_file`) and on stdout. Each cell line also has a
+sha256 of every prompt's tokens, so on one host the two modes can be compared. The exit
+code is 0 only with zero ordering violations and no failed request.
+
 ## Starting the system
 
 `pllm.launch` starts this laptop's processes the same way on macOS and Windows: the gateway
