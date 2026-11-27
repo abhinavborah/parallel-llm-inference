@@ -21,10 +21,39 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          fetch-depth: 0
+      # On a pull request, skip the checks when only Markdown changed, and skip macOS unless
+      # code, tests, dependencies, config, data, CI or a root dotfile changed. Pushes to main
+      # run everything.
+      - id: scope
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          run=true
+          if [ "$EVENT" = pull_request ]; then
+            files=$(git diff --name-only "$BASE" HEAD)
+            echo "$files"
+            if ! grep -qv '\.md$' <<<"$files"; then
+              run=false
+            elif [ "$RUNNER_OS" = macOS ] &&
+              ! grep -qE '^(src/|tests/|config/|data/|\.github/|\.git[a-z]+$|\.python-version$|pyproject\.toml$|uv\.lock$)' <<<"$files"; then
+              run=false
+            fi
+          fi
+          echo "run checks: $run"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - if: steps.scope.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v10.3.2
         with:
           enable-cache: true
-      - run: uv sync --locked
-      - run: uv run ruff check
-      - run: uv run ruff format --check
-      - run: uv run pytest
+      - if: steps.scope.outputs.run == 'true'
+        run: uv sync --locked
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run ruff check
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run ruff format --check
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run pytest
