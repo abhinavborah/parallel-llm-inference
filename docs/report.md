@@ -61,7 +61,7 @@ Also:
 - **Failure detection is tuned for one network.** The heartbeat timeout default of 2.0 s was set from beat gaps on one laptop. Runs on the college Wi-Fi use `--heartbeat-timeout 5` until #124 is settled. A stage whose heartbeat stream breaks is treated as dead even if the process is fine, so a network blip costs a respawn and a weight reload.
 - **No authentication.** No port has authentication. The Windows firewall rule limits the Stage 0 and supervisor ports to the other laptop's address; the ports on the Mac are open to the Wi-Fi.
 - **One model presented.** All presented runs use SmolLM2-135M (#61). Qwen3-0.6B is pinned and its forward pass is tested, but its Stage 0 weights alone (840.1 MiB, computed from the checkpoint's tensor shapes) exceed the Host B budget.
-- **Not built:** micro-batching (#40), partial replay (X10, decided against in #51), gateway durability, discovery and pairing, the toxiproxy cross-check for X4. Both stages failing at once (R6.14) is open in #52.
+- **Not built:** micro-batching (#40), partial replay (X10, decided against in #51), gateway durability, discovery and pairing, the toxiproxy cross-check for X4.
 
 ## 3. System description and architecture
 
@@ -425,7 +425,7 @@ Fault suite claims and their tests:
 | R6.10 a slow worker fails cleanly at the deadline | a step delay; a suspended worker | `test_fail_cleanly.py`, `test_deadlines.py` |
 | R6.11 a delayed or lost hop | one message lost, or held past the step timeout or past the deadline, on each hop | `test_hop_faults.py::test_a_lost_hop_message_fails_its_request_at_the_deadline_and_holds_up_no_other`, `::test_a_hop_message_late_past_the_step_timeout_still_completes_its_request`, `::test_a_hop_message_late_past_the_deadline_fails_its_request_and_its_result_is_dropped` |
 | R6.12 recovery time in four parts | kill of a real stage process; suspend and resume | `test_recovery.py`, `test_stale_after_suspend.py` |
-| R6.14 both stages at once | none yet | pending (#52) |
+| R6.14 both stages at once | kill of both real stage processes together | `test_both_stages.py::test_both_stages_killed_together_recover_and_the_request_finishes_unchanged` |
 
 ## 12. How to run
 
