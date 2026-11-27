@@ -489,6 +489,8 @@ Definitions, as in vLLM's serving benchmark, all on the gateway's one clock:
 
 Plots for each experiment (X2 to X9) are added here by that experiment.
 
+The final report, with the evidence table for every requirement, is [docs/report.md](docs/report.md).
+
 ## Dashboard
 
 A live page for the demo (`pllm.dashboard`, standard library only, so nothing for Host B and
@@ -541,6 +543,8 @@ The tests pin the page, every event it reads and the server's rules, and, when `
 installed, run the page's own script against a stand-in for the DOM, fed a real state event
 (`tests/dashboard_page_check.js`). No test drives a real browser. Reported numbers come from
 the scripts that read the metrics files, never from this page.
+
+The live demo script, with each segment's commands and fallbacks, is in [docs/demo.md](docs/demo.md).
 
 ## Heartbeat
 
