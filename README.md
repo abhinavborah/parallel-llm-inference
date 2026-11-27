@@ -347,7 +347,7 @@ logits equal the single-process reference (tested with small random models).
     - SmolLM2 (k = 15): 202.6 MiB of weights leave 254.2 MiB, 23,040 bytes per position,
       11,570 positions. At the committed limits (22 requests of at most 528 positions) 21
       fit, so it binds only when nearly all 22 are that long; with
-      longer requests it binds sooner, for example 5 requests of 2,000 positions.
+      longer requests it binds sooner, for example 6 requests of 2,000 positions.
     - Qwen3-0.6B (k = 14): 840.1 MiB of Stage 0 weights alone exceed 0.7 GiB, so no KV
       budget is left. The gateway refuses to start with the numbers; `--no-kv-admission`
       (on the gateway or the launcher) runs it without the check, and the run record then
