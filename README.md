@@ -574,7 +574,9 @@ stream with FAILED_PRECONDITION and that process stops sending heartbeats but ke
 serving; frees still queued for the old process are dropped. A process whose epoch was
 declared dead with no replacement yet gets ABORTED at its next Beat or stream, exits with
 code 1, and its supervisor starts a new one (see "Failure detection"). A restarted gateway would
-refuse every stream the same way; only workers are restarted.
+refuse every stream the same way; only workers are restarted. Gateway failure is outside
+the fault model (R6.16): there is no durable request log, so a gateway that dies loses every
+request in flight, and clients must send them again.
 
 Limits:
 
@@ -613,6 +615,10 @@ goes on from the history the client has.
   third, instead of replaying again: a request that kills every new stage, for example by
   running a worker out of memory, must not keep the others replaying until its deadline.
 
+Replay is always full, through both stages, even when only Stage 1 died. Partial replay,
+where Stage 0 keeps its outbound activations so that only Stage 1 recomputes (R6.15,
+experiment X10), was not built: the replay scope decision (#51) chose full replay only.
+
 ## Recovery time
 
 Each replay is one recovery (R6.12). When it ends, at the request's first new token or when
@@ -638,6 +644,16 @@ the metrics file (see [Report](#report)), so the late results of a resumed old s
 too. If both stages die during one replay, the line names the later death. A request that
 fails at a death before replaying, such as at `MAX_DEATHS`, still gets a line, with
 `recovered` false.
+
+Both stages killed at once (R6.14): each death is declared and bumps every request, so a
+request uses two of its `MAX_DEATHS`, and its replay starts only once both new stages have
+registered. A single failure already replays through both stages, so a double failure costs
+the slower of the two restarts, which run in parallel (one supervisor per host), plus any
+contention, not twice a single recovery. That gap is small and not measured, so the fault
+suite checks that the request finishes unchanged and that its replay starts only after both
+new stages have registered, not a timing margin. The line names one of the
+two deaths, the one the gateway handled last (usually the later declared), so its `total_ns`
+starts at that stage's last beat and can miss up to one heartbeat interval of the other.
 
 ## Fault suite
 
@@ -671,7 +687,7 @@ no downloaded weights. The suite uses only 127.0.0.1.
 | R6.10 a slow worker fails cleanly at the deadline, bounds hold | a step delay on each stage; a suspended worker | `test_fail_cleanly.py::test_a_worker_slower_than_the_step_timeout_fails_requests_at_their_deadline_within_bounds`; `test_deadlines.py::test_with_a_suspended_worker_every_request_ends_by_its_deadline` |
 | R6.11 a delayed or lost hop | one message lost, or held past the step timeout or past the deadline, on each hop | `test_hop_faults.py::test_a_lost_hop_message_fails_its_request_at_the_deadline_and_holds_up_no_other`, `::test_a_hop_message_late_past_the_step_timeout_still_completes_its_request`, `::test_a_hop_message_late_past_the_deadline_fails_its_request_and_its_result_is_dropped` |
 | R6.12 recovery time in four parts | kill of a real stage process (each stage); a stopped stage; suspend and resume | `test_recovery.py`; `test_stale_after_suspend.py` (stale outputs counted) |
-| R6.14 both stages at once | none yet | open: #52 |
+| R6.14 both stages at once | kill of both real stage processes together | `test_both_stages.py::test_both_stages_killed_together_recover_and_the_request_finishes_unchanged` |
 
 Hop faults (R6.11) use the hop wrapper of X4 (`pllm.faults.HopDelay`) on the gateway to
 Stage 0 hop and the Stage 0 to Stage 1 hop. Its `release()` is asked once per message, so a
