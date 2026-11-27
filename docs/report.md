@@ -1,6 +1,6 @@
 # Pipeline-parallel LLM inference with fault recovery: final report
 
-Status: draft skeleton, 2026-11-27, at commit ad5daaa. Every section is drafted from what is already true on `main`. Result cells hold only results posted on closed issues; every other cell says "pending (#N)" with the issue that will produce it. The members rewrite their own sections (author line under each heading) and fill the results from the runs (#62).
+Status: draft skeleton, 2026-11-27, at commit df83e19. Every section is drafted from what is already true on `main`. Result cells hold only results posted on closed issues; every other cell says "pending (#N)" with the issue that will produce it. The members rewrite their own sections (author line under each heading) and fill the results from the runs (#62).
 
 Rules for every number in this report:
 
@@ -57,7 +57,7 @@ These are stated before the results, because they shape how the results read.
 Also:
 
 - **Host B memory is tight.** The worker budget is 0.7 GiB peak RSS. The clean measurement of available memory gave a minimum of 1.28 GiB (2026-11-03, 60 samples); a reading with other programs open gave a minimum of 0.73 GiB (2026-11-07). Memory pressure and paging on Host B were reported during the first runs on the college Wi-Fi (#60, #124), so runs need other programs closed.
-- **The network is shared Wi-Fi.** The college Wi-Fi probes on 2026-11-26 had p95 round trips from 16 to 120 ms, with both laptops on battery (section 8.3). #123 requires a plugged-in rerun before timed runs; it is pending (#62).
+- **The network is shared Wi-Fi.** The first college Wi-Fi probes on 2026-11-26 had p95 round trips from 16 to 120 ms, with both laptops on battery (section 8.3). Later probes the same day were higher (p95 up to 179 ms, not yet on a closed issue). #123 requires a plugged-in rerun before timed runs; Host A's side was run (not yet on a closed issue) and Host B's is pending (#62).
 - **Failure detection is tuned for one network.** The heartbeat timeout default of 2.0 s was set from beat gaps on one laptop. Runs on the college Wi-Fi use `--heartbeat-timeout 5` until #124 is settled. A stage whose heartbeat stream breaks is treated as dead even if the process is fine, so a network blip costs a respawn and a weight reload.
 - **No authentication.** No port has authentication. The Windows firewall rule limits the Stage 0 and supervisor ports to the other laptop's address; the ports on the Mac are open to the Wi-Fi.
 - **One model presented.** All presented runs use SmolLM2-135M (#61). Qwen3-0.6B is pinned and its forward pass is tested, but its Stage 0 weights alone (840.1 MiB, computed from the checkpoint's tensor shapes) exceed the Host B budget.
@@ -84,7 +84,7 @@ client --Generate--> gateway --Steps--> Stage 0 --Steps--> Stage 1 --Push--> gat
            (Beats and Nacks up; route updates and Frees down)
 ```
 
-SmolLM2-135M has 30 layers and a hidden size of 576. The committed split point is k = 15 (`[split]` in `config/hosts.toml`). This is the even split, not the capacity-aware one: the function that chooses k from each host's free memory and speed, and the X9 sweep, are in open PR #140 (#64).
+SmolLM2-135M has 30 layers and a hidden size of 576. The committed split point is k = 15 (`[split]` in `config/hosts.toml`). This is the even split, not the capacity-aware one: the function that chooses k from each host's free memory and speed, and the X9 sweep runner, are on `main` since PR #140; the sweep has not run yet (#64).
 
 ### 3.2 Model and reference
 
@@ -127,7 +127,7 @@ gRPC, package `pllm.v1`, schema version 3 (`pllm.proto.SCHEMA_VERSION`). The sch
 - Deadlines: each step carries `budget_ms`, the time left when it was sent. A stage turns it into a deadline on its own clock. The absolute wall-clock deadline field (9) was retired, so no clock is compared across machines.
 - Nack reasons: `WRONG_EPOCH`, `BAD_SENDER`, `STALE_ATTEMPT`, `GAP`. Every Nack travels on the heartbeat stream, so the gateway learns of a refusal at once.
 - Optional gRPC metadata `pllm-load-ns` on Register carries the new stage's weight load time, used only as a duration to split recovery time. It is outside the protobuf schema and backward compatible.
-- Every channel among the gateway and the stages (registration, heartbeat, the gateway's stream to Stage 0, the stream between the stages) sets keepalive; the client's and the dashboard's channels to the gateway do not: a ping after 2 s without traffic, and the connection closes when the ack is 8 s late.
+- Every channel among the gateway and the stages (registration, heartbeat, the gateway's stream to Stage 0, the stream between the stages) sets keepalive: a ping after 2 s without traffic, and the connection closes when the ack is 8 s late. The client's and the dashboard's channels to the gateway do not set keepalive.
 
 ## 5. Guarantees and failure model
 
@@ -170,7 +170,7 @@ Only the gateway judges a request's deadline, on its own monotonic clock. A wait
 
 ### 5.8 Backpressure
 
-From `[limits]` in the hosts file: 14 running requests; an admission queue of 8 (a full queue refuses at once with RESOURCE_EXHAUSTED); 8 credits for steps in flight; a stage inbox of 16 messages per stream, so a full inbox slows the sender through gRPC flow control. KV admission reserves each request's maximum KV on Stage 0 against Host B's KV budget: 0.7 GiB less the runtime (196 MiB, a check on Host B, not a recorded run), a margin (64 MiB, proposed, not measured) and Stage 0's weights (202.6 MiB for SmolLM2-135M at k = 15, computed), leaving 254.2 MiB. Tests: `tests/test_backpressure.py`, `tests/test_kv_admission.py`.
+At most 14 running requests (the constant `MAX_RUNNING` in `gateway.py`). From `[limits]` in the hosts file: an admission queue of 8 (a full queue refuses at once with RESOURCE_EXHAUSTED); 8 credits for steps in flight; a stage inbox of 16 messages per stream, so a full inbox slows the sender through gRPC flow control. KV admission reserves each request's maximum KV on Stage 0 against Host B's KV budget: 0.7 GiB less the runtime (196 MiB, a check on Host B, not a recorded run), a margin (64 MiB, proposed, not measured) and Stage 0's weights (202.6 MiB for SmolLM2-135M at k = 15, computed), leaving 254.2 MiB. Tests: `tests/test_backpressure.py`, `tests/test_kv_admission.py`.
 
 ### 5.9 Fault model
 
@@ -190,14 +190,15 @@ Author: joint.
 | Supervisor, fault injector, standby | `supervisor`, `faults`, `standby` | R6.1, R6.2, R7.13 |
 | Configuration, run records, launcher, host checks | `config`, `runrecord`, `launch`, `hostmem`, `netcheck` | R1.6 to R1.8, R1.10, R8.2, R8.10 |
 | Metrics and report | `metrics`, `report` | R7.1 to R7.6 |
-| Experiment runners | `x1a`, `x1b`, `x2`, `x3`, `x4`, `x5`, `x6`, `x7` | R7.8 to R7.14 |
+| Capacity-aware split and process memory | `capacity`, `procmem` | R8.6, R8.7 |
+| Experiment runners | `x1a`, `x1b`, `x2`, `x3`, `x4`, `x5`, `x6`, `x7`, `x9`, `x9probe`, `x9monitor` | R7.8 to R7.14, R7.16 |
 | Dashboard (stretch) | `dashboard` | R9.2 to R9.5 |
 
 ## 7. Contribution
 
 Author: joint. Member A is GitHub `abhinavborah` (Host A, macOS). Member B is GitHub `murthymetta2002` (Host B, Windows).
 
-The table puts the owner named in `docs/brd.md` beside the git authors of each module, so it can be checked against history. Commit counts are at commit ad5daaa, without merge commits, and grow as work lands. Regenerate them with:
+The table puts the owner named in `docs/brd.md` beside the git authors of each module, so it can be checked against history. Commit counts are at commit df83e19, without merge commits, and grow as work lands. Regenerate them with:
 
 ```
 git log --no-merges --format=%an -- src/pllm/<module>.py | sort | uniq -c
@@ -212,7 +213,7 @@ A row marked "differs" is one where the BRD owner and the git authors disagree. 
 | `split.py` | B (R2.5) | 3 | 3 | shared |
 | `prompts.py` | B (R2.6) | 3 | 0 | differs |
 | `models.py` | B (R1.9) | 0 | 1 | matches |
-| `worker.py` | B (R3.1, R3.2) | 4 | 6 | matches |
+| `worker.py` | B (R3.1, R3.2) | 4 | 7 | matches |
 | `stage_service.py` | B (R3.4, R3.6, R3.11) | 4 | 10 | matches |
 | `kvstore.py` | B (R3.5) | 1 | 4 | matches |
 | `wire.py` | B (R3.4) | 1 | 1 | shared |
@@ -223,12 +224,12 @@ A row marked "differs" is one where the BRD owner and the git authors disagree. 
 | `client.py` | A (R4.1) | 0 | 1 | differs |
 | `detection.py` | A (R6.3) | 3 | 0 | matches |
 | `beatgaps.py` | A (R6.3) | 1 | 0 | matches |
-| `supervisor.py` | B (R6.2) | 1 | 3 | matches |
+| `supervisor.py` | B (R6.2) | 1 | 4 | matches |
 | `faults.py` | B (R6.1) | 4 | 3 | shared |
 | `standby.py` | A (R7.13) | 0 | 1 | differs |
 | `config.py` | A (R1.6) | 4 | 5 | shared |
 | `runrecord.py` | A (R1.10) | 1 | 3 | differs |
-| `launch.py` | A and B (R8.2) | 7 | 2 | shared |
+| `launch.py` | A and B (R8.2) | 7 | 3 | shared |
 | `hostmem.py` | B (R1.7) | 0 | 1 | matches |
 | `netcheck.py` | A and B (R1.8) | 2 | 3 | shared |
 | `metrics.py` | A (R7.1, R7.2) | 2 | 2 | shared |
@@ -241,6 +242,11 @@ A row marked "differs" is one where the BRD owner and the git authors disagree. 
 | `x5.py` | A (R7.12) | 0 | 1 | differs |
 | `x6.py` | A (R7.13) | 0 | 1 | differs |
 | `x7.py` | A (R7.14) | 0 | 3 | differs |
+| `x9.py` | B (R7.16) | 0 | 1 | matches |
+| `x9probe.py` | B (R7.16) | 0 | 1 | matches |
+| `x9monitor.py` | B (R8.7) | 0 | 1 | matches |
+| `capacity.py` | A (R8.6) | 0 | 1 | differs |
+| `procmem.py` | B (R8.7) | 0 | 1 | matches |
 | `dashboard.py` | unassigned (R9.2) | 0 | 1 | stretch |
 | `proto/protocol.proto` | A and B (R1.4) | 1 | 3 | shared |
 
@@ -250,7 +256,7 @@ Cross-tests, each written by the member who did not build the component (R3.14, 
 |---|---|---|
 | `tests/test_cross_worker.py` | stage worker KV truncate and fencing (R3.14) | A |
 | `tests/test_cross_result_filter.py` | gateway result filter (R4.9, split agreed in #31) | A |
-| `tests/test_replay_cross.py` | gateway replay (R4.9) | B (first commit), later changes by A |
+| `tests/test_replay_cross.py` | gateway replay (R4.9) | B (first commit), later changes by B and A |
 | `tests/test_detection_cross.py` | gateway failure detection | B (first commit), later changes by A |
 
 Experiments and report sections: each member runs the experiments they own in the BRD, makes those plots and writes those results subsections (section 9). Owners per the BRD: A owns X2, X4, X5, X6, X7; B owns X1a, X1b, X3, X8, X9.
@@ -280,8 +286,8 @@ Both laptops on the college Wi-Fi; a phone hotspot is the fallback. No Ethernet 
 | Network | Date | Round trip | Notes |
 |---|---|---|---|
 | Phone hotspot | 2026-11-07 | median 8.67 to 9.26 ms, p95 10.35 to 13.04 ms | `pllm.netcheck probe`, run records on #7 |
-| College Wi-Fi | 2026-11-26 | median 8 to 13 ms, p95 16 to 120 ms | `pllm.netcheck probe`, three runs each way, both laptops on battery, cause of the spread unknown (BRD K5; no run records named). The amendment on #123 gave the p95 low end as 24 ms; PR #132 corrected it to 16 ms, since 24 ms is the lowest Mac to Windows run and one Windows to Mac run read 16.01 ms |
-| College Wi-Fi, plugged in | pending (#62) | pending (#62) | required before timed runs by #123 |
+| College Wi-Fi | 2026-11-26 | median 8 to 13 ms, p95 16 to 120 ms | First probes of the day: `pllm.netcheck probe`, three runs each way, both laptops on battery, cause of the spread unknown (BRD K5; no run records named). The amendment on #123 gave the p95 low end as 24 ms; PR #132 corrected it to 16 ms, since 24 ms is the lowest Mac to Windows run and one Windows to Mac run read 16.01 ms. Later probes the same day were higher (p95 up to 179 ms, not yet on a closed issue) |
+| College Wi-Fi, plugged in | Host A side: 2026-11-26; Host B side: pending (#62) | Host A side: run, not yet on a closed issue; Host B side: pending (#62) | required before timed runs by #123 |
 
 Each timed result states the round-trip spread of its session.
 
@@ -355,7 +361,7 @@ Optional clause. Not built; #40 open.
 
 Expectation: on SmolLM2-135M an even split fits Host B, so the splits separate on speed and busy time, not memory; Host B peak RSS within budget with no paging.
 
-Result: pending (#64, runner in open PR #140).
+Result: pending (#64, runner on `main` since PR #140).
 
 ## 10. Evidence for Spec R1 to Spec R16
 
@@ -380,7 +386,7 @@ Author: joint. Test paths are under `tests/`; every test named here carries the 
 | Spec R15 | Report throughput | R7.5, R7.9 | `test_report.py::test_only_completed_requests_give_latencies_and_throughput` | X2 pending (#58) |
 | Spec R16 | Report transferred bytes | R7.2, R7.10 | `test_metrics.py::test_sizes_are_the_serialized_sizes`, `test_x3.py::test_activation_bytes_are_hidden_size_x_4_per_position_within_the_overhead` | X3 pending (#55) |
 
-Spec R9 has no test or run. It is an optional clause; whether it is cut is a separate decision (R7.19).
+Spec R9 has no test or run. It is an optional clause, not built (#40 open); if it is cut, R7.19 also cuts the X2 upper bound.
 
 ## 11. Evidence per claim and experiment
 
@@ -399,7 +405,7 @@ Author: joint. Each result comes from the script and command named beside it.
 | X6: stale outputs after a suspend | R7.13, R6.8 | `pllm.x6`, `pllm.standby` | `uv run python -m pllm.x6 smollm2-135m --stages 1 --metrics runs/<gateway>.metrics.jsonl --rtt-ms <ms>` | pending (#60) |
 | X7: overload with bounds on and off | R7.14 | `pllm.x7` | `uv run python -m pllm.x7 run smollm2-135m --metrics runs/<gateway>.metrics.jsonl --rate <requests per second>` | pending (#59) |
 | X8: micro-batching | R7.15 | none | none | optional, not built (#40) |
-| X9: capacity-aware split | R7.16, R8.6, R8.7 | runner in open PR #140 | not yet on `main` | pending (#64) |
+| X9: capacity-aware split | R7.16, R8.6, R8.7 | `pllm.x9`, `pllm.capacity` | `uv run python -m pllm.x9 run smollm2-135m --metrics runs/<gateway>.metrics.jsonl --budget-mib 716.8 --rtt-ms <ms>` (after `probe` and `choose`, README "X9") | pending (#64) |
 | Fault suite: every failure-handling claim has a test that injects the fault | R6.13 | tests marked `fault` | `uv run pytest -m fault -rs` | Host B: 129 passed, 1 skipped (needs 1.5 GiB of free memory), 0 failed, commit 86b3436. Host A: 102 passed, 0 skipped, commit not stated; PR #135 says this run came before the cross-tests were marked, and on #46 Member B noted it may be from an earlier commit. The two laptops ran different test sets; a Host A run at 86b3436 would give one set (#46) |
 | Recovery time in four parts (detection, respawn, weight load, replay prefill) | R6.12 | `recovery` lines in the metrics file, `pllm.report` | from the X5 runs | pending (#60) |
 
@@ -428,7 +434,7 @@ The README is the reference; this section only points to it.
 - Install and test: README "Development" (`uv sync`, `uv run pytest`).
 - Weights: README "Model weights" (`uv run python -m pllm.models smollm2-135m`).
 - Two-laptop session: README "Session checklist", then "Host checks" for the network probe, then "Starting the system".
-- Each experiment: the README section of that name (X1a, X1b, X2, X3, X4, X5 and X6, X7).
+- Each experiment: the README section of that name (X1a, X1b, X2, X3, X4, X5 and X6, X7, X9).
 - Tables and plots: README "Report" (`uv run python -m pllm.report`).
 
 ## 13. Conclusion
