@@ -23,6 +23,7 @@ LAYERS = 4
 K = 2
 BEAT = 0.05
 TIMEOUT = 1.0  # heartbeat timeout: 20 beats, so a slow runner does not declare a live stage
+DEADLINE = 60  # seconds per request: a stage restart or swap on a slow CI runner nears 30
 DELAY = 0.03  # per step on the stage in this process
 # The stage under test is the slower one, so it nearly always has a step in hand: a
 # suspended stage 1 sends a late result only for a step it held when it was suspended.
@@ -478,7 +479,7 @@ class Live:
 
     def call(self, ids, max_tokens):
         prompt = " ".join(map(str, ids))
-        return self.run.call(prompt=prompt, max_tokens=max_tokens)
+        return self.run.call(prompt=prompt, max_tokens=max_tokens, timeout_ms=DEADLINE * 1000)
 
     def context(self, kind=x5.Context, **fields):
         fields = {"call": self.call, "control": self.control, **fields}
@@ -488,13 +489,13 @@ class Live:
             requests=len(PROMPTS),
             new_tokens=N,
             fault_at=AT,
-            timeout=25,
+            timeout=DEADLINE + 10,
             wait=90,
             settle=0.5,
             **fields,
         )
         ctx.healthy()  # the first worker has loaded and both stages are routed
-        ctx.wait = 25
+        ctx.wait = DEADLINE
         return ctx
 
     def close(self):
