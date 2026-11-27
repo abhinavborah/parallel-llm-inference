@@ -645,8 +645,9 @@ Both stages killed at once (R6.14): each death is declared and bumps every reque
 request uses two of its `MAX_DEATHS`, and its replay starts only once both new stages have
 registered. A single failure already replays through both stages, so a double failure costs
 the slower of the two restarts, which run in parallel (one supervisor per host), plus any
-contention: at least as long as either stage's own restart, not twice as long. The gap is
-small, so the fault suite checks that bound, not a timing margin. The line names one of the
+contention, not twice a single recovery. That gap is small and not measured, so the fault
+suite checks that the request finishes unchanged and that its replay starts only after both
+new stages have registered, not a timing margin. The line names one of the
 two deaths, the one the gateway handled last (usually the later declared), so its `total_ns`
 starts at that stage's last beat and can miss up to one heartbeat interval of the other.
 

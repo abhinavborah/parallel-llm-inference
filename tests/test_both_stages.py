@@ -143,8 +143,8 @@ def recover(run, children, events, stages, expected):
 
 
 def test_both_stages_killed_together_recover_and_the_request_finishes_unchanged(pipeline, tmp_path):
-    """The replay waits for both new registrations, so the recovery lasts at least as long
-    as each stage's own restart: what a single failure of that stage costs at least."""
+    """The request finishes unchanged, and its replay starts only after both new stages have
+    registered, so it waits for the slower of the two restarts."""
     run, children, events = pipeline
     expected = reference(tmp_path, K, IDS, N)[0]
     line, old = recover(run, children, events, (0, 1), expected)
@@ -157,13 +157,10 @@ def test_both_stages_killed_together_recover_and_the_request_finishes_unchanged(
         return next(e for e in events if e["event"] == kind and e.get(key) == epoch
                     and e["stage"] == stage and e.get("declared", True))  # fmt: skip
 
-    deaths = {s: one("detected", s, "epoch", old[s]) for s in (0, 1)}
+    for stage in (0, 1):
+        one("detected", stage, "epoch", old[stage])  # each death declared
     registrations = {s: one("registered", s, "old_epoch", old[s]) for s in (0, 1)}
     assert line["t_ns"] >= max(r["t_ns"] for r in registrations.values())
-    first_beat = min(d["last_beat_ns"] for d in deaths.values())
-    for stage in (0, 1):
-        restart = registrations[stage]["t_ns"] - deaths[stage]["last_beat_ns"]
-        assert line["t_ns"] - first_beat >= restart > 0
     # the line names one of the two deaths: the one the gateway handled last, usually the
     # later declared, though the two declarations can reach it in either order
     assert line["old_epoch"] == old[line["stage"]]

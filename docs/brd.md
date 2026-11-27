@@ -286,7 +286,7 @@ Priority: Must (P0 on the board), Should (P1), Could (P2). Week: the roadmap wee
 | R6.11 | Delayed or lost hop: the transport wrapper can delay or drop a hop message; the request recovers by timeout and replay or fails at its deadline. | Should | W5 | A (unconfirmed) | Proposal PG4 |
 | R6.12 | Recovery time is logged as four parts: detection, respawn, weight load, replay prefill, plus recomputed tokens and stale outputs discarded. | Must | W4 | A (unconfirmed) | X5; Proposal PG6 |
 | R6.13 | Each failure-handling claim in this epic has an automated fault-injection test that runs on both laptops. | Must | W4 | A and B (unconfirmed) | G2 |
-| R6.14 | Both stages failing at once recovers, with longer recovery time (test). | Could | W5 | A (unconfirmed) | Fault model |
+| R6.14 | Both stages failing at once recovers: the request completes unchanged, and its replay waits for the slower of the two restarts (test). | Could | W5 | A (unconfirmed) | Fault model |
 | R6.15 | Stretch, partial replay (experiment X10): Stage 0 keeps its outbound activations per request so a Stage 1 failure replays only Stage 1; compare recompute time with X5. | Could | W6 | B (unconfirmed) | X10; D6 |
 | R6.16 | Stretch, gateway durability: a durable request log lets the gateway restart. Default is out of the fault model, stated in the report. | Could | W6 | A (unconfirmed) | D5 |
 | R6.17 | Decision D6: replay scope. Default is full replay through both stages; the alternative is partial replay (R6.15). Decide by W5. Status: decided 2026-11-07 (#51): full replay only; R6.15 stays a stretch, revisited only if Stage 0 busy time during replay in the X5 Stage 1 kill runs exceeds a quarter of recovery time and every Must exit criterion passes. | Should | W5 | A and B (unconfirmed) | D6 |
@@ -471,3 +471,4 @@ Items reported by one member and not yet confirmed by the other are marked uncon
 | 1.3 | 2026-11-21 | Network decision (#123): a phone hotspot, no Ethernet or cable; "LAN" defined in section 3; R1.8, R8.5 and K5 updated. |
 | 1.4 | 2026-11-25 | Host B worker budget agreed as 0.7 GiB peak RSS (#127); R1.7, G5, K2 and section 1 updated. |
 | 1.5 | 2026-11-26 | Network decision changed (#123): college Wi-Fi primary with the Windows firewall on, phone hotspot fallback; "LAN" in section 3, R1.8, R8.3, R8.5 and K5 updated. |
+| 1.7 | 2026-11-27 | R6.14 reworded by both members (#52): the request completes unchanged and the replay waits for the slower restart, instead of a longer recovery time, which a test cannot check reliably. |
