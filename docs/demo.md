@@ -105,7 +105,8 @@ launcher terminal. For SmolLM2 at k = 15 it is 254.2 MiB, 23,040 bytes per posit
 positions. Each request reserves its
 prompt plus `max_tokens` positions before it may queue.
 
-Audience sees: Stage 0's RSS under 0.7 GiB, and the budget that keeps it there.
+Audience sees: Stage 0's RSS beside the 0.7 GiB budget, and the admission rule that bounds
+the KV cache inside it.
 
 Fallback: the same lines in the recorded run's launch and supervisor logs.
 
@@ -173,14 +174,12 @@ segment 6 shows them (`recovery.csv` in the report).
 Audience sees: Stage 0 dead, then alive with a higher epoch. The client stream pauses and
 continues with no repeated or missing token. The "Duplicate tokens (always 0)" tile stays 0.
 
-Fallback: run X5 once on Stage 0 against the live system. It first runs its own fault-free
-reference, so it takes a few minutes:
+Fallback: the recorded run. Backup, during questions only: run X5 once on Stage 0 against
+the live system. It first runs its own fault-free reference, so it takes a few minutes:
 
 ```
 uv run python -m pllm.x5 smollm2-135m --metrics runs/<gateway>.metrics.jsonl --stages 0 --repeats 1 --trial --rtt-ms <ms>
 ```
-
-If the LAN is down, use the recorded run.
 
 ### 5. Fencing, live suspend (Member B 2, Member A 0.5; 2.5 minutes)
 
@@ -208,9 +207,11 @@ late output is not certain: a frozen worker that held no step sends none. The ep
 (`stale_epoch` at the gateway, `BAD_SENDER` at Stage 1) are shown by X6 in segment 6. No
 Stage 0 replacement is started live, since two Stage 0 workers need about 1.4 GiB on Host B.
 
-Fallback, on the Mac only:
+Fallback: the recorded run. Backup, during questions only, on the Mac:
 
-- The test that proves it, with a small random model:
+- The test that proves fencing once a replacement serves, with a small random model. There
+  Stage 1 refuses the late Stage 0 step with `BAD_SENDER`; live, the gateway drops it as
+  `stale_attempt`:
 
   ```
   uv run pytest tests/test_stale_after_suspend.py
