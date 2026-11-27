@@ -6,6 +6,7 @@ hosts file, so moving to another network never changes this command.
 """
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -48,13 +49,16 @@ def commands(
     hop_delay_control: bool = False,
     heartbeat_timeout: float | None = None,
     gateway_args: Sequence[str] = (),
+    split_point: int | None = None,
     no_kv_admission: bool = False,
 ) -> dict[str, list[str]]:
     """The command of each role in start order: the stages register with the gateway. With
     dashboard, the gateway also serves the live page. With hop_delay_control, the gateway
     and Stage 1 take the X4 hop delay from runs/hop_delay_ms (pllm.x4). heartbeat_timeout
-    goes to the gateway, which checks its range. no_kv_admission turns the gateway's Host B
-    KV admission off (R5.3). gateway_args are added to the gateway's command."""
+    goes to the gateway, which checks its range. split_point, if given, goes to the
+    gateway and to every stage in place of the hosts file's (split sweeps). no_kv_admission
+    turns the gateway's Host B KV admission off (R5.3). gateway_args are added to the
+    gateway's command."""
     wanted = set(roles)
     out = {}
     for role in config.ROLES:
@@ -85,6 +89,8 @@ def commands(
             ]
             if hop_delay_control and stage == "1":
                 out[role].append("--hop-delay-control")
+        if split_point is not None:
+            out[role] += ["--split-point", str(split_point)]
     return out
 
 
@@ -160,6 +166,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--admission-queue", metavar="N|off", help="passed to the gateway")
     parser.add_argument("--credits", type=int, help="passed to the gateway")
     parser.add_argument(
+        "--split-point",
+        type=int,
+        metavar="K",
+        help="X9: run this split instead of the committed one; give both laptops the same K",
+    )
+    parser.add_argument(
         "--dashboard",
         action="store_true",
         help="the gateway also serves the live dashboard (it can kill and freeze workers)",
@@ -202,7 +214,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--admission-queue and --credits need the gateway role on this laptop")
     try:
         hosts = config.load()
-        split = config.split_point(args.model)
+        split = config.split_point(args.model) if args.split_point is None else args.split_point
     except (ValueError, OSError) as err:
         parser.error(str(err))
     wrong = elsewhere(hosts, args.roles, this_laptop())
@@ -215,6 +227,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"model files missing ({', '.join(sorted(missing))}): "
             f"uv run python -m pllm.models {args.model}"
         )
+
+    if args.split_point is not None:
+        # refused here, since a supervisor would restart a stage with a bad k for ever;
+        # read as JSON so the launcher does not import torch
+        text = (MODELS_DIR / args.model / "config.json").read_text(encoding="utf-8")
+        layers = json.loads(text)["num_hidden_layers"]
+        if not 1 <= args.split_point <= layers - 1:
+            parser.error(f"--split-point must be from 1 to {layers - 1}")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     threads = args.threads or default_threads(args.roles)
@@ -263,6 +283,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             hop_delay_control=args.hop_delay_control,
             heartbeat_timeout=args.heartbeat_timeout,
             gateway_args=gateway_args,
+            split_point=args.split_point,
             no_kv_admission=args.no_kv_admission,
         )
         try:
